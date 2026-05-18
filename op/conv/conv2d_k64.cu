@@ -2,40 +2,351 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include "cuda_utils.cuh"
+#include "ptx_utils.cuh"
 
-void direct_conv2d_T_cpu(
-        const float *input, const float *filter, const float *bias, float *output,
-        int N, int C, int H, int W, int K, int R, int S, int U, int V, int P, int Q)
+
+// =============================================================================
+// SNN Conv2D Kernel: 64×64 output tile, K_chunk=16, T time-steps
+//
+// Layout:
+//   Input  : [1, C_in, H, W]  uint8  (T bits packed per element, bit t = time step t)
+//   Weights: [C_in*Kh*Kw, C_out] float (pre-transposed, column-major)
+//   Output : [T, C_out, H_out, W_out] float
+//
+// Block tile: M_TILE=64 (C_out) × N_TILE=64 (spatial), K_chunk=16
+// Threads   : 256 (8 warps)
+// Grid      : (ceil(outHW/64), ceil(C_out/64), 1)
+//
+// SMEM (single buffer, ~5KB):
+//   smemweight [K_CHUNK=16][M_TILE=64] float  = 4KB  (cp.async, 1 float4/thread)
+//   smeminput  [K_CHUNK=16][N_TILE=64] uint8  = 1KB  (ldg8×N + sts)
+//
+// Thread decomposition (from thread_map_test.cu, verified 0 bank conflicts):
+//   lane_id   = threadIdx.x % 32
+//   warp_id   = threadIdx.x / 32   (0..7)
+//   mma_tid_x = lane_id / 16 * 2 + lane_id % 2   (0..3, 4 cols)
+//   mma_tid_y = lane_id % 16 / 2                  (0..7, 8 rows)
+//
+// Per-warp tile: [16M × 32N]
+//   warp_m = warp_id / 2  (0..3) → M [warp_m*16, warp_m*16+16)
+//   warp_n = warp_id % 2  (0..1) → N [warp_n*32, warp_n*32+32)
+//
+// Per-thread fragment: [2M × 8N]  (matches thread_map_test read granularity)
+//   mma_tid_y (0..7) → weight float2 broadcast (8 rows × float2 = 16 floats/row)
+//     smemweight[k][warp_m*16 + mma_tid_y*2 .. +2]  — 4 threads share same float2
+//   mma_tid_x (0..3) → input  uint64 broadcast (4 cols × uint64 = 32 uint8/row)
+//     smeminput [k][warp_n*32 + mma_tid_x*8 .. +8]  — 8 threads share same uint64
+//
+//   output_frag[T][2][8]: [2M rows] × [8N cols] × T time-steps
+// =============================================================================
+
+template <int T_STEPS>
+__global__ void snn_conv2d_64x64_k16(
+    const uint8_t * __restrict__ inputs,   // [1, C_in, H, W] uint8 packed spikes
+    const float   * __restrict__ weights,  // [C_in*Kh*Kw, C_out] float, col-major
+    float         * __restrict__ outputs,  // [T, C_out, H_out, W_out] float
+    Conv2DParam param)
 {
-    int Oh = (H + 2 * P - R) / U + 1;
-    int Ow = (W + 2 * Q - S) / V + 1;
+    constexpr int K_CHUNK = 16;
+    constexpr int M_TILE  = 64;
+    constexpr int N_TILE  = 64;
 
-    for (int n = 0; n < N; n++)
+    // SMEM: K-loop uses 5KB (4KB weight + 1KB input)
+    //       Epilogue uses 8KB (8 warps × 1KB each)
+    //       Allocate max(5KB, 8KB) = 8KB
+    __shared__ __align__(128) char smem[8 * 1024];
+    float   *smemweight = reinterpret_cast<float   *>(smem);
+    uint8_t *smeminput  = reinterpret_cast<uint8_t *>(smem + 4 * 1024);
+
+    // --- Thread indices ---
+    const int tid     = threadIdx.x;
+    const int lane_id = tid % 32;
+    const int warp_id = tid / 32;
+
+    // Thread map verified in thread_map_test.cu (0 bank conflicts)
+    const int mma_tid_x = lane_id / 16 * 2 + lane_id % 2;  // 0..3
+    const int mma_tid_y = lane_id % 16 / 2;                 // 0..7
+
+    // Warp-level tile assignment
+    const int warp_m = warp_id / 2;  // 0..3 → M rows [warp_m*16, warp_m*16+16)
+    const int warp_n = warp_id % 2;  // 0..1 → N cols [warp_n*32, warp_n*32+32)
+
+    // Per-thread SMEM read base (matches smem_float2_load / smem_uint64_load)
+    //   weight: mma_tid_y selects 1 float2 out of 8 → m offset = mma_tid_y*2
+    //   input : mma_tid_x selects 1 uint64 out of 4 → n offset = mma_tid_x*8 (bytes)
+    const int thread_m_base = warp_m * 16 + mma_tid_y * 2;  // 0..62, step 2
+    const int thread_n_base = warp_n * 32 + mma_tid_x * 8;  // 0..56, step 8
+
+    // --- Global tile offsets ---
+    const int m_tile_base = blockIdx.y * M_TILE;
+    const int n_tile_base = blockIdx.x * N_TILE;
+
+    // --- Accumulators: T_STEPS × [2M × 8N] ---
+    float output_frag[T_STEPS][2][8];
+#pragma unroll
+    for (int t = 0; t < T_STEPS; t++)
+#pragma unroll
+        for (int i = 0; i < 2; i++)
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+                output_frag[t][i][j] = 0.f;
+
+    // --- K-loop ---
+    const int in_features = param.inChKhKw;
+    const int k_iters     = (in_features + K_CHUNK - 1) / K_CHUNK;
+
+    for (int k_iter = 0; k_iter < k_iters; k_iter++)
     {
-        for (int k = 0; k < K; k++)
+        const int k_base = k_iter * K_CHUNK;
+
+        // ----------------------------------------------------------------
+        // Stage 1: cp.async weights [K_CHUNK, M_TILE] → smemweight
+        //   256 threads × 1 float4 = 256 × 16B = 4KB ✓
+        //   tid/16 → k row (0..15), tid%16 → float4 col (0..15, col*4=m)
+        // ----------------------------------------------------------------
         {
-            for (int oh = 0; oh < Oh; oh++)
+            int w_row    = tid / 16;
+            int w_col    = (tid % 16) * 4;
+            int global_k = k_base + w_row;
+            int global_m = m_tile_base + w_col;
+
+            uint32_t smem_ptr = ptx::smem_u32addr(&smemweight[w_row * M_TILE + w_col]);
+            bool valid  = (global_k < in_features) && (global_m + 3 < (int)param.out_ch);
+            int  src_sz = valid ? 16 : 0;
+
+            asm volatile(
+                "cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+                :: "r"(smem_ptr),
+                   "l"(&weights[global_k * param.out_ch + global_m]),
+                   "r"(src_sz)
+            );
+        }
+
+        // ----------------------------------------------------------------
+        // Stage 2: Load inputs [K_CHUNK, N_TILE] → smeminput (uint8)
+        //   smeminput layout: [K_CHUNK][N_TILE], each row = 64 uint8
+        //   Load granularity: uint64 (8 bytes) per thread
+        //   tid/8 → k row (0..31, only 0..15 valid), tid%8 → uint64 col (0..7, col*8=n)
+        //   32 threads × 8B × (256/32) passes needed?
+        //   Simpler: 256 threads cover 16×64 = 1024 bytes as uint32 (4B each):
+        //     tid/16 = k (0..15), tid%16 = n/4 (0..15)  → same mapping as weight load
+        // ----------------------------------------------------------------
+        {
+            int i_k      = tid / 16;
+            int i_n4     = tid % 16;          // covers n = [i_n4*4, i_n4*4+4)
+            int global_k = k_base + i_k;
+
+            uint32_t packed = 0;
+            if (global_k < in_features)
             {
-                for (int ow = 0; ow < Ow; ow++)
+                int c_idx = global_k / param.KhKw;
+                int ky    = global_k % param.KhKw / param.Kw;
+                int kx    = global_k % param.KhKw % param.Kw;
+#pragma unroll
+                for (int b = 0; b < 4; b++)
                 {
-                    float sum = 0;
-                    for (int c = 0; c < C; c++)
+                    int n_idx = n_tile_base + i_n4 * 4 + b;
+                    if (n_idx < (int)param.outHW)
                     {
-                        for (int r = 0; r < R; r++)
+                        int oh = n_idx / param.out_w;
+                        int ow = n_idx % param.out_w;
+                        int ih = oh * param.Sh - param.Ph + ky;
+                        int iw = ow * param.Sw - param.Pw + kx;
+                        if (ih >= 0 && ih < (int)param.in_h &&
+                            iw >= 0 && iw < (int)param.in_w)
                         {
-                            for (int s = 0; s < S; s++)
-                            {
-                                int ih = oh * U - P + r;
-                                int iw = ow * V - Q + s;
-                                if (iw >= 0 && ih >= 0 && iw < W && ih < H)
-                                {
-                                    sum += (input[n * C * H * W + c * (W * H) + ih * W + iw] *
-                                            filter[k * R * S * C + c * R * S + r * S + s]);
+                            packed |= (uint32_t)inputs[c_idx * param.inHW + ih * param.in_w + iw]
+                                      << (b * 8);
+                        }
+                    }
+                }
+            }
+            // Store as uint32 into smeminput via sts32
+            uint32_t smeminput_ptr = ptx::smem_u32addr(&reinterpret_cast<uint32_t *>(smeminput)[i_k * (N_TILE / 4) + i_n4]);
+            ptx::sts32(packed, smeminput_ptr);
+        }
+
+        asm volatile("cp.async.commit_group;\n" :::);
+        asm volatile("cp.async.wait_group 0;\n" :::);
+        __syncthreads();
+
+        // ----------------------------------------------------------------
+        // Stage 3: Compute [2M × 8N] outer product for this K_chunk
+        //
+        //   weight read: float2 at smemweight[k][thread_m_base]
+        //     mma_tid_y selects row → 4 threads with same mma_tid_y broadcast same float2
+        //     → weight_frag[2] = {w[thread_m_base], w[thread_m_base+1]}
+        //
+        //   input read: uint64 at smeminput[k][thread_n_base]
+        //     mma_tid_x selects col → 8 threads with same mma_tid_x broadcast same uint64
+        //     → input_frag = 8 consecutive uint8 values (8 spatial positions)
+        //
+        //   outer product: output_frag[t][i][j] += weight_frag[i]  if spike_t(input_frag[j])
+        // ----------------------------------------------------------------
+        float    weight_frag[2];
+        uint32_t input_frag_lo, input_frag_hi;  // uint64 split into two uint32
+
+#pragma unroll
+        for (int k = 0; k < K_CHUNK; k++)
+        {
+            // lds64: float2 from smemweight — mma_tid_y broadcast (0 bank conflict)
+            uint32_t w_addr = ptx::smem_u32addr(&smemweight[k * M_TILE + thread_m_base]);
+            ptx::lds64(weight_frag[0], weight_frag[1], w_addr);
+
+            // lds64: uint64 from smeminput split as two uint32 — mma_tid_x broadcast (0 bank conflict)
+            uint32_t i_addr = ptx::smem_u32addr(&smeminput[k * N_TILE + thread_n_base]);
+            ptx::lds64(input_frag_lo, input_frag_hi, i_addr);
+
+            // T-way parallel conditional accumulation
+#pragma unroll
+            for (int t = 0; t < T_STEPS; t++)
+            {
+#pragma unroll
+                for (int i = 0; i < 2; i++)
+                {
+#pragma unroll
+                    for (int j = 0; j < 8; j++)
+                    {
+                        // j=0..3 from lo word, j=4..7 from hi word
+                        uint32_t word  = (j < 4) ? input_frag_lo : input_frag_hi;
+                        int      shift = (j % 4) * 8 + t;
+                        int      spike = (word >> shift) & 1;
+                        add_f32(output_frag[t][i][j], weight_frag[i], spike);
+                    }
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // ----------------------------------------------------------------
+    // Epilogue: reg → smem → gmem  (mirrors conv2d_32x128x8 pattern)
+    //
+    // Per-warp tile: [16M × 32N], split into 2 batches of [8M × 32N].
+    //   Per batch: 8 × 32 = 256 floats = 1KB / warp, 8 warps = 8KB ✓
+    //
+    // SMEM epilogue layout (reuse smem after K-loop, 8KB total):
+    //   smemout for warp: smem + warp_id * 1024B  → [8M][32N] float
+    //
+    // Thread (mma_tid_y, mma_tid_x) owns:
+    //   M: rows {mma_tid_y*2, mma_tid_y*2+1}  within [0..15] of warp tile
+    //   N: cols {mma_tid_x*8 .. mma_tid_x*8+7} within [0..31] of warp tile
+    //
+    // Batch b (0 or 1) covers warp-local M rows [b*8 .. b*8+7]:
+    //   threads with mma_tid_y ∈ {b*4, b*4+1, b*4+2, b*4+3} contribute.
+    //   Within the [8M×32N] smem tile, this thread's smem-local row = mma_tid_y%4*2
+    //
+    // sts128: write 4 floats at [smem_row][mma_tid_x*8+0..3] and [+4..7]
+    //         for both M rows (smem_row and smem_row+1)
+    //
+    // lds + stg32: lane_id covers 32 N positions in one row (32 threads × 1 float)
+    //   loop 8 M rows → 8 stg32 calls per batch
+    // ----------------------------------------------------------------
+
+    // Epilogue reuses smem, warp gets 256 floats = 1KB
+    float       *warp_smem      = reinterpret_cast<float *>(smem) + warp_id * 256;
+    uint32_t     warp_smem_base = ptx::smem_u32addr(warp_smem);
+    const float *smemout_lds    = warp_smem + lane_id;
+
+    // GMEM base for this warp's tile
+    const int warp_m_global = m_tile_base + warp_m * 16;  // first M row
+    const int warp_n_global = n_tile_base + warp_n * 32;  // first N col
+
+    // lane_id-based N index and guard
+    const int  n_global  = warp_n_global + lane_id;
+    const bool n_valid   = (n_global < (int)param.outHW);
+
+    for (int t = 0; t < T_STEPS; t++)
+    {
+        float *out_t = outputs + (size_t)t * param.out_ch * param.outHW;
+
+#pragma unroll
+        for (int b = 0; b < 2; b++)
+        {
+            // smem-local M row for this thread within the [8M×32N] tile
+            // batch b covers warp-local rows [b*8 .. b*8+7]
+            // this thread's warp-local rows = mma_tid_y*2, mma_tid_y*2+1
+            // smem row = (mma_tid_y - b*4)*2 = (mma_tid_y%4)*2
+            const int smem_row = (mma_tid_y % 4) * 2;  // 0,2,4,6
+
+            // sts: write [smem_row][0..7] and [smem_row+1][0..7] for N-block mma_tid_x
+            // smem stride = 32 floats/row
+            __syncthreads();
+
+            if (mma_tid_y / 4 == b)
+            {
+                const uint32_t sts_r0 = warp_smem_base
+                    + (uint32_t)(smem_row * 32 + mma_tid_x * 8) * sizeof(float);
+                const uint32_t sts_r1 = warp_smem_base
+                    + (uint32_t)((smem_row + 1) * 32 + mma_tid_x * 8) * sizeof(float);
+
+                ptx::sts128(output_frag[t][0][0], output_frag[t][0][1],
+                            output_frag[t][0][2], output_frag[t][0][3], sts_r0);
+                ptx::sts128(output_frag[t][0][4], output_frag[t][0][5],
+                            output_frag[t][0][6], output_frag[t][0][7],
+                            sts_r0 + 4 * (uint32_t)sizeof(float));
+
+                ptx::sts128(output_frag[t][1][0], output_frag[t][1][1],
+                            output_frag[t][1][2], output_frag[t][1][3], sts_r1);
+                ptx::sts128(output_frag[t][1][4], output_frag[t][1][5],
+                            output_frag[t][1][6], output_frag[t][1][7],
+                            sts_r1 + 4 * (uint32_t)sizeof(float));
+            }
+
+            __syncthreads();
+
+            // stg: all 32 threads stream 8 rows from smem to GMEM
+            // smemout_lds + row*32 → lane_id position in row
+            const int m_base = warp_m_global + b * 8;
+
+#pragma unroll
+            for (int row = 0; row < 8; row++)
+            {
+                const int  m_global = m_base + row;
+                const bool m_valid  = (m_global < (int)param.out_ch);
+                ptx::stg32(smemout_lds[row * 32],
+                           out_t + (size_t)m_global * param.outHW + n_global,
+                           m_valid && n_valid);
+            }
+        }
+    }
+}
+
+
+// CPU reference for multi-T SNN conv (for correctness verification)
+void snn_conv2d_cpu_ref(
+    const uint8_t *inputs,   // [1, C_in, H, W] packed uint8
+    const float   *weights,  // [C_in*Kh*Kw, C_out] float
+    float         *outputs,  // [T, C_out, H_out, W_out] float
+    int T, int C_in, int H, int W,
+    int C_out, int Kh, int Kw,
+    int stride, int pad)
+{
+    int H_out = (H + 2 * pad - Kh) / stride + 1;
+    int W_out = (W + 2 * pad - Kw) / stride + 1;
+
+    for (int t = 0; t < T; t++) {
+        for (int k = 0; k < C_out; k++) {
+            for (int oh = 0; oh < H_out; oh++) {
+                for (int ow = 0; ow < W_out; ow++) {
+                    float sum = 0.f;
+                    for (int c = 0; c < C_in; c++) {
+                        for (int ky = 0; ky < Kh; ky++) {
+                            for (int kx = 0; kx < Kw; kx++) {
+                                int ih = oh * stride - pad + ky;
+                                int iw = ow * stride - pad + kx;
+                                if (ih < 0 || ih >= H || iw < 0 || iw >= W) continue;
+                                uint8_t packed = inputs[c * H * W + ih * W + iw];
+                                int spike = (packed >> t) & 1;
+                                if (spike) {
+                                    int feat_idx = c * Kh * Kw + ky * Kw + kx;
+                                    sum += weights[feat_idx * C_out + k];
                                 }
                             }
                         }
                     }
-                    output[n * K * Oh * Ow + k * Oh * Ow + oh * Ow + ow] = sum + bias[k];
+                    outputs[t * C_out * H_out * W_out + k * H_out * W_out + oh * W_out + ow] = sum;
                 }
             }
         }
@@ -43,479 +354,114 @@ void direct_conv2d_T_cpu(
 }
 
 
-__global__ void conv2d_32x128x8_T_S_kernel(
-        uint32_t *inputs, float *weights, float *bias, float *outputs, Conv2DParam param)
+void snn_conv2d_launch(
+    const uint8_t *d_inputs, const float *d_weights, float *d_outputs,
+    Conv2DParam &param, int T)
 {
-    __shared__ __align__ (16 * 1024) char smem[16 * 1024];
-    auto *smemweight = reinterpret_cast<float *>(smem);
-    auto *smeminput = reinterpret_cast<uint32_t *>(smem + 8 * 1024);
-
-    const uint32_t lane_id = threadIdx.x % 32;
-    const uint32_t warp_id = threadIdx.x / 32;
-    const uint32_t mma_tid_x = lane_id / 2;
-    const uint32_t mma_tid_y = lane_id % 2;
-
-    uint32_t inputs_sts_addr = smem_u32addr(smeminput + (threadIdx.x / 32) * 128 + (threadIdx.x % 32));
-    uint32_t weights_sts_addr = smem_u32addr(smemweight + threadIdx.x);
-
-    uint32_t inputs_lds_addr = smem_u32addr(smeminput + (warp_id % 2) * 64 + mma_tid_x * 4);
-    uint32_t weights_lds_addr = smem_u32addr(smemweight + (warp_id / 2) * 8 + mma_tid_y * 4);
-
-    const char *input_ldg_ptr = (const char *) (inputs + blockIdx.z * param.inBatchNumel);
-    const char *weight_ldg_ptr = (const char *) (
-            weights + blockIdx.y * 32 + threadIdx.x / 32 * param.out_ch + threadIdx.x % 32);
-
-    uint32_t input_ldg_reg[4];
-    float weight_ldg_reg;
-
-    uint32_t input_frag[2][4];
-    float weight_frag[2][4];
-    float output_frag[4][4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-    {
-#pragma unroll
-        for (int j = 0; j < 4; ++j)
-        {
-            output_frag[i][j] = 0;
-        }
-    }
-
-    int posh_ori[4];
-    int posw_ori[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-    {
-        posh_ori[i] = ((blockIdx.x * 128 + threadIdx.x % 32 + i * 32) / param.out_w) * param.Sh - param.Ph;
-        posw_ori[i] = ((blockIdx.x * 128 + threadIdx.x % 32 + i * 32) % param.out_w) * param.Sw - param.Pw;
-    }
-
-    bool weights_ldg_guard = blockIdx.y * 32 + threadIdx.x % 32 < param.out_ch;
-    ldg32_nc_0(weight_ldg_reg, weight_ldg_ptr, weights_ldg_guard && threadIdx.x / 32 < param.first_k_tile);
-
-    int curC = threadIdx.x / 32 / param.KhKw;
-    int curR = threadIdx.x / 32 % param.KhKw / param.Kw;
-    int curS = threadIdx.x / 32 % param.KhKw % param.Kw;
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-    {
-        int curH = posh_ori[i] + curR;
-        int curW = posw_ori[i] + curS;
-        int inOffsetTmp = curC * param.inHW + curH * param.in_w + curW;
-
-        bool guard = threadIdx.x / 32 < param.first_k_tile && curH >= 0 &&
-                     curW >= 0 && curW < param.in_w && curH < param.in_h;
-        ldg32_nc_0(input_ldg_reg[i], input_ldg_ptr + inOffsetTmp * sizeof(uint32_t), guard);
-    }
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-    {
-        sts32(input_ldg_reg[i], inputs_sts_addr + i * 32 * sizeof(uint32_t));
-    }
-    sts32(weight_ldg_reg, weights_sts_addr);
-    __syncthreads();
-
-    inputs_sts_addr ^= 0x1000;  // 0x1000=4096
-    weights_sts_addr ^= 0x1000; // 0x0400=1024
-
-    weight_ldg_ptr += param.first_k_tile * param.out_ch * sizeof(float);
-
-    lds128(input_frag[0][0], input_frag[0][1], input_frag[0][2], input_frag[0][3], inputs_lds_addr);
-    lds128(weight_frag[0][0], weight_frag[0][1], weight_frag[0][2], weight_frag[0][3], weights_lds_addr);
-
-    for (int crs = 0; crs < param.inChKhKw - param.first_k_tile; crs += 8)
-    {
-#pragma unroll
-        for (int k_frag = 0; k_frag < 8; ++k_frag)
-        {
-            if (k_frag == 7)
-            {
-#pragma unroll
-                for (int i = 0; i < 4; ++i)
-                {
-                    sts32(input_ldg_reg[i], inputs_sts_addr + i * 32 * sizeof(uint32_t));
-                }
-                sts32(weight_ldg_reg, weights_sts_addr);
-                __syncthreads();
-
-                inputs_lds_addr ^= 0x1000;
-                weights_lds_addr ^= 0x1000;
-                inputs_sts_addr ^= 0x1000;
-                weights_sts_addr ^= 0x1000;
-
-                weight_ldg_ptr += 8 * param.out_ch * sizeof(float);
-            }
-
-            lds128(weight_frag[(k_frag + 1) % 2][0],
-                   weight_frag[(k_frag + 1) % 2][1],
-                   weight_frag[(k_frag + 1) % 2][2],
-                   weight_frag[(k_frag + 1) % 2][3],
-                   weights_lds_addr + (k_frag + 1) % 8 * 32 * sizeof(float));
-            lds128(input_frag[(k_frag + 1) % 2][0],
-                   input_frag[(k_frag + 1) % 2][1],
-                   input_frag[(k_frag + 1) % 2][2],
-                   input_frag[(k_frag + 1) % 2][3],
-                   inputs_lds_addr + (k_frag + 1) % 8 * 128 * sizeof(uint32_t));
-
-            if (k_frag == 0)
-            {
-                ldg32_nc(weight_ldg_reg, weight_ldg_ptr, weights_ldg_guard);
-
-                curC = (crs + param.first_k_tile + threadIdx.x / 32) / param.KhKw;
-                curR = (crs + param.first_k_tile + threadIdx.x / 32) % param.KhKw / param.Kw;
-                curS = (crs + param.first_k_tile + threadIdx.x / 32) % param.KhKw % param.Kw;
-#pragma unroll
-                for (int i = 0; i < 4; ++i)
-                {
-                    int curH = posh_ori[i] + curR;
-                    int curW = posw_ori[i] + curS;
-                    int inOffsetTmp = curC * param.inHW + curH * param.in_w + curW;
-
-                    bool guard = curH >= 0 && curW >= 0 && curW < param.in_w && curH < param.in_h;
-                    ldg32_nc_0(input_ldg_reg[i], input_ldg_ptr + inOffsetTmp * sizeof(uint32_t), guard);
-                }
-            }
-
-#pragma unroll
-            for (int i = 0; i < 4; ++i)
-            {
-#pragma unroll
-                for (int j = 0; j < 4; ++j)
-                {
-                    // output_frag[i][j] += weight_frag[k_frag % 2][i] * input_frag[k_frag % 2][j];
-
-                    add_f32(output_frag[i][j], weight_frag[k_frag % 2][i], (int) input_frag[k_frag % 2][j]);
-
-                    // if (input_frag[k_frag % 2][j])
-                    //     output_frag[i][j] += weight_frag[k_frag % 2][i];
-                }
-            }
-        }
-    }
-
-#pragma unroll
-    for (int k_frag = 0; k_frag < 8; ++k_frag)
-    {
-        if (k_frag < 7)
-        {
-            lds128(weight_frag[(k_frag + 1) % 2][0],
-                   weight_frag[(k_frag + 1) % 2][1],
-                   weight_frag[(k_frag + 1) % 2][2],
-                   weight_frag[(k_frag + 1) % 2][3],
-                   weights_lds_addr + (k_frag + 1) % 8 * 32 * sizeof(float));
-            lds128(input_frag[(k_frag + 1) % 2][0],
-                   input_frag[(k_frag + 1) % 2][1],
-                   input_frag[(k_frag + 1) % 2][2],
-                   input_frag[(k_frag + 1) % 2][3],
-                   inputs_lds_addr + (k_frag + 1) % 8 * 128 * sizeof(uint32_t));
-        }
-
-#pragma unroll
-        for (int i = 0; i < 4; ++i)
-        {
-#pragma unroll
-            for (int j = 0; j < 4; ++j)
-            {
-                // output_frag[i][j] += weight_frag[k_frag % 2][i] * input_frag[k_frag % 2][j];
-
-                add_f32(output_frag[i][j], weight_frag[k_frag % 2][i], (int) input_frag[k_frag % 2][j]);
-
-                // if (input_frag[k_frag % 2][j])
-                //     output_frag[i][j] += weight_frag[k_frag % 2][i];
-            }
-        }
-    }
-
-    auto *smembias = reinterpret_cast<float *>(smem + 8 * 1024);
-    if (threadIdx.x < 32)
-    {
-        smembias[threadIdx.x] = bias[blockIdx.y * 32 + threadIdx.x];
-    }
-
-    uint32_t outputs_sts_addr = smem_u32addr((float4 *) (smem + warp_id * 1024) + mma_tid_y * 16 * 2 + mma_tid_x);
-    const float *outputs_lds_ptr = (float *) (smem + warp_id * 1024) + lane_id;
-    uint32_t bias_lds_addr = warp_id / 2 * 8 + mma_tid_y * 4;
-
-    int m_idx = blockIdx.y * 32 + warp_id / 2 * 8;
-    int n_idx = blockIdx.x * 128 + warp_id % 2 * 64 + lane_id;
-
-    float *outputs_stg_ptr = outputs + blockIdx.z * param.outBatchNumel + m_idx * param.outHW + n_idx;
-
-    if (m_idx >= param.out_ch)
-    {
-        return;
-    }
-    else if (m_idx + 8 <= param.out_ch)
-    {
-        uint32_t n_guard = param.outHW < n_idx ? 0 : param.outHW - n_idx;
-
-#pragma unroll
-        for (int i = 0; i < 2; ++i)
-        {
-            __syncthreads();
-
-#pragma unroll
-            for (int p = 0; p < 2; ++p)
-            {
-                sts128(output_frag[p + i * 2][0] + smembias[bias_lds_addr + p + i * 2],
-                       output_frag[p + i * 2][1] + smembias[bias_lds_addr + p + i * 2],
-                       output_frag[p + i * 2][2] + smembias[bias_lds_addr + p + i * 2],
-                       output_frag[p + i * 2][3] + smembias[bias_lds_addr + p + i * 2],
-                       outputs_sts_addr + p * 16 * sizeof(float4));
-            }
-            __syncthreads();
-
-            stg32(outputs_lds_ptr[0 * 64], outputs_stg_ptr + 0 * param.outHW, 0 < n_guard);
-            stg32(outputs_lds_ptr[0 * 64 + 32], outputs_stg_ptr + 0 * param.outHW + 32, 32 < n_guard);
-
-            stg32(outputs_lds_ptr[1 * 64], outputs_stg_ptr + 1 * param.outHW, 0 < n_guard);
-            stg32(outputs_lds_ptr[1 * 64 + 32], outputs_stg_ptr + 1 * param.outHW + 32, 32 < n_guard);
-
-            stg32(outputs_lds_ptr[2 * 64], outputs_stg_ptr + 4 * param.outHW, 0 < n_guard);
-            stg32(outputs_lds_ptr[2 * 64 + 32], outputs_stg_ptr + 4 * param.outHW + 32, 32 < n_guard);
-
-            stg32(outputs_lds_ptr[3 * 64], outputs_stg_ptr + 5 * param.outHW, 0 < n_guard);
-            stg32(outputs_lds_ptr[3 * 64 + 32], outputs_stg_ptr + 5 * param.outHW + 32, 32 < n_guard);
-
-            outputs_stg_ptr += 2 * param.outHW;
-        }
-    }
-    else
-    {
-        uint32_t n_guard = param.outHW < n_idx ? 0 : param.outHW - n_idx;
-        uint32_t m_guard = param.out_ch < m_idx ? 0 : param.out_ch - m_idx;
-
-#pragma unroll
-        for (int i = 0; i < 2; ++i)
-        {
-            __syncthreads();
-
-#pragma unroll
-            for (int p = 0; p < 2; ++p)
-            {
-                sts128(output_frag[p + i * 2][0] + smembias[bias_lds_addr + p + i * 2],
-                       output_frag[p + i * 2][1] + smembias[bias_lds_addr + p + i * 2],
-                       output_frag[p + i * 2][2] + smembias[bias_lds_addr + p + i * 2],
-                       output_frag[p + i * 2][3] + smembias[bias_lds_addr + p + i * 2],
-                       outputs_sts_addr + p * 16 * sizeof(float4));
-            }
-            __syncthreads();
-
-            stg32(outputs_lds_ptr[0 * 64], outputs_stg_ptr + 0 * param.outHW, 0 < m_guard && 0 < n_guard);
-            stg32(outputs_lds_ptr[0 * 64 + 32], outputs_stg_ptr + 0 * param.outHW + 32, 0 < m_guard && 32 < n_guard);
-
-            stg32(outputs_lds_ptr[1 * 64], outputs_stg_ptr + 1 * param.outHW, 1 < m_guard && 0 < n_guard);
-            stg32(outputs_lds_ptr[1 * 64 + 32], outputs_stg_ptr + 1 * param.outHW + 32, 1 < m_guard && 32 < n_guard);
-
-            stg32(outputs_lds_ptr[2 * 64], outputs_stg_ptr + 4 * param.outHW, 4 < m_guard && 0 < n_guard);
-            stg32(outputs_lds_ptr[2 * 64 + 32], outputs_stg_ptr + 4 * param.outHW + 32, 4 < m_guard && 32 < n_guard);
-
-            stg32(outputs_lds_ptr[3 * 64], outputs_stg_ptr + 5 * param.outHW, 5 < m_guard && 0 < n_guard);
-            stg32(outputs_lds_ptr[3 * 64 + 32], outputs_stg_ptr + 5 * param.outHW + 32, 5 < m_guard && 32 < n_guard);
-
-            outputs_stg_ptr += 2 * param.outHW;
-            m_guard -= 2;
-        }
-    }
-}
-
-
-
-
-/**
- * Mini Test Kernel: 64×64 output, single block, K_CHUNK=16
- *
- * SMEM: weight [K_CHUNK=16, M_TILE=64] float (4KB)
- *       input  [K_CHUNK=16, N_TILE=64] uint8 (1KB)
- *
- * Thread layout (from thread_map.txt, 8 rows × 4 cols per warp):
- *   256 threads, 8 warps
- *   lane_id = tid % 32,  warp_id = tid / 32
- *   mma_tid_x = lane_id / 16 * 2 + lane_id % 2  (0..3)
- *   mma_tid_y = lane_id % 16 / 2                 (0..7)
- *
- * Warp decomposition:
- *   warp_m = warp_id / 2 (0..3) → M [warp_m*16, warp_m*16+16)
- *   warp_n = warp_id % 2 (0..1) → N [warp_n*32, warp_n*32+32)
- *
- * Within warp [16M, 32N], each thread handles [4M, 4N]:
- *   M_group = mma_tid_y / 2                    (0..3)
- *   N_group = mma_tid_x * 2 + mma_tid_y % 2    (0..7)
- */
-__global__ void conv2d_64x64x16_test(
-    const uint8_t *inputs,   // [16, 64] uint8
-    const float *weights,    // [16, 64] float
-    float *outputs)          // [64, 64] float
-{
-    constexpr int K_CHUNK = 16;
-    constexpr int M_TILE = 64;
-    constexpr int N_TILE = 64;
-
-    __shared__ __align__(128) char smem[5 * 1024];
-    float *smemweight = reinterpret_cast<float *>(smem);
-    uint8_t *smeminput = reinterpret_cast<uint8_t *>(smem + 4 * 1024);
-
-    const int tid = threadIdx.x;
-    const int lane_id = tid % 32;
-    const int warp_id = tid / 32;
-    const int mma_tid_x = lane_id / 16 * 2 + lane_id % 2;  // 0..3
-    const int mma_tid_y = lane_id % 16 / 2;                 // 0..7
-
-    const int warp_m = warp_id / 2;  // 0..3
-    const int warp_n = warp_id % 2;  // 0..1
-
-    // Thread's sub-position within warp [16M, 32N] → [4M, 4N]
-    const int M_group = mma_tid_y / 2;                  // 0..3
-    const int N_group = mma_tid_x * 2 + mma_tid_y % 2;  // 0..7
-
-    // --- Load weights [16, 64] float → SMEM with cp.async ---
-    // 16×16=256 threads, each copies 1 float4 (16B)
-    int w_row_f4 = tid / 16;      // 0..15
-    int w_col_f4 = tid % 16;      // 0..15
-    int w_col    = w_col_f4 * 4;  // 0,4,8,...,60
-
-    uint32_t w_smem_ptr = smem_u32addr(&smemweight[w_row_f4 * M_TILE + w_col]);
-    asm volatile(
-        "cp.async.cg.shared.global [%0], [%1], 16;\n"
-        :: "r"(w_smem_ptr),
-           "l"(&weights[w_row_f4 * M_TILE + w_col])
+    dim3 block(256);
+    dim3 grid(
+        (param.outHW  + 63) / 64,   // spatial tiles
+        (param.out_ch + 63) / 64,   // C_out tiles
+        1
     );
 
-    // --- Load inputs [16, 64] uint8 → SMEM ---
-    // 256 threads, each copies 4 uint8 = 1 uint32
-    int i_row = tid / 16;        // 0..15
-
-    uint32_t *smeminput32 = reinterpret_cast<uint32_t *>(smeminput);
-    const uint32_t *inputs32 = reinterpret_cast<const uint32_t *>(inputs);
-    smeminput32[i_row * (N_TILE / 4) + (tid % 16)] =
-        inputs32[i_row * (N_TILE / 4) + (tid % 16)];
-
-    asm volatile("cp.async.commit_group;\n" :::);
-    asm volatile("cp.async.wait_group 0;\n" :::);
-    __syncthreads();
-
-    // --- Register fragments ---
-    float weight_frag[4];
-    uint32_t input_frag;  // 4 uint8 packed
-    float output_frag[4][4] = {0};
-
-    int thread_m_base = warp_m * 16 + M_group * 4;
-    int thread_n_base = warp_n * 32 + N_group * 4;
-
-    // K-iteration: accumulate over all K_CHUNK rows
-    for (int k = 0; k < K_CHUNK; k++) {
-        // Load weight_frag[4] from smemweight[k][thread_m_base .. thread_m_base+4)
-        // SMEM weight layout: [K_CHUNK=16][M_TILE=64], row stride = M_TILE
-        for (int i = 0; i < 4; i++) {
-            weight_frag[i] = smemweight[k * M_TILE + thread_m_base + i];
-        }
-
-        // Load input_frag (4 uint8 packed) from smeminput[k][thread_n_base ..]
-        // SMEM input layout: [K_CHUNK=16][N_TILE=64], packed as [16][16] uint32
-        input_frag = smeminput32[k * (N_TILE / 4) + thread_n_base / 4];
-
-        // Outer product: output_frag[i][j] += weight_frag[i] * input[j]
-        // Ref lines 186-190: add_f32 with spike guard
-        for (int i = 0; i < 4; i++) {
-            for (int j = 0; j < 4; j++) {
-                int spike = (input_frag >> (j * 8)) & 0xFF;
-                add_f32(output_frag[i][j], weight_frag[i], spike);
-                // if (spike) output_frag[i][j] += weight_frag[i];
-            }
-        }
-    }
-
-    // --- Epilogue: write output_frag[4][4] to GMEM ---
-    // Output: [M_TILE=64][N_TILE=64], row-major
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++) {
-            int out_m = thread_m_base + i;
-            int out_n = thread_n_base + j;
-            outputs[out_m * N_TILE + out_n] = output_frag[i][j];
-        }
+    switch (T) {
+        case 1: snn_conv2d_64x64_k16<1><<<grid, block>>>(d_inputs, d_weights, d_outputs, param); break;
+        case 2: snn_conv2d_64x64_k16<2><<<grid, block>>>(d_inputs, d_weights, d_outputs, param); break;
+        case 3: snn_conv2d_64x64_k16<3><<<grid, block>>>(d_inputs, d_weights, d_outputs, param); break;
+        case 4: snn_conv2d_64x64_k16<4><<<grid, block>>>(d_inputs, d_weights, d_outputs, param); break;
     }
 }
 
 
-void conv2d_64x64_cpu_ref(
-    const uint8_t *inputs, const float *weights, float *outputs,
-    int K, int M, int N)
+void snn_conv2d_test(int T, int C_in, int H, int W, int C_out,
+                     int Kh, int Kw, int stride, int pad)
 {
-    // output[M, N] += weights[K, M]^T @ inputs[K, N]
-    // output[m][n] = sum_k weight[k][m] * input[k][n]
-    for (int m = 0; m < M; m++) {
-        for (int n = 0; n < N; n++) {
-            float sum = 0;
-            for (int k = 0; k < K; k++) {
-                if (inputs[k * N + n]) {
-                    sum += weights[k * M + m];
-                }
-            }
-            outputs[m * N + n] = sum;
-        }
-    }
-}
+    const int H_out      = (H + 2*pad - Kh) / stride + 1;
+    const int W_out      = (W + 2*pad - Kw) / stride + 1;
+    const int in_features = C_in * Kh * Kw;
 
+    printf("  T=%d C_in=%d H=%d C_out=%d K=%dx%d s=%d p=%d → H_out=%d in_feat=%d  ",
+           T, C_in, H, C_out, Kh, Kw, stride, pad, H_out, in_features);
 
-void conv2d_64x64_mini_test()
-{
-    constexpr int K = 16;
-    constexpr int M = 64;
-    constexpr int N = 64;
+    size_t input_sz  = (size_t)C_in * H * W;
+    size_t weight_sz = (size_t)in_features * C_out;
+    size_t output_sz = (size_t)T * C_out * H_out * W_out;
 
-    printf("\n=== conv2d_64x64x16 mini test ===\n");
-    printf("  K=%d, M=%d, N=%d, T=1\n", K, M, N);
+    uint8_t *h_inputs  = new uint8_t[input_sz];
+    float   *h_weights = new float[weight_sz];
+    float   *h_outputs = new float[output_sz];
+    float   *h_ref     = new float[output_sz];
 
-    // Host alloc
-    uint8_t *h_inputs  = new uint8_t[K * N];
-    float   *h_weights = new float[K * M];
-    float   *h_outputs = new float[M * N];
-    float   *h_ref     = new float[M * N];
-
-    // Random init
     srand(42);
-    for (int i = 0; i < K * N; i++) {
-        h_inputs[i] = (uint8_t)((rand() & 1));  // 0 or 1
+    // Pack T bits per element: bit t = spike at time t (0 or 1)
+    for (size_t i = 0; i < input_sz; i++) {
+        uint8_t packed = 0;
+        for (int t = 0; t < T; t++) {
+            if ((rand() & 1)) packed |= (1u << t);
+        }
+        h_inputs[i] = packed;
     }
-    for (int i = 0; i < K * M; i++) {
-        h_weights[i] = (float)((rand() & 255)) / 256.0f;
+    for (size_t i = 0; i < weight_sz; i++) {
+        h_weights[i] = (float)(rand() & 255) / 256.f;
     }
 
-    // Device alloc
     uint8_t *d_inputs;
-    float   *d_weights;
-    float   *d_outputs;
-    cudaMalloc(&d_inputs,  K * N * sizeof(uint8_t));
-    cudaMalloc(&d_weights, K * M * sizeof(float));
-    cudaMalloc(&d_outputs, M * N * sizeof(float));
+    float   *d_weights, *d_outputs;
+    cudaMalloc(&d_inputs,  input_sz  * sizeof(uint8_t));
+    cudaMalloc(&d_weights, weight_sz * sizeof(float));
+    cudaMalloc(&d_outputs, output_sz * sizeof(float));
+    cudaMemset(d_outputs, 0, output_sz * sizeof(float));
 
-    cudaMemcpy(d_inputs,  h_inputs,  K * N * sizeof(uint8_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_weights, h_weights, K * M * sizeof(float),   cudaMemcpyHostToDevice);
+    cudaMemcpy(d_inputs,  h_inputs,  input_sz  * sizeof(uint8_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weights, h_weights, weight_sz * sizeof(float),   cudaMemcpyHostToDevice);
 
-    // Launch
-    dim3 block(256);
-    dim3 grid(1, 1, 1);
-    conv2d_64x64x16_test<<<grid, block>>>(d_inputs, d_weights, d_outputs);
+    Conv2DParam param;
+    param.in_h         = H;
+    param.in_w         = W;
+    param.inHW         = H * W;
+    param.inChKhKw     = in_features;
+    param.inBatchNumel = C_in * H * W;
+    param.out_ch       = C_out;
+    param.out_w        = W_out;
+    param.outHW        = H_out * W_out;
+    param.outBatchNumel = C_out * H_out * W_out;
+    param.Kh           = Kh;
+    param.Kw           = Kw;
+    param.KhKw         = Kh * Kw;
+    param.Sh           = stride;
+    param.Sw           = stride;
+    param.Ph           = pad;
+    param.Pw           = pad;
 
-    cudaMemcpy(h_outputs, d_outputs, M * N * sizeof(float), cudaMemcpyDeviceToHost);
+    snn_conv2d_launch(d_inputs, d_weights, d_outputs, param, T);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("  CUDA error: %s\n", cudaGetErrorString(err));
+        goto cleanup;
+    }
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(h_outputs, d_outputs, output_sz * sizeof(float), cudaMemcpyDeviceToHost);
 
     // CPU reference
-    conv2d_64x64_cpu_ref(h_inputs, h_weights, h_ref, K, M, N);
+    snn_conv2d_cpu_ref(h_inputs, h_weights, h_ref,
+                       T, C_in, H, W, C_out, Kh, Kw, stride, pad);
 
-    // Verify
-    int errors = 0;
-    for (int m = 0; m < M; m++) {
-        for (int n = 0; n < N; n++) {
-            if (abs(h_outputs[m * N + n] - h_ref[m * N + n]) > 0.001f) {
-                if (errors < 10)
-                    printf("  Err[%d,%d]: gpu=%.4f, cpu=%.4f\n",
-                           m, n, h_outputs[m * N + n], h_ref[m * N + n]);
+    {
+        int errors = 0;
+        for (size_t i = 0; i < output_sz; i++) {
+            if (fabsf(h_outputs[i] - h_ref[i]) > 0.001f) {
+                if (errors < 5)
+                    printf("  Err[%zu]: gpu=%.4f cpu=%.4f\n", i, h_outputs[i], h_ref[i]);
                 errors++;
             }
         }
+        printf("  %s (%d errors)\n", errors == 0 ? "PASSED!" : "FAILED", errors);
     }
-    printf("  %s (%d errors)\n", errors == 0 ? "PASSED!" : "FAILED", errors);
 
+cleanup:
     cudaFree(d_inputs);
     cudaFree(d_weights);
     cudaFree(d_outputs);
@@ -526,393 +472,27 @@ void conv2d_64x64_mini_test()
 }
 
 
-void conv2d_T_kernel_launch(void *inputs, void *weights, void *bias, void *outputs, Conv2DParam param, uint32_t n)
+int main() 
 {
-    uint32_t bx = (param.outHW + 127) / 128;
-    uint32_t by = (param.out_ch + 63) / 64;
-    uint32_t bz = n;
+    printf("\n=== snn_conv2d_64x64_k16 tests ===\n");
+    // T=1..4, 3x3 stride=1 pad=1
+    for (int t = 1; t <= 4; t++)
+        snn_conv2d_test(t,  64, 80, 80,  64, 3, 3, 1, 1);
 
-    dim3 block(256);
-    dim3 grid(bx, by, bz);
+    // boundary: C_out not multiple of 64
+    snn_conv2d_test(2,  64, 80, 80,  48, 3, 3, 1, 1);
 
-    // conv2d_32x128x8_T_S_kernel<<<grid, block>>>((uint32_t *) inputs, (float *) weights, (float *) bias, (float *) outputs, param);
-}
+    // 1x1 conv
+    snn_conv2d_test(4,  64, 80, 80,  64, 1, 1, 1, 0);
 
-void conv2d_T_main()
-{
-    // --- Mini test: 64×64, K_CHUNK=16, T=1 ---
-    conv2d_64x64_mini_test();
+    // stride=2
+    snn_conv2d_test(4,  64, 80, 80,  64, 3, 3, 2, 1);
 
-    int n, c, h, w, k, r, s, u, v, p, q;
-    // n = 4, c = 4, h = 160, w = h, k = 4, r = 3, s = r, u = 2, v = u, p = 1, q = p;
-    // n = 4, c = 128, h = 160, w = h, k = 128, r = 3, s = r, u = 2, v = u, p = 1, q = p;
+    // larger C_in
+    snn_conv2d_test(4, 128, 40, 40, 128, 3, 3, 1, 1);
 
-    // 32
-    // n = 2, c = 32, h = 160, w = h, k = 16, r = 3, s = r, u = 2, v = u, p = 1, q = p;
-    // n = 1, c = 32, h = 85, w = h, k = 35, r = 3, s = r, u = 2, v = u, p = 1, q = p;
+    // spatial not multiple of 64 (outHW=41*41=1681)
+    snn_conv2d_test(2,  32, 43, 43,  32, 3, 3, 1, 1);
 
-    // 64
-    n = 2, c = 64, h = 160, w = h, k = 64, r = 3, s = r, u = 2, v = u, p = 1, q = p;
-    // n = 2, c = 65, h = 160, w = h, k = 69, r = 3, s = r, u = 2, v = u, p = 1, q = p;
-
-    // 128
-    // n = 2, c = 128, h = 160, w = h, k = 128, r = 3, s = r, u = 2, v = u, p = 1, q = p;
-    // n = 2, c = 128, h = 160, w = h, k = 128, r = 1, s = r, u = 1, v = u, p = 0, q = p;
-    // n = 2, c = 128, h = 160, w = h, k = 128, r = 3, s = r, u = 1, v = u, p = 1, q = p;
-
-    // n = 2, c = 33, h = 43, w = h, k = 128, r = 3, s = r, u = 2, v = u, p = 1, q = p;
-    // n = 1, c = 3, h = 40, w = h, k = 9, r = 3, s = r, u = 2, v = u, p = 1, q = p;
-
-    int out_h = (h - r + 2 * p) / u + 1;
-    int out_w = (w - s + 2 * q) / v + 1;
-    printf("outH: %4d   outW: %4d\n", out_h, out_w);
-
-    Conv2DParam param;
-    param.in_h = h;
-    param.in_w = w;
-    param.inHW = h * w;
-    param.inChKhKw = c * r * s;
-    param.inChKhKw = (c * r * s + 1) / 2; // half
-    param.inBatchNumel = c * h * w;
-    param.out_ch = k;
-    param.out_w = out_w;
-    param.outHW = out_h * out_w;
-    param.outBatchNumel = k * out_h * out_w;
-    param.Kw = s;
-    param.KhKw = r * s;
-    param.Sh = u;
-    param.Sw = v;
-    param.Ph = p;
-    param.Pw = q;
-
-    param.k_tiles = (param.inChKhKw + 7) / 8 - 1;
-    param.first_k_tile = param.inChKhKw - param.k_tiles * 8;
-
-    double M = k;
-    double N = n * out_h * out_w;
-    double K = c * r * s;
-    double temp = n * out_h * out_w * 1e-9f;
-    double flopsPerConv = temp * M * K * 2.0;
-
-    uint32_t *spikes;
-    uint16_t *spikes_h;
-    float *inputs, *weights, *weightsT, *bias, *outputs_cpu, *outputs_host;
-    half *inputs_h, *weights_h, *weightsT_h, *outputs_host_h;
-    half2 *bias_h;
-    cudaMallocHost((void **) &spikes, n * c * h * w * sizeof(uint32_t));
-    cudaMallocHost((void **) &spikes_h, n * c * h * w * sizeof(uint16_t));
-    cudaMallocHost((void **) &inputs, n * c * h * w * sizeof(float));
-    cudaMallocHost((void **) &weights, k * c * r * s * sizeof(float));
-    cudaMallocHost((void **) &weightsT, k * c * r * s * sizeof(float));
-    cudaMallocHost((void **) &bias, k * sizeof(float));
-    cudaMallocHost((void **) &inputs_h, n * c * h * w * sizeof(half));
-    cudaMallocHost((void **) &weights_h, k * c * r * s * sizeof(half));
-    cudaMallocHost((void **) &weightsT_h, (c * r * s + 1) / 2 * k * sizeof(half2));
-    // cudaMallocHost((void **) &weightsT_h, (k + 1) / 2 * c * r * s * sizeof(half2));
-    cudaMallocHost((void **) &bias_h, k * sizeof(half2));
-    cudaMallocHost((void **) &outputs_cpu, n * k * out_h * out_w * sizeof(float));
-    cudaMallocHost((void **) &outputs_host, n * k * out_h * out_w * sizeof(float));
-    cudaMallocHost((void **) &outputs_host_h, n * k * out_h * out_w * sizeof(half));
-
-    uint32_t *spikes_device;
-    uint16_t *spikes_device_h;
-    float *inputs_device, *weights_device, *weightsT_device, *bias_device, *outputs_device;
-    half *inputs_device_h, *weights_device_h, *weightsT_device_h, *outputs_device_h;
-    half2 *bias_device_h;
-    cudaMalloc((void **) &spikes_device, n * c * h * w * sizeof(uint32_t));
-    cudaMalloc((void **) &spikes_device_h, n * c * h * w * sizeof(uint16_t));
-    cudaMalloc((void **) &inputs_device, n * c * h * w * sizeof(float));
-    cudaMalloc((void **) &weights_device, k * c * r * s * sizeof(float));
-    cudaMalloc((void **) &weightsT_device, k * c * r * s * sizeof(float));
-    cudaMalloc((void **) &bias_device, k * sizeof(float));
-    cudaMalloc((void **) &outputs_device, n * k * out_h * out_w * sizeof(float));
-    cudaMalloc((void **) &inputs_device_h, n * c * h * w * sizeof(half));
-    cudaMalloc((void **) &weights_device_h, k * c * r * s * sizeof(half));
-    cudaMalloc((void **) &weightsT_device_h, (c * r * s + 1) / 2 * k * sizeof(half2));
-    // cudaMalloc((void **) &weightsT_device_h, (k + 1) / 2 * c * r * s * sizeof(half2));
-    cudaMalloc((void **) &bias_device_h, k * sizeof(half2));
-    cudaMalloc((void **) &outputs_device_h, n * k * out_h * out_w * sizeof(half));
-
-    for (int i = 0; i < n * c * h * w; i++)
-    {
-        // input[i] = 0.1f;
-        inputs[i] = (rand() & 255) / 256.0f;
-
-        if (inputs[i] > 0.5f)
-        {
-            spikes[i] = 1;
-            spikes_h[i] = 1;
-            inputs[i] = 1.0f;
-        }
-        else
-        {
-            spikes[i] = 0;
-            spikes_h[i] = 0;
-            inputs[i] = 0;
-        }
-        // spikes[i] = 0;
-        // spikes_h[i] = 0;
-        // inputs[i] = 0.0f;
-        inputs_h[i] = __float2half_rn(inputs[i]);
-    }
-    for (int i = 0; i < k * c * r * s; i++)
-    {
-        // weights[i] = 0.25f;
-        weights[i] = (rand() & 255) / 256.0f;
-        weights_h[i] = __float2half_rn(weights[i]);
-    }
-    for (int i = 0; i < k; i++)
-    {
-        // bias[i] = 10.0f;
-        bias[i] = (rand() & 255) / 256.0f;
-        bias_h[i] = half2(bias[i], bias[i]);
-        // bias_h[i] = half2(0.0f, bias[i]);
-        // bias_h[i] = half2(bias[i], 0.0f);
-    }
-
-    // Transpose
-    for (int j = 0; j < k; j++)
-    {
-        for (int i = 0; i < c * r * s; i++)
-        {
-            weightsT[i * k + j] = weights[j * (c * r * s) + i];
-        }
-    }
-    // Transpose half
-    auto *weightsTPtr = reinterpret_cast<half2 *>(weightsT_h);
-    int kernelNumel = c * r * s;
-    for (int j = 0; j < k; j++)
-    {
-        for (int i = 0; i < (kernelNumel + 1) / 2; i++)
-        {
-            half2 x = half2(0, 0);
-
-            x.x = weights_h[j * kernelNumel + i * 2];
-            if (i * 2 + 1 < kernelNumel)
-                x.y = weights_h[j * kernelNumel + i * 2 + 1];
-
-            weightsTPtr[i * k + j] = x;
-        }
-    }
-    // for (int j = 0; j < (k + 1) / 2; j++)
-    // {
-    //     for (int i = 0; i < kernelNumel; i++)
-    //     {
-    //         half2 x = half2(0, 0);
-
-    //         x.x = weight_h[(j * 2) * kernelNumel + i];
-    //         if (j * 2 + 1 < k)
-    //             x.y = weight_h[(j * 2 + 1) * kernelNumel + i];
-
-    //         weightsTPtr[i * ((k + 1) / 2) + j] = x;
-    //     }
-    // }
-
-    // printf("==================== Weights T ====================\n");
-    // for (int i = 0; i < c * r * s; i++)
-    // {
-    //     for (int j = 0; j < k; j++)
-    //     {
-    //         printf("%.4lf ", weightT[i * k + j]);
-    //     }
-    //     printf("\n");
-    // }
-    // printf("==================== Weights T ====================\n");
-    // printf("=================== Weights T Half ===================\n");
-    // for (int i = 0; i < c * r * s; i++)
-    // {
-    //     for (int j = 0; j < (k + 1) / 2; j++)
-    //     {
-    //         printf("%.4lf %.4lf ", __half2float(weightT_h[i * ((k + 1) / 2 * 2) + j * 2]),
-    //                __half2float(weightT_h[i * ((k + 1) / 2 * 2) + j * 2 + 1]));
-    //     }
-    //     printf("\n");
-    // }
-    // printf("=================== Weights T Half ===================\n");
-
-    cudaMemcpy(spikes_device, spikes, n * c * h * w * sizeof(uint32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(spikes_device_h, spikes_h, n * c * h * w * sizeof(uint16_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(inputs_device, inputs, n * c * h * w * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(weights_device, weights, k * c * r * s * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(weightsT_device, weightsT, k * c * r * s * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(bias_device, bias, k * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(inputs_device_h, inputs_h, n * c * h * w * sizeof(half), cudaMemcpyHostToDevice);
-    cudaMemcpy(weights_device_h, weights_h, k * c * r * s * sizeof(half), cudaMemcpyHostToDevice);
-    cudaMemcpy(weightsT_device_h, weightsT_h, (c * r * s + 1) / 2 * k * sizeof(half2), cudaMemcpyHostToDevice);
-    // cudaMemcpy(weightsT_device_h, weightT_h, (k + 1) / 2 * c * r * s * sizeof(half2), cudaMemcpyHostToDevice);
-    cudaMemcpy(bias_device_h, bias_h, k * sizeof(half2), cudaMemcpyHostToDevice);
-
-    // conv2d_T_kernel_launch(inputs_device, weightsT_device, bias_device, outputs_device, param, n);
-    // cudaMemcpy(outputs_host, outputs_device, n * k * out_h * out_w * sizeof(float), cudaMemcpyDeviceToHost);
-    
-    // conv2d_T_kernel_launch(inputs_device_h, weightsT_device_h, bias_device_h, outputs_device_h, param, n);
-    // cudaMemcpy(outputs_host_h, outputs_device_h, n * k * out_h * out_w * sizeof(half), cudaMemcpyDeviceToHost);
-    
-    // conv2d_T_kernel_launch(spikes_device, weightsT_device, bias_device, outputs_device, param, n);
-    // cudaMemcpy(outputs_host, outputs_device, n * k * out_h * out_w * sizeof(float), cudaMemcpyDeviceToHost);
-    
-    conv2d_T_kernel_launch(spikes_device_h, weightsT_device_h, bias_device_h, outputs_device_h, param, n);
-    cudaMemcpy(outputs_host_h, outputs_device_h, n * k * out_h * out_w * sizeof(half), cudaMemcpyDeviceToHost);
-
-
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    cudaEventRecord(start);
-    float time_elapsed = 0;
-
-    int iters = 0;
-    for (int i = 0; i < iters; i++)
-    {
-        conv2d_T_kernel_launch(inputs_device, weightsT_device, bias_device, outputs_device, param, n);
-        // conv2d_T_kernel_launch(inputs_device_h, weightsT_device_h, bias_device_h, outputs_device_h, param, n);
-        // conv2d_T_kernel_launch(spikes_device, weightsT_device, bias_device, outputs_device, param, n);
-        // conv2d_T_kernel_launch(spikes_device_h, weightsT_device_h, bias_device_h, outputs_device_h, param, n);
-    }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&time_elapsed, start, stop);
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-
-    printf("=================== CPU Calc ===================\n");
-    direct_conv2d_T_cpu(inputs, weights, bias, outputs_cpu, n, c, h, w, k, r, s, u, v, p, q);
-
-    printf("=================== start verfiy ===================\n");
-    int error = 0;
-    for (int i = 0; i < n * k * out_h * out_w; i++)
-    {
-        // if (abs(outputs_host[i] - outputs_cpu[i]) > 0.0001f)
-        if (abs(__half2float(outputs_host_h[i]) - outputs_cpu[i]) > 0.80f) // 0.25  0.80
-        {
-            // printf("Error: %d, gpu: %.4lf, cpu: %.4lf\n", i, outputs_host[i], outputs_cpu[i]);
-
-            printf("Error: %d, gpu: %.4lf, cpu: %.4lf %.4lf\n",
-                   i, __half2float(outputs_host_h[i]), outputs_cpu[i],
-                      __half2float(outputs_host_h[i]) - outputs_cpu[i]);
-
-            error++;
-            if (error > 10)
-                break;
-        }
-    }
-    // printf("%.4lf %.4lf\n", outputs_host[0], outputs_cpu[0]);
-    // printf("%.4lf %.4lf\n", outputs_host[1], outputs_cpu[1]);
-    // printf("%.4lf %.4lf\n", outputs_host[2], outputs_cpu[2]);
-    // printf("%.4lf %.4lf\n", outputs_host[3], outputs_cpu[3]);
-
-    printf("%.4lf %.4lf\n", __half2float(outputs_host_h[0]), outputs_cpu[0]);
-    printf("%.4lf %.4lf\n", __half2float(outputs_host_h[1]), outputs_cpu[1]);
-    printf("%.4lf %.4lf\n", __half2float(outputs_host_h[2]), outputs_cpu[2]);
-    printf("%.4lf %.4lf\n", __half2float(outputs_host_h[3]), outputs_cpu[3]);
-
-    // printf("%lf %lf %lf %lf\n", outputs_cpu[0], outputs_cpu[1], outputs_cpu[2], outputs_cpu[3]);
-    printf("===================  Error: %d  =====================\n", error);
-
-    float timePerConv = time_elapsed / iters;
-    double gflops = flopsPerConv / (timePerConv / 1000.0f);
-    printf("%3d %3d %3d %3d | %d %d %d\n", n, c, h, w, r, s, k);
-    printf("time: %.6f ms\n", timePerConv);
-    printf("Performance: %.2f GFlops\n", gflops);
-
-#ifdef use_cudnn
-    printf("=================== cudnn ===================\n");
-
-    cudnnHandle_t cudnn;
-    cudnnCreate(&cudnn);
-
-    cudnnTensorDescriptor_t input_desc;
-    cudnnCreateTensorDescriptor(&input_desc);
-    cudnnSetTensor4dDescriptor(input_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w);
-
-    cudnnFilterDescriptor_t filter_desc;
-    cudnnCreateFilterDescriptor(&filter_desc);
-    cudnnSetFilter4dDescriptor(filter_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, k, c, r, s);
-
-    cudnnConvolutionDescriptor_t conv_desc;
-    cudnnCreateConvolutionDescriptor(&conv_desc);
-    cudnnSetConvolution2dDescriptor(conv_desc, p, q, u, v, 1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT);
-
-    cudnnTensorDescriptor_t output_desc;
-    cudnnCreateTensorDescriptor(&output_desc);
-    cudnnSetTensor4dDescriptor(output_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, k, out_h, out_w);
-
-    // cudnnGetConvolution2dForwardOutputDim(conv_desc, input_desc, filter_desc, &n, &k, &out_h, &out_w);
-
-
-    size_t space_size = 0;
-    cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
-    cudnnGetConvolutionForwardWorkspaceSize(
-            cudnn, input_desc, filter_desc, conv_desc, output_desc,
-            algo, &space_size);
-
-    void *workspace = nullptr;
-    cudaMalloc(&workspace, space_size);
-
-    float alpha = 1.0f, beta = 0.0f;
-    cudnnConvolutionForward(
-            cudnn, &alpha,
-            input_desc, input_device, filter_desc, weight_device,
-            conv_desc, algo, workspace, space_size,
-            &beta, output_desc, output_device);
-
-    cudaMemcpy(output_host, output_device, n * k * out_h * out_w * sizeof(float), cudaMemcpyDeviceToHost);
-
-    printf("=================== start verfiy ===================\n");
-    error = 0;
-    for (int i = 0; i < n * k * out_h * out_w; i++)
-    {
-        if (abs(output_host[i] - output_cpu[i]) > 0.0001f)
-        {
-            printf("Error: position: %d, gpu: %lf, cpu: %lf\n", i, output_host[i], output_cpu[i]);
-            error++;
-            break;
-        }
-    }
-    printf("%lf %lf\n", output_host[0], output_cpu[0]);
-    printf("%lf %lf\n", output_host[1], output_cpu[1]);
-    printf("%lf %lf %lf %lf\n", output_cpu[0], output_cpu[1], output_cpu[2], output_cpu[3]);
-
-    printf("===================  Error: %d  =====================\n", error);
-
-    cudaFree(workspace);
-    cudnnDestroyTensorDescriptor(input_desc);
-    cudnnDestroyTensorDescriptor(output_desc);
-    cudnnDestroyFilterDescriptor(filter_desc);
-    cudnnDestroyConvolutionDescriptor(conv_desc);
-    cudnnDestroy(cudnn);
-#endif
-
-
-    cudaFree(spikes_device);
-    cudaFree(spikes_device_h);
-    cudaFree(inputs_device);
-    cudaFree(weights_device);
-    cudaFree(weightsT_device);
-    cudaFree(bias_device);
-    cudaFree(outputs_device);
-    cudaFree(inputs_device_h);
-    cudaFree(weights_device_h);
-    cudaFree(weightsT_device_h);
-    cudaFree(outputs_device_h);
-    cudaFree(bias_device_h);
-
-    cudaFreeHost(spikes);
-    cudaFreeHost(spikes_h);
-    cudaFreeHost(inputs);
-    cudaFreeHost(weights);
-    cudaFreeHost(weightsT);
-    cudaFreeHost(bias);
-    cudaFreeHost(outputs_cpu);
-    cudaFreeHost(outputs_host);
-    cudaFreeHost(inputs_h);
-    cudaFreeHost(weights_h);
-    cudaFreeHost(weightsT_h);
-    cudaFreeHost(outputs_host_h);
-    cudaFreeHost(bias_h);
-}
-
-int main() {
-    conv2d_T_main();
     return 0;
 }
