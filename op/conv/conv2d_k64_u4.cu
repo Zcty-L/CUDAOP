@@ -7,6 +7,9 @@
 // =============================================================================
 // SNN Conv2D Specialized Kernels — three compile-time variants:
 //
+// This variant keeps GMEM inputs as uint8 packed spikes, then repacks the input
+// tile into u4 nibbles in SMEM. It is not TensorRT FP4 numeric storage.
+//
 //   Variant A: 1×1, stride=1, pad=0   Kh=1, Kw=1, Sh=1, Sw=1, Ph=0, Pw=0
 //   Variant B: 3×3, stride=1, pad=1   Kh=3, Kw=3, Sh=1, Sw=1, Ph=1, Pw=1
 //   Variant C: 3×3, stride=2, pad=1   Kh=3, Kw=3, Sh=2, Sw=2, Ph=1, Pw=1
@@ -18,12 +21,12 @@
 // All variants inherit from conv2d_k64_padded.cu:
 //   - 64×64 output tile, K_chunk=16, 256 threads (8 warps)
 //   - Weight cp.async.ca (always full 16B, no boundary predicate)
-//   - Double buffer (ping-pong): 2×5KB = 10KB SMEM
+//   - Double buffer (ping-pong): weights 2×4KB + inputs 2×512B = 9KB SMEM
 //   - Co_out padded to ×64, in_features padded to ×16
 // =============================================================================
 
 template <int T_STEPS, int Kh, int Kw, int Sh, int Sw, int Ph, int Pw>
-__global__ void snn_conv2d_64x64_k16_v2(
+__global__ void snn_conv2d_64x64_k16_u8_smem_u4(
     const uint8_t * __restrict__ inputs,
     const float   * __restrict__ weights,
     float         * __restrict__ outputs,
@@ -35,22 +38,22 @@ __global__ void snn_conv2d_64x64_k16_v2(
     constexpr int N_TILE   = 64;
     constexpr int KhKw     = Kh * Kw;
 
-    __shared__ __align__(128) char smem[10 * 1024];
+    __shared__ __align__(128) char smem[9 * 1024];
 
     float   *smemweight[2];
     smemweight[0] = reinterpret_cast<float *>(smem);
     smemweight[1] = reinterpret_cast<float *>(smem + 4 * 1024);
 
-    uint8_t *smeminput[2];
-    smeminput[0] = reinterpret_cast<uint8_t *>(smem + 8 * 1024);
-    smeminput[1] = reinterpret_cast<uint8_t *>(smem + 9 * 1024);
+    uint32_t *smeminput[2];
+    smeminput[0] = reinterpret_cast<uint32_t *>(smem + 8 * 1024);
+    smeminput[1] = reinterpret_cast<uint32_t *>(smem + 8 * 1024 + 512);
 
     // --- Thread indices (verified: 0 bank conflicts) ---
     const int tid     = threadIdx.x;
     const int lane_id = tid % 32;
     const int warp_id = tid / 32;
 
-    const int mma_tid_x = lane_id / 16 * 2 + lane_id % 2;  // 0..3
+    const int mma_tid_x = lane_id / 16 * 2 + lane_id % 2;   // 0..3
     const int mma_tid_y = lane_id % 16 / 2;                 // 0..7
 
     const int warp_m = warp_id / 2;
@@ -97,7 +100,10 @@ __global__ void snn_conv2d_64x64_k16_v2(
     };
 
     // ----------------------------------------------------------------
-    // load_input: pack 4 uint8 → uint32, sts32 → SMEM
+    // load_input: pack 4 uint8 low nibbles → uint16, sts16 → SMEM.
+    // GMEM input remains one uint8 per spatial point; only SMEM is u4-packed.
+    // All 256 threads participate, matching the u8 load parallelism. Two
+    // neighboring halfword stores form one uint32 consumed by the compute path.
     //
     //   Variant A (KhKw==1): ky=kx=0, ih=oh*Sh-Ph, iw=ow*Sw-Pw
     //     With s=1/p=0: ih=oh, iw=ow — always in bounds, no check needed.
@@ -113,7 +119,7 @@ __global__ void snn_conv2d_64x64_k16_v2(
         const int i_n4     = tid % 16;
         const int global_k = k_base + i_k;
 
-        uint32_t packed = 0;
+        uint16_t packed = 0;
         if (global_k < in_features)
         {
             if constexpr (KhKw == 1)
@@ -132,9 +138,9 @@ __global__ void snn_conv2d_64x64_k16_v2(
                         int ow = n_idx % param.out_w;
                         int ih = oh * Sh - Ph;
                         int iw = ow * Sw - Pw;
-                        packed |= (uint32_t)inputs[c_idx * param.inHW
-                                                   + ih * param.in_w + iw]
-                                  << (b * 8);
+                        packed |= (uint16_t)(((uint32_t)inputs[c_idx * param.inHW
+                                                              + ih * param.in_w + iw] & 0xFu)
+                                             << (b * 4));
                     }
                 }
             }
@@ -158,17 +164,21 @@ __global__ void snn_conv2d_64x64_k16_v2(
                         if (ih >= 0 && ih < (int)param.in_h &&
                             iw >= 0 && iw < (int)param.in_w)
                         {
-                            packed |= (uint32_t)inputs[c_idx * param.inHW
-                                                       + ih * param.in_w + iw]
-                                      << (b * 8);
+                            packed |= (uint16_t)(((uint32_t)inputs[c_idx * param.inHW
+                                                                  + ih * param.in_w + iw] & 0xFu)
+                                                 << (b * 4));
                         }
                     }
                 }
             }
         }
+
         uint32_t smeminput_ptr = ptx::smem_u32addr(
-            &reinterpret_cast<uint32_t *>(smeminput[buf])[i_k * (N_TILE / 4) + i_n4]);
-        ptx::sts32(packed, smeminput_ptr);
+            &reinterpret_cast<uint16_t *>(smeminput[buf])[i_k * (N_TILE / 4) + i_n4]);
+        asm volatile(
+            "st.shared.b16 [%0], %1;\n"
+            :: "r"(smeminput_ptr), "h"(packed)
+        );
     };
 
     // ----------------------------------------------------------------
@@ -200,7 +210,7 @@ __global__ void snn_conv2d_64x64_k16_v2(
         __syncthreads();
 
         float    weight_frag[2];
-        uint32_t input_frag_lo, input_frag_hi;
+        uint32_t input_frag;
 
 #pragma unroll
         for (int k = 0; k < K_CHUNK; k++)
@@ -210,8 +220,8 @@ __global__ void snn_conv2d_64x64_k16_v2(
             ptx::lds64(weight_frag[0], weight_frag[1], w_addr);
 
             uint32_t i_addr = ptx::smem_u32addr(
-                &smeminput[cur][k * N_TILE + thread_n_base]);
-            ptx::lds64(input_frag_lo, input_frag_hi, i_addr);
+                &smeminput[cur][k * (N_TILE / 8) + (thread_n_base >> 3)]);
+            ptx::lds32(input_frag, i_addr);
 
 #pragma unroll
             for (int t = 0; t < T_STEPS; t++)
@@ -222,9 +232,8 @@ __global__ void snn_conv2d_64x64_k16_v2(
 #pragma unroll
                     for (int j = 0; j < 8; j++)
                     {
-                        uint32_t word  = (j < 4) ? input_frag_lo : input_frag_hi;
-                        int      shift = (j % 4) * 8 + t;
-                        int      spike = (word >> shift) & 1;
+                        int      shift = j * 4 + t;
+                        int      spike = (input_frag >> shift) & 1;
                         add_f32(output_frag[t][i][j], weight_frag[i], spike);
                     }
                 }
@@ -318,7 +327,7 @@ static void pad_weights(
 // =============================================================================
 
 template <int T, int Kh, int Kw, int Sh, int Sw, int Ph, int Pw>
-void snn_conv2d_v2_launch(
+void snn_conv2d_u8_smem_u4_launch(
     const uint8_t *d_inputs, const float *d_weights_padded,
     float *d_outputs, Conv2DParam &param, int out_ch_padded)
 {
@@ -328,46 +337,46 @@ void snn_conv2d_v2_launch(
         (param.out_ch + 63) / 64,
         1
     );
-    snn_conv2d_64x64_k16_v2<T, Kh, Kw, Sh, Sw, Ph, Pw>
+    snn_conv2d_64x64_k16_u8_smem_u4<T, Kh, Kw, Sh, Sw, Ph, Pw>
         <<<grid, block>>>(d_inputs, d_weights_padded, d_outputs, param, out_ch_padded);
 }
 
 // Variant A: 1×1, stride=1, pad=0
-void snn_conv2d_1x1_s1_launch(
+void snn_conv2d_u8_smem_u4_1x1_s1_launch(
     const uint8_t *d_in, const float *d_w, float *d_out,
     Conv2DParam &param, int T, int out_ch_padded)
 {
     switch (T) {
-        case 1: snn_conv2d_v2_launch<1, 1,1,1,1,0,0>(d_in, d_w, d_out, param, out_ch_padded); break;
-        case 2: snn_conv2d_v2_launch<2, 1,1,1,1,0,0>(d_in, d_w, d_out, param, out_ch_padded); break;
-        case 3: snn_conv2d_v2_launch<3, 1,1,1,1,0,0>(d_in, d_w, d_out, param, out_ch_padded); break;
-        case 4: snn_conv2d_v2_launch<4, 1,1,1,1,0,0>(d_in, d_w, d_out, param, out_ch_padded); break;
+        case 1: snn_conv2d_u8_smem_u4_launch<1, 1,1,1,1,0,0>(d_in, d_w, d_out, param, out_ch_padded); break;
+        case 2: snn_conv2d_u8_smem_u4_launch<2, 1,1,1,1,0,0>(d_in, d_w, d_out, param, out_ch_padded); break;
+        case 3: snn_conv2d_u8_smem_u4_launch<3, 1,1,1,1,0,0>(d_in, d_w, d_out, param, out_ch_padded); break;
+        case 4: snn_conv2d_u8_smem_u4_launch<4, 1,1,1,1,0,0>(d_in, d_w, d_out, param, out_ch_padded); break;
     }
 }
 
 // Variant B: 3×3, stride=1, pad=1
-void snn_conv2d_3x3_s1_launch(
+void snn_conv2d_u8_smem_u4_3x3_s1_launch(
     const uint8_t *d_in, const float *d_w, float *d_out,
     Conv2DParam &param, int T, int out_ch_padded)
 {
     switch (T) {
-        case 1: snn_conv2d_v2_launch<1, 3,3,1,1,1,1>(d_in, d_w, d_out, param, out_ch_padded); break;
-        case 2: snn_conv2d_v2_launch<2, 3,3,1,1,1,1>(d_in, d_w, d_out, param, out_ch_padded); break;
-        case 3: snn_conv2d_v2_launch<3, 3,3,1,1,1,1>(d_in, d_w, d_out, param, out_ch_padded); break;
-        case 4: snn_conv2d_v2_launch<4, 3,3,1,1,1,1>(d_in, d_w, d_out, param, out_ch_padded); break;
+        case 1: snn_conv2d_u8_smem_u4_launch<1, 3,3,1,1,1,1>(d_in, d_w, d_out, param, out_ch_padded); break;
+        case 2: snn_conv2d_u8_smem_u4_launch<2, 3,3,1,1,1,1>(d_in, d_w, d_out, param, out_ch_padded); break;
+        case 3: snn_conv2d_u8_smem_u4_launch<3, 3,3,1,1,1,1>(d_in, d_w, d_out, param, out_ch_padded); break;
+        case 4: snn_conv2d_u8_smem_u4_launch<4, 3,3,1,1,1,1>(d_in, d_w, d_out, param, out_ch_padded); break;
     }
 }
 
 // Variant C: 3×3, stride=2, pad=1
-void snn_conv2d_3x3_s2_launch(
+void snn_conv2d_u8_smem_u4_3x3_s2_launch(
     const uint8_t *d_in, const float *d_w, float *d_out,
     Conv2DParam &param, int T, int out_ch_padded)
 {
     switch (T) {
-        case 1: snn_conv2d_v2_launch<1, 3,3,2,2,1,1>(d_in, d_w, d_out, param, out_ch_padded); break;
-        case 2: snn_conv2d_v2_launch<2, 3,3,2,2,1,1>(d_in, d_w, d_out, param, out_ch_padded); break;
-        case 3: snn_conv2d_v2_launch<3, 3,3,2,2,1,1>(d_in, d_w, d_out, param, out_ch_padded); break;
-        case 4: snn_conv2d_v2_launch<4, 3,3,2,2,1,1>(d_in, d_w, d_out, param, out_ch_padded); break;
+        case 1: snn_conv2d_u8_smem_u4_launch<1, 3,3,2,2,1,1>(d_in, d_w, d_out, param, out_ch_padded); break;
+        case 2: snn_conv2d_u8_smem_u4_launch<2, 3,3,2,2,1,1>(d_in, d_w, d_out, param, out_ch_padded); break;
+        case 3: snn_conv2d_u8_smem_u4_launch<3, 3,3,2,2,1,1>(d_in, d_w, d_out, param, out_ch_padded); break;
+        case 4: snn_conv2d_u8_smem_u4_launch<4, 3,3,2,2,1,1>(d_in, d_w, d_out, param, out_ch_padded); break;
     }
 }
 
@@ -423,8 +432,8 @@ static void snn_conv2d_cpu_ref(
 // =============================================================================
 
 template <int T, int Kh, int Kw, int Sh, int Sw, int Ph, int Pw>
-void snn_conv2d_v2_test(int C_in, int H, int W, int C_out,
-                         const char *label)
+void snn_conv2d_u8_smem_u4_test(int C_in, int H, int W, int C_out,
+                                 const char *label)
 {
     constexpr int KhKw    = Kh * Kw;
     constexpr int K_CHUNK = 16;
@@ -492,7 +501,7 @@ void snn_conv2d_v2_test(int C_in, int H, int W, int C_out,
     param.Ph            = Ph;
     param.Pw            = Pw;
 
-    snn_conv2d_v2_launch<T, Kh, Kw, Sh, Sw, Ph, Pw>(
+    snn_conv2d_u8_smem_u4_launch<T, Kh, Kw, Sh, Sw, Ph, Pw>(
         d_inputs, d_weightsP, d_outputs, param, C_out_padded);
 
     cudaError_t err = cudaGetLastError();
@@ -506,7 +515,6 @@ void snn_conv2d_v2_test(int C_in, int H, int W, int C_out,
 
     snn_conv2d_cpu_ref<Kh, Kw, Sh, Sw, Ph, Pw>(
         h_inputs, h_weights, h_ref, T, C_in, H, W, C_out);
-
     {
         int errors = 0;
         float max_diff = 0.f;
@@ -520,8 +528,50 @@ void snn_conv2d_v2_test(int C_in, int H, int W, int C_out,
             }
             if (diff > max_diff) max_diff = diff;
         }
-        printf("  %s (%d errors, max_diff=%.6f)\n",
-               errors == 0 ? "PASSED!" : "FAILED", errors, max_diff);
+
+        constexpr int WARMUP_ITERS = 10;
+        constexpr int BENCH_ITERS  = 100;
+        float avg_ms = -1.f;
+        cudaEvent_t start = nullptr;
+        cudaEvent_t stop  = nullptr;
+        cudaError_t bench_err = cudaEventCreate(&start);
+        if (bench_err == cudaSuccess) bench_err = cudaEventCreate(&stop);
+
+        if (bench_err == cudaSuccess) {
+            for (int i = 0; i < WARMUP_ITERS; i++) {
+                snn_conv2d_u8_smem_u4_launch<T, Kh, Kw, Sh, Sw, Ph, Pw>(
+                    d_inputs, d_weightsP, d_outputs, param, C_out_padded);
+            }
+            bench_err = cudaDeviceSynchronize();
+        }
+
+        if (bench_err == cudaSuccess) {
+            cudaEventRecord(start);
+            for (int i = 0; i < BENCH_ITERS; i++) {
+                snn_conv2d_u8_smem_u4_launch<T, Kh, Kw, Sh, Sw, Ph, Pw>(
+                    d_inputs, d_weightsP, d_outputs, param, C_out_padded);
+            }
+            cudaEventRecord(stop);
+            bench_err = cudaEventSynchronize(stop);
+        }
+
+        if (bench_err == cudaSuccess) {
+            float elapsed_ms = 0.f;
+            bench_err = cudaEventElapsedTime(&elapsed_ms, start, stop);
+            avg_ms = elapsed_ms / BENCH_ITERS;
+        }
+
+        if (start) cudaEventDestroy(start);
+        if (stop)  cudaEventDestroy(stop);
+
+        if (bench_err == cudaSuccess) {
+            printf("  %s (%d errors, max_diff=%.6f) avg_ms=%.6f\n",
+                   errors == 0 ? "PASSED!" : "FAILED", errors, max_diff, avg_ms);
+        } else {
+            printf("  %s (%d errors, max_diff=%.6f) bench_error=%s\n",
+                   errors == 0 ? "PASSED!" : "FAILED", errors, max_diff,
+                   cudaGetErrorString(bench_err));
+        }
     }
 
 cleanup:
@@ -542,41 +592,41 @@ cleanup:
 
 int main()
 {
-    printf("\n=== snn_conv2d_64x64_k16_v2 — three specialized variants ===\n");
+    printf("\n=== snn_conv2d_64x64_k16_u8_smem_u4 — three specialized variants ===\n");
 
     // =====================================================================
     // Variant A: 1×1, stride=1, pad=0
     // =====================================================================
-    printf("\n--- Variant A: 1×1, s=1, p=0 ---\n");
+    printf("\n--- Variant A: 1x1, s=1, p=0 ---\n");
 
-    snn_conv2d_v2_test<4, 1,1,1,1,0,0>( 64, 80, 80,  64, "base");
-    snn_conv2d_v2_test<4, 1,1,1,1,0,0>(128, 40, 40, 128, "larger");
-    snn_conv2d_v2_test<2, 1,1,1,1,0,0>( 64, 80, 80,  48, "C_out boundary");
+    snn_conv2d_u8_smem_u4_test<4, 1,1,1,1,0,0>( 64, 80, 80,  64, "base");
+    snn_conv2d_u8_smem_u4_test<4, 1,1,1,1,0,0>(128, 40, 40, 128, "larger");
+    snn_conv2d_u8_smem_u4_test<2, 1,1,1,1,0,0>( 64, 80, 80,  48, "C_out boundary");
     // Many 1×1 layers have C_out > C_in or C_out < C_in
-    snn_conv2d_v2_test<4, 1,1,1,1,0,0>( 64, 40, 40, 128, "expansion x2");
-    snn_conv2d_v2_test<4, 1,1,1,1,0,0>(128, 40, 40,  64, "squeeze x0.5");
+    snn_conv2d_u8_smem_u4_test<4, 1,1,1,1,0,0>( 64, 40, 40, 128, "expansion x2");
+    snn_conv2d_u8_smem_u4_test<4, 1,1,1,1,0,0>(128, 40, 40,  64, "squeeze x0.5");
 
     // =====================================================================
     // Variant B: 3×3, stride=1, pad=1
     // =====================================================================
-    printf("\n--- Variant B: 3×3, s=1, p=1 ---\n");
+    printf("\n--- Variant B: 3x3, s=1, p=1 ---\n");
 
-    snn_conv2d_v2_test<4, 3,3,1,1,1,1>( 64, 80, 80,  64, "base");
-    snn_conv2d_v2_test<4, 3,3,1,1,1,1>( 32, 40, 40,  32, "smaller");
-    snn_conv2d_v2_test<2, 3,3,1,1,1,1>( 32, 43, 43,  48, "C_out boundary");
+    snn_conv2d_u8_smem_u4_test<4, 3,3,1,1,1,1>( 64, 80, 80,  64, "base");
+    snn_conv2d_u8_smem_u4_test<4, 3,3,1,1,1,1>( 32, 40, 40,  32, "smaller");
+    snn_conv2d_u8_smem_u4_test<2, 3,3,1,1,1,1>( 32, 43, 43,  48, "C_out boundary");
     // T=1 quick test
-    snn_conv2d_v2_test<1, 3,3,1,1,1,1>( 64, 80, 80,  64, "T=1");
+    snn_conv2d_u8_smem_u4_test<1, 3,3,1,1,1,1>( 64, 80, 80,  64, "T=1");
 
     // =====================================================================
     // Variant C: 3×3, stride=2, pad=1
     // =====================================================================
-    printf("\n--- Variant C: 3×3, s=2, p=1 ---\n");
+    printf("\n--- Variant C: 3x3, s=2, p=1 ---\n");
 
-    snn_conv2d_v2_test<4, 3,3,2,2,1,1>( 64, 80, 80,  64, "H_out=40");
+    snn_conv2d_u8_smem_u4_test<4, 3,3,2,2,1,1>( 64, 80, 80,  64, "H_out=40");
     // Channel doubling (typical for stride=2 downsampling layers)
-    snn_conv2d_v2_test<4, 3,3,2,2,1,1>( 32, 80, 80,  64, "C expand");
-    snn_conv2d_v2_test<4, 3,3,2,2,1,1>( 16, 40, 40,  32, "small H=40");
-    snn_conv2d_v2_test<2, 3,3,2,2,1,1>( 32, 43, 43, 128, "boundary");
+    snn_conv2d_u8_smem_u4_test<4, 3,3,2,2,1,1>( 32, 80, 80,  64, "C expand");
+    snn_conv2d_u8_smem_u4_test<4, 3,3,2,2,1,1>( 16, 40, 40,  32, "small H=40");
+    snn_conv2d_u8_smem_u4_test<2, 3,3,2,2,1,1>( 32, 43, 43, 128, "boundary");
 
     printf("\n=== All tests complete ===\n");
     return 0;

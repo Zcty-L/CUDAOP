@@ -236,6 +236,20 @@ __device__ __forceinline__ void sts128(const T &reg0, const T &reg1, const T &re
 // =============================================================================
 
 template <typename T>
+__device__ __forceinline__ void stg8(const T &reg, void *ptr, bool guard)
+{
+    static_assert(sizeof(T) == 1, "stg8 requires 1-byte type");
+    unsigned v = (unsigned)(*reinterpret_cast<const unsigned char*>(&reg));
+    asm volatile (
+        "{.reg .pred p;\n"
+        " setp.ne.b32 p, %2, 0;\n"
+        " @p st.global.u8 [%0], %1;\n"
+        "}"
+        : : "l"(ptr), "r"(v), "r"((int)guard)
+    );
+}
+
+template <typename T>
 __device__ __forceinline__ void stg16(const T &reg, void *ptr, bool guard)
 {
     static_assert(sizeof(T) == 2, "stg16 requires 2-byte type");
@@ -311,6 +325,20 @@ __device__ __forceinline__ void ldg_nc_0(T &reg, const void *ptr, bool guard = t
     else if constexpr (sizeof(T) == 4) { ldg32_nc_0(reg, ptr, guard); }
     else if constexpr (sizeof(T) == 8) { ldg64_nc_0(reg, ptr, guard); }
     else if constexpr (sizeof(T) == 16) { ldg128_nc_0(reg, ptr, guard); }
+}
+
+
+// Predicated fp16x2 add: @p add.f16x2 acc, acc, w
+__device__ __forceinline__ void add_f16x2(__half2 &a, const __half2 &b, int guard)
+{
+    asm volatile(
+        "{.reg .pred p;\n"
+        " setp.ne.b32 p, %2, 0;\n"
+        " @p add.f16x2 %0, %0, %1;\n"
+        "}"
+        : "+r"(*reinterpret_cast<unsigned *>(&a))
+        : "r"(*reinterpret_cast<const unsigned *>(&b)), "r"(guard)
+    );
 }
 
 } // namespace ptx
