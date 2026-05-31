@@ -47,6 +47,7 @@ set(OP_SOURCES
     "op/conv/conv2d_k64_u8_fp16.cu"
     "op/conv/conv2d_sn_k64_u8_fp16.cu"
     "op/conv/conv2d_k64_specialized_fp16_benchmark.cu"
+    "op/resize/resize_u8.cu"
     # "op/test/thread_map_test.cu"
     # "op/wgmma/wgmma_tf32.cu"
     # "op/wgmma/wgmma_bf16.cu"
