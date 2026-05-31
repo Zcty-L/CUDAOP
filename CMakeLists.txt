@@ -46,6 +46,8 @@ set(OP_SOURCES
     "op/conv/conv2d_sn_k64_u8.cu"
     "op/conv/conv2d_k64_u8_fp16.cu"
     "op/conv/conv2d_sn_k64_u8_fp16.cu"
+    "op/conv/conv2d_erf_k64_u8.cu"
+    "op/conv/conv2d_erf_k64_u8_fp16.cu"
     "op/conv/conv2d_k64_specialized_fp16_benchmark.cu"
     "op/resize/resize_u8.cu"
     "op/mul/mul_u8.cu"
