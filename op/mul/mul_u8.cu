@@ -111,7 +111,7 @@ void test_mul_u8(int c, int h, int w, int t_step)
     mul_u8_cpu_ref<T>(h_hx, h_xt, ref_ht, ref_hfloat, N, t_step);
 
     dim3 blockDim(256);
-    dim3 gridDim((N / 4 + blockDim.x - 1) / blockDim.x);
+    dim3 gridDim(((N + 3) / 4 + blockDim.x - 1) / blockDim.x);
 
     auto launch = [&]() {
         MulU8Kernel_v2<T><<<gridDim, blockDim>>>(d_hx, d_xt, d_ht, d_hfloat, N, t_step);
