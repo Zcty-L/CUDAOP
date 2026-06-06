@@ -33,14 +33,8 @@ include_directories(
 )
 
 # --- Build Explicitly Specified .cu Files ---
-# 在此处手动添加需要编译的源文件路径
 set(OP_SOURCES
-    # "op/conv/conv2d_k128.cu"
-    # "op/conv/conv2d_mma_k128.cu"
-    # "op/dwconv/conv2d_groups_fp32.cu"
-    # "op/dwconv/conv2d_groups_fp16.cu"
-    # "op/mma/mma_kernel.cu"
-    # "op/cp_async/cp_async.cu"
+    "op/conv/conv2d_k128.cu"
     "op/conv/conv2d_k64_u8.cu"
     "op/conv/conv2d_k64_u4.cu"
     "op/conv/conv2d_sn_k64_u8.cu"
@@ -48,12 +42,11 @@ set(OP_SOURCES
     "op/conv/conv2d_sn_k64_u8_fp16.cu"
     "op/conv/conv2d_erf_k64_u8.cu"
     "op/conv/conv2d_erf_k64_u8_fp16.cu"
-    "op/conv/conv2d_k64_specialized_fp16_benchmark.cu"
     "op/resize/resize_u8.cu"
     "op/mul/mul_u8.cu"
-    # "op/test/thread_map_test.cu"
-    # "op/wgmma/wgmma_tf32.cu"
-    # "op/wgmma/wgmma_bf16.cu"
+    "op/linear/linear_k128.cu"
+    "op/linear/linear_sn_k64_u8.cu"
+    "op/linear/linear_sn_k64_u8_fp16.cu"
 )
 
 foreach(SRC_FILE ${OP_SOURCES})
@@ -84,9 +77,3 @@ foreach(SRC_FILE ${OP_SOURCES})
     
     message(STATUS "Added standalone target: ${EXE_NAME}")
 endforeach()
-
-# Link CPU ops for targets that need them
-# target_sources(conv2d_groups_fp32 PRIVATE "op/cpu/cpu_ops.cpp")
-# target_include_directories(conv2d_groups_fp32 PRIVATE "${PROJECT_SOURCE_DIR}/op/cpu")
-# target_sources(mma_kernel PRIVATE "op/cpu/cpu_ops.cpp")
-# target_include_directories(mma_kernel PRIVATE "${PROJECT_SOURCE_DIR}/op/cpu")
