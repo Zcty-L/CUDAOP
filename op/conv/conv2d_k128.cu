@@ -130,15 +130,25 @@ __global__ void conv2d_128x128x8_kernel(
         }
         __syncthreads();
     }
+
+    // --- Vectorized Output Write-back (Direct STG128) ---
 #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        const int m_global = blockIdx.y * 128 + thread_m_base + i;
-        if (m_global < param.M) {
+    for (int i = 0; i < 8; i += 4) {
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const int n_global = blockIdx.x * 128 + thread_n_base + j;
+            const int m_global = blockIdx.y * 128 + thread_m_base + i;
+            if (n_global < param.N) {
+                if (m_global + 3 < param.M) {
+                    ptx::stg128(C_frag[i][j], C_frag[i+1][j], C_frag[i+2][j], C_frag[i+3][j], 
+                                &outputs[(size_t)blockIdx.z * param.outBatchNumel + (size_t)n_global * param.M + m_global], true);
+                } else {
 #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                const int n_global = blockIdx.x * 128 + thread_n_base + j;
-                if (n_global < param.N)
-                    outputs[(size_t)blockIdx.z * param.outBatchNumel + (size_t)n_global * param.M + m_global] = C_frag[i][j];
+                    for (int ii = 0; ii < 4; ii++) {
+                        if (m_global + ii < param.M)
+                            outputs[(size_t)blockIdx.z * param.outBatchNumel + (size_t)n_global * param.M + m_global + ii] = C_frag[i+ii][j];
+                    }
+                }
             }
         }
     }
@@ -379,23 +389,33 @@ __global__ void conv2d_128x128x8_FP16_kernel(
         }
         __syncthreads();
     }
+
+    // --- Vectorized Output Write-back (Direct STG128 for Half) ---
 #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        const int m_global = blockIdx.y * 128 + thread_m_base + i;
-        if (m_global < param.M) {
+    for (int j = 0; j < 8; j++) {
+        const int n_global = blockIdx.x * 128 + thread_n_base + j;
+        if (n_global < param.N) {
+            const int m_global = blockIdx.y * 128 + thread_m_base;
+            if (m_global + 7 < param.M) {
+                uint32_t r[4];
+                #pragma unroll
+                for (int ii = 0; ii < 4; ii++) {
+                    half2 h2;
+                    h2.x = __float2half(C_frag[ii*2][j]);
+                    h2.y = __float2half(C_frag[ii*2+1][j]);
+                    r[ii] = reinterpret_cast<uint32_t&>(h2);
+                }
+                ptx::stg128(r[0], r[1], r[2], r[3], &outputs[(size_t)blockIdx.z * param.outBatchNumel + (size_t)n_global * param.M + m_global], true);
+            } else {
 #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                const int n_global = blockIdx.x * 128 + thread_n_base + j;
-                if (n_global < param.N)
-                    outputs[(size_t)blockIdx.z * param.outBatchNumel + (size_t)n_global * param.M + m_global] = __float2half(C_frag[i][j]);
+                for (int i = 0; i < 8; i++) {
+                    if (m_global + i < param.M)
+                        outputs[(size_t)blockIdx.z * param.outBatchNumel + (size_t)n_global * param.M + m_global + i] = __float2half(C_frag[i][j]);
+                }
             }
         }
     }
 }
-
-// -----------------------------------------------------------------------------
-// SNN FP16 Optimized Kernel
-// -----------------------------------------------------------------------------
 __global__ void conv2d_128x128x8_S_FP16_kernel(
     const uint8_t *inputs,
     const half *weights,
