@@ -30,6 +30,7 @@ find_path(CUDNN_INCLUDE cudnn.h PATHS /usr/include /usr/local/cuda/include REQUI
 
 include_directories(
         ${PROJECT_SOURCE_DIR}
+        ${PROJECT_SOURCE_DIR}/op
 )
 
 # --- Build Explicitly Specified .cu Files ---

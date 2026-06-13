@@ -1,0 +1,7 @@
+{
+  "hooks": {
+    "preRead": {
+      "files": ["./AGENTS.md"]
+    }
+  }
+}

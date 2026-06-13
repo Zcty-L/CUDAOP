@@ -2,3 +2,7 @@ build/
 *.png
 *.jpg
 *.csv
+
+# Claude Code — 个人本地配置不提交
+.claude/settings.local.json
+.claude/memories/
