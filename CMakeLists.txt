@@ -35,6 +35,7 @@ include_directories(
 
 # --- Build Explicitly Specified .cu Files ---
 set(OP_SOURCES
+    "op/device_query.cu"
     "op/conv/conv2d_k128.cu"
     "op/conv/conv2d_k64_u8.cu"
     "op/conv/conv2d_k64_u4.cu"
@@ -78,3 +79,56 @@ foreach(SRC_FILE ${OP_SOURCES})
     
     message(STATUS "Added standalone target: ${EXE_NAME}")
 endforeach()
+
+# Build the PyTorch CUDA extension from Python. This target is intentionally
+# opt-in because it depends on the active Python environment and PyTorch.
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_custom_target(lora_moe_ops
+    COMMAND
+        ${CMAKE_COMMAND} -E env
+        TORCH_CUDA_ARCH_LIST=12.0
+        ${Python3_EXECUTABLE} setup.py build_ext --inplace
+    WORKING_DIRECTORY
+        "${PROJECT_SOURCE_DIR}/op/lora_moe"
+    COMMENT
+        "Building the lora_moe_ops Python CUDA extension"
+    VERBATIM
+)
+
+add_custom_target(lora_moe_standard_test
+    COMMAND
+        ${Python3_EXECUTABLE} test_standard.py
+    COMMAND
+        ${Python3_EXECUTABLE} test_nonstandard.py
+    COMMAND
+        ${Python3_EXECUTABLE} test_grouped_gemm.py
+    WORKING_DIRECTORY
+        "${PROJECT_SOURCE_DIR}/op/lora_moe"
+    DEPENDS
+        lora_moe_ops
+    COMMENT
+        "Testing the LoRA-MoE Torch implementations"
+    VERBATIM
+)
+
+set(
+    CUTLASS_ROOT
+    "${PROJECT_SOURCE_DIR}/../cutlass"
+    CACHE PATH
+    "Path to the CUTLASS source tree"
+)
+
+add_executable(
+    lora_moe_cutlass_grouped_test
+    op/lora_moe/csrc/cutlass_grouped_gemm_test.cu
+)
+target_include_directories(
+    lora_moe_cutlass_grouped_test
+    PRIVATE
+        "${CUTLASS_ROOT}/include"
+)
+target_link_libraries(
+    lora_moe_cutlass_grouped_test
+    PRIVATE
+        CUDA::cudart
+)
