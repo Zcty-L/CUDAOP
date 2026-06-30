@@ -119,7 +119,9 @@ cmake --build build --target <cmake目标> -j
 
 ### 1.5 创建实验记录
 
-在最终报告中维护以下表格。优化期间可先记录在 `/tmp/opt_kernel_<kernel_name>.md`，不得把临时 profile 文件提交到仓库。
+
+在最终报告中维护以下表格。优化期间可先记录在 `/tmp/opt_kernel_<kernel_name>.md`，但 `/tmp` 只作为运行中草稿。
+阶段性停止、`[BLOCKED]` 或最终交付前，必须将可读报告写入 `docs/opt_kernel/<kernel_name>.md`。不得只交付 `/tmp` 路径；临时 profile 文件不得提交到仓库。
 
 ```markdown
 | 轮次 | 假设/改动 | 正确性 | median ms | mean ms | 相对当前基线 | 决策 |
@@ -213,6 +215,20 @@ ncu -f --set basic --kernel-name regex:<kernel名称正则> \
 5. 计算单元：warp primitive、Tensor Core 或架构专用指令。
 6. 微调：展开、编译属性和较小参数搜索。
 
+
+制定计划时必须先输出“高级机制适配性判断”，不得只给微调项。至少覆盖：
+```markdown
+| 机制 | 适用条件 | 当前 kernel 是否满足 | 预期收益 | 风险 | 是否实验 |
+|------|----------|----------------------|----------|------|----------|
+| register prefetch / software pipeline | 有可重叠的下一轮 load，寄存器余量足够 |  |  |  |  |
+| shared input tile / multi-stage | block 内存在显著输入复用，shared 占用和同步成本可控 |  |  |  |  |
+| `cp.async` / async copy | global-to-shared 搬运足够大，能与计算重叠 |  |  |  |  |
+| vectorized global load | 地址连续、对齐且边界处理成本可控 |  |  |  |  |
+| cache hint / ldg variant | 访问复用或只读语义明确，cache 行为是瓶颈证据之一 |  |  |  |  |
+| TMA / block cluster | tile 搬运粒度大，存在跨线程块复用或 cluster 协作收益 |  |  |  |  |
+```
+若判定不实验，必须写明“不满足的具体条件”或“收益不足以覆盖的成本”。若判定实验，必须转化为单变量实验项。
+
 涉及架构专用机制时，先读取 [CUDA 架构特性表](references/cuda-architecture-features.md)，核对目标架构、PTX ISA、CUDA Toolkit、使用约束和 fallback。不得仅因架构支持而应用某项机制。
 
 ## 阶段 4 - 单变量实验循环
@@ -273,11 +289,8 @@ compute-sanitizer --tool memcheck ./build/<cmake目标> <运行参数>
 
 ## 阶段 6 - 交付
 
-将报告写入：
-
-```text
-docs/opt_kernel/<kernel_name>.md
-```
+仓库可见路径：`docs/opt_kernel/<kernel_name>.md`。
+若存在 `/tmp/opt_kernel_<kernel_name>.md`，将其中有效内容整理或同步到上述路径；删除或省略临时命令噪声、绝对临时 profile 路径和失败实验中不影响结论的冗余日志。
 
 报告模板：
 
