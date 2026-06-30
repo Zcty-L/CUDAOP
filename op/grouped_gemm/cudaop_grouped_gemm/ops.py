@@ -104,3 +104,24 @@ def torch_gmm(
         offs=offsets,
     )
     return _ContiguousGradient.apply(output)
+
+
+def lora_gmm(
+    a: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    batch_sizes: torch.Tensor,
+) -> torch.Tensor:
+    """用两个 CUTLASS Grouped GEMM 组成 LoRA down/up。"""
+    hidden = gmm(
+        a,
+        down_weight,
+        batch_sizes,
+        trans_b=True,
+    )
+    return gmm(
+        hidden,
+        up_weight,
+        batch_sizes,
+        trans_b=False,
+    )

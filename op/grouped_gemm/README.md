@@ -8,6 +8,7 @@
 - `LoraUpGrouped`：Triton LoRA up 前向算子。
 - `LoraFusedDownUpGrouped`：融合 down/up，并额外返回供反向使用的
   `[M, 16]` 中间矩阵。
+- `triton_fused_lora`：支持自动求导的融合接口。
 
 Triton LoRA 实现固定 rank=16，并拆分为两个 kernel：
 
@@ -22,8 +23,23 @@ rank=16 收缩。两个算子会按 `batch_sizes` Tensor 对象及版本号缓�
 路由元数据；路由变化时自动重新构建，也可以调用
 `clear_metadata_cache()` 主动清除。
 
-两个 Triton 类当前只提供前向；训练路径仍使用 `gmm` 或
-`torch_gmm`。
+状态化 Triton 类只提供前向。训练路径可以使用 `gmm`、
+`torch_gmm` 或 `triton_fused_lora`；融合 Triton 反向包含：
+
+```text
+fused agrad:
+    grad_hidden = grad_output @ up_weight.T
+    grad_input  = grad_hidden @ down_weight
+
+bgrad down:
+    grad_down_weight = grad_hidden.T @ input
+
+bgrad up:
+    grad_up_weight = saved_hidden.T @ grad_output
+```
+
+完全分开的反向需要四个 grouped GEMM kernel；Triton 实现将两个
+输入梯度融合，因此使用三个 kernel。
 
 ## 构建与测试
 
@@ -67,8 +83,17 @@ from cudaop_grouped_gemm import LoraFusedDownUpGrouped
 
 fused = LoraFusedDownUpGrouped(down_weight, up_weight)
 saved_hidden, fused_output = fused(a, sizes)
+
+from cudaop_grouped_gemm import triton_fused_lora
+
+a.requires_grad_(True)
+down_weight.requires_grad_(True)
+up_weight.requires_grad_(True)
+output = triton_fused_lora(a, down_weight, up_weight, sizes)
+output.sum().backward()
 ```
 
 `op/lora_moe/gmm_ops.py` 提供了惰性构造入口
-`triton_lora_down`、`triton_lora_up` 和 `triton_lora_fused`。
-使用前需先安装本包，或将 `op/grouped_gemm` 加入 `PYTHONPATH`。
+`triton_lora_down`、`triton_lora_up`、`triton_lora_fused` 和
+`triton_lora_autograd`。使用前需先安装本包，或将
+`op/grouped_gemm` 加入 `PYTHONPATH`。

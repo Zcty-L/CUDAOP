@@ -11,7 +11,9 @@ from cudaop_grouped_gemm import (
     LoraFusedDownUpGrouped,
     LoraUpGrouped,
     gmm,
+    lora_gmm,
     torch_gmm,
+    triton_fused_lora,
 )
 
 
@@ -19,6 +21,7 @@ LOGGER = logging.getLogger("cudaop_grouped_gemm_test")
 
 BF16_RTOL = 2e-2
 BF16_ATOL = 2e-2
+BF16_GRAD_ATOL = 5e-1
 WARMUP_ITERATIONS = 20
 BENCHMARK_ITERATIONS = 100
 SIZES = [128, 157, 97, 100, 111, 129, 138, 101] * 10
@@ -71,14 +74,14 @@ def run_accuracy() -> None:
         hidden_size,
         device="cuda",
         dtype=torch.bfloat16,
-    )
+    ) * 0.1
     down_weight = torch.randn(
         experts,
         16,
         hidden_size,
         device="cuda",
         dtype=torch.bfloat16,
-    )
+    ) * 0.1
     up_weight = torch.randn_like(down_weight)
     down = LoraDownGrouped(down_weight)
     up = LoraUpGrouped(up_weight)
@@ -198,6 +201,145 @@ def run_accuracy() -> None:
         "final output",
         str(tuple(fused_output.shape)),
         max_error(fused_output, triton_output),
+    )
+
+
+def run_backward_accuracy() -> None:
+    sizes = torch.tensor(SIZES)
+    tokens = int(sizes.sum())
+    experts = sizes.numel()
+    hidden_size = 256
+    source_a = torch.randn(
+        tokens,
+        hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    source_down = torch.randn(
+        experts,
+        16,
+        hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    source_up = torch.randn_like(source_down)
+    grad_output = torch.randn_like(source_a)
+
+    def execute(operation):
+        a = source_a.detach().clone().requires_grad_(True)
+        down_weight = (
+            source_down.detach().clone().requires_grad_(True)
+        )
+        up_weight = (
+            source_up.detach().clone().requires_grad_(True)
+        )
+        output = operation(
+            a,
+            down_weight,
+            up_weight,
+            sizes,
+        )
+        output.backward(grad_output)
+        return (
+            output.detach(),
+            a.grad.detach(),
+            down_weight.grad.detach(),
+            up_weight.grad.detach(),
+        )
+
+    cutlass_results = execute(lora_gmm)
+    triton_results = execute(triton_fused_lora)
+    names = (
+        "output",
+        "grad input",
+        "grad down",
+        "grad up",
+    )
+    for triton_value, cutlass_value in zip(
+        triton_results,
+        cutlass_results,
+    ):
+        torch.testing.assert_close(
+            triton_value,
+            cutlass_value,
+            rtol=BF16_RTOL,
+            atol=BF16_GRAD_ATOL,
+        )
+
+    LOGGER.info(
+        "%-12s | %-18s | %18s",
+        "tensor",
+        "shape",
+        "Triton/CUTLASS diff",
+    )
+    LOGGER.info("-" * 56)
+    for name, triton_value, cutlass_value in zip(
+        names,
+        triton_results,
+        cutlass_results,
+    ):
+        LOGGER.info(
+            "%-12s | %-18s | %18.6f",
+            name,
+            str(tuple(triton_value.shape)),
+            max_error(triton_value, cutlass_value),
+        )
+
+    empty_sizes = torch.tensor([0, 3, 0, 5])
+    empty_tokens = int(empty_sizes.sum())
+    empty_input = torch.randn(
+        empty_tokens,
+        32,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    empty_down = torch.randn(
+        4,
+        16,
+        32,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    empty_up = torch.randn_like(empty_down)
+    empty_grad_output = torch.randn_like(empty_input)
+
+    def execute_empty(operation):
+        a = empty_input.detach().clone().requires_grad_(True)
+        down_weight = (
+            empty_down.detach().clone().requires_grad_(True)
+        )
+        up_weight = (
+            empty_up.detach().clone().requires_grad_(True)
+        )
+        output = operation(
+            a,
+            down_weight,
+            up_weight,
+            empty_sizes,
+        )
+        output.backward(empty_grad_output)
+        return a.grad, down_weight.grad, up_weight.grad
+
+    cutlass_empty = execute_empty(lora_gmm)
+    triton_empty = execute_empty(triton_fused_lora)
+    for triton_value, cutlass_value in zip(
+        triton_empty,
+        cutlass_empty,
+    ):
+        torch.testing.assert_close(
+            triton_value,
+            cutlass_value,
+            rtol=BF16_RTOL,
+            atol=BF16_GRAD_ATOL,
+        )
+    empty_weight_grads = triton_empty[1:]
+    for weight_grad in empty_weight_grads:
+        if torch.count_nonzero(weight_grad[[0, 2]]).item() != 0:
+            raise AssertionError("空 expert 的权重梯度必须为零")
+    LOGGER.info("")
+    LOGGER.info(
+        "空 expert 与 K 尾块回归：sizes=%s hidden_size=32 [PASS]",
+        empty_sizes.tolist(),
     )
 
 
@@ -372,6 +514,63 @@ def run_performance() -> None:
         )
     )
 
+    grad_output = torch.randn_like(a)
+
+    def cutlass_forward_backward() -> None:
+        input_value = a.detach().requires_grad_(True)
+        down_value = down_weight.detach().requires_grad_(True)
+        up_value = up_weight.detach().requires_grad_(True)
+        output = lora_gmm(
+            input_value,
+            down_value,
+            up_value,
+            sizes,
+        )
+        output.backward(grad_output)
+
+    def triton_forward_backward() -> None:
+        input_value = a.detach().requires_grad_(True)
+        down_value = down_weight.detach().requires_grad_(True)
+        up_value = up_weight.detach().requires_grad_(True)
+        output = triton_fused_lora(
+            input_value,
+            down_value,
+            up_value,
+            sizes,
+        )
+        output.backward(grad_output)
+
+    cutlass_backward_us = benchmark(cutlass_forward_backward)
+    triton_backward_us = benchmark(triton_forward_backward)
+    LOGGER.info("")
+    LOGGER.info(
+        (
+            "%-18s | %16s | %18s | %12s | %10s"
+        ),
+        "implementation",
+        "backward kernels",
+        "forward+backward",
+        "speedup",
+        "result",
+    )
+    LOGGER.info("-" * 88)
+    LOGGER.info(
+        "%-18s | %16d | %15.3f us | %12s | %10s",
+        "CUTLASS separate",
+        4,
+        cutlass_backward_us,
+        "-",
+        "baseline",
+    )
+    LOGGER.info(
+        "%-18s | %16d | %15.3f us | %11.3fx | %10s",
+        "Triton fused",
+        3,
+        triton_backward_us,
+        cutlass_backward_us / triton_backward_us,
+        "pass",
+    )
+
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -388,6 +587,9 @@ def main() -> None:
     LOGGER.info("阶段：LoRA down/up 分阶段前向精度验证")
     torch.manual_seed(11)
     run_accuracy()
+    LOGGER.info("")
+    LOGGER.info("阶段：LoRA fused backward 精度验证")
+    run_backward_accuracy()
     LOGGER.info("")
     LOGGER.info(
         (

@@ -274,3 +274,20 @@ def triton_lora_fused(
     from cudaop_grouped_gemm import LoraFusedDownUpGrouped
 
     return LoraFusedDownUpGrouped(down_weight, up_weight)
+
+
+def triton_lora_autograd(
+    a: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    batch_sizes: torch.Tensor,
+) -> torch.Tensor:
+    """调用支持三 kernel 融合反向的 Triton LoRA 算子。"""
+    from cudaop_grouped_gemm import triton_fused_lora
+
+    return triton_fused_lora(
+        a,
+        down_weight,
+        up_weight,
+        batch_sizes,
+    )

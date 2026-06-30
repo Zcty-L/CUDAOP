@@ -1,5 +1,7 @@
 """针对 LoRA rank=16 分别优化的 Triton Grouped GEMM。"""
 
+from typing import Any
+
 import torch
 import triton
 import triton.language as tl
@@ -333,6 +335,215 @@ def grouped_fused_downup_kernel(
             up_accumulator,
             mask=row_mask[:, None] & column_mask[None, :],
         )
+
+
+@triton.jit
+def grouped_fused_agrad_kernel(
+    grad_output,
+    up_weight,
+    down_weight,
+    grad_hidden,
+    grad_input,
+    hidden_size: tl.constexpr,
+    cumulative_tiles,
+    token_offsets,
+    token_counts,
+    stride_gom,
+    stride_gon,
+    stride_ue,
+    stride_ur,
+    stride_un,
+    stride_de,
+    stride_dr,
+    stride_dk,
+    stride_ghm,
+    stride_ghr,
+    stride_gim,
+    stride_gik,
+    num_experts,
+    block_m: tl.constexpr,
+    block_k: tl.constexpr,
+    num_stages: tl.constexpr,
+):
+    """融合计算 grad_hidden 和 grad_input。"""
+    rank: tl.constexpr = 16
+    tile_index = tl.program_id(0)
+    expert = _find_expert(
+        tile_index,
+        cumulative_tiles,
+        num_experts,
+    )
+    previous_tiles = tl.load(
+        cumulative_tiles + expert - 1,
+        mask=expert > 0,
+        other=0,
+    )
+    local_tile = tile_index - previous_tiles
+    token_offset = tl.load(token_offsets + expert)
+    token_count = tl.load(token_counts + expert)
+    row_start = token_offset + local_tile * block_m
+
+    rows = tl.arange(0, block_m)
+    ranks = tl.arange(0, rank)
+    reduction = tl.arange(0, block_k)
+    row_mask = rows < token_offset + token_count - row_start
+
+    grad_output_base = grad_output + row_start * stride_gom
+    up_base = up_weight + expert * stride_ue
+    hidden_accumulator = tl.zeros(
+        (block_m, rank),
+        dtype=tl.float32,
+    )
+    for reduction_start in tl.range(
+        0,
+        hidden_size,
+        block_k,
+        num_stages=num_stages,
+    ):
+        reduction_offsets = reduction_start + reduction
+        reduction_mask = reduction_offsets < hidden_size
+        grad_output_pointers = (
+            grad_output_base
+            + rows[:, None] * stride_gom
+            + reduction_offsets[None, :] * stride_gon
+        )
+        up_pointers = (
+            up_base
+            + reduction_offsets[:, None] * stride_un
+            + ranks[None, :] * stride_ur
+        )
+        grad_output_tile = tl.load(
+            grad_output_pointers,
+            mask=row_mask[:, None] & reduction_mask[None, :],
+            other=0.0,
+        )
+        up_tile = tl.load(
+            up_pointers,
+            mask=reduction_mask[:, None],
+            other=0.0,
+        )
+        hidden_accumulator += tl.dot(
+            grad_output_tile,
+            up_tile,
+        )
+
+    grad_hidden_tile = hidden_accumulator.to(tl.bfloat16)
+    grad_hidden_base = grad_hidden + row_start * stride_ghm
+    grad_hidden_pointers = (
+        grad_hidden_base
+        + rows[:, None] * stride_ghm
+        + ranks[None, :] * stride_ghr
+    )
+    tl.store(
+        grad_hidden_pointers,
+        grad_hidden_tile,
+        mask=row_mask[:, None],
+    )
+
+    down_base = down_weight + expert * stride_de
+    grad_input_base = grad_input + row_start * stride_gim
+    for output_start in tl.range(0, hidden_size, block_k):
+        columns = output_start + reduction
+        column_mask = columns < hidden_size
+        down_pointers = (
+            down_base
+            + ranks[:, None] * stride_dr
+            + columns[None, :] * stride_dk
+        )
+        down_tile = tl.load(
+            down_pointers,
+            mask=column_mask[None, :],
+            other=0.0,
+        )
+        input_accumulator = tl.dot(
+            grad_hidden_tile,
+            down_tile,
+        )
+        grad_input_pointers = (
+            grad_input_base
+            + rows[:, None] * stride_gim
+            + columns[None, :] * stride_gik
+        )
+        tl.store(
+            grad_input_pointers,
+            input_accumulator,
+            mask=row_mask[:, None] & column_mask[None, :],
+        )
+
+
+@triton.jit
+def grouped_bgrad_kernel(
+    lhs,
+    rhs,
+    output,
+    hidden_size: tl.constexpr,
+    token_offsets,
+    token_counts,
+    stride_lm,
+    stride_lr,
+    stride_rm,
+    stride_rk,
+    stride_oe,
+    stride_or,
+    stride_ok,
+    block_tokens: tl.constexpr,
+    block_n: tl.constexpr,
+):
+    """计算每个 expert 的 ``lhs.T @ rhs`` 权重梯度。"""
+    rank: tl.constexpr = 16
+    expert = tl.program_id(0)
+    output_tile = tl.program_id(1)
+    token_offset = tl.load(token_offsets + expert)
+    token_count = tl.load(token_counts + expert)
+    columns = output_tile * block_n + tl.arange(0, block_n)
+    column_mask = columns < hidden_size
+    ranks = tl.arange(0, rank)
+    accumulator = tl.zeros(
+        (rank, block_n),
+        dtype=tl.float32,
+    )
+
+    for token_start in tl.range(
+        0,
+        token_count,
+        block_tokens,
+        num_stages=2,
+    ):
+        tokens = token_start + tl.arange(0, block_tokens)
+        token_mask = tokens < token_count
+        lhs_pointers = (
+            lhs
+            + (token_offset + tokens[None, :]) * stride_lm
+            + ranks[:, None] * stride_lr
+        )
+        rhs_pointers = (
+            rhs
+            + (token_offset + tokens[:, None]) * stride_rm
+            + columns[None, :] * stride_rk
+        )
+        lhs_tile = tl.load(
+            lhs_pointers,
+            mask=token_mask[None, :],
+            other=0.0,
+        )
+        rhs_tile = tl.load(
+            rhs_pointers,
+            mask=token_mask[:, None] & column_mask[None, :],
+            other=0.0,
+        )
+        accumulator += tl.dot(lhs_tile, rhs_tile)
+
+    output_pointers = (
+        output
+        + expert * stride_oe
+        + ranks[:, None] * stride_or
+        + columns[None, :] * stride_ok
+    )
+    tl.store(
+        output_pointers,
+        accumulator,
+        mask=column_mask[None, :],
+    )
 
 
 def _check_common(
@@ -730,3 +941,425 @@ class LoraFusedDownUpGrouped:
             num_stages_up=self.num_stages_up,
         )
         return hidden, output
+
+
+class LoraFusedAgradGrouped:
+    """融合计算 LoRA up/down 的输入梯度。"""
+
+    def __init__(
+        self,
+        up_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+        block_m: int = 64,
+        block_k: int = 64,
+        num_warps: int = 4,
+        num_stages: int = 3,
+    ):
+        if up_weight.shape != down_weight.shape:
+            raise ValueError("down 和 up 权重形状必须相同")
+        if (
+            up_weight.ndim != 3
+            or up_weight.shape[1] != LORA_RANK
+        ):
+            raise ValueError("权重形状必须是 [E, 16, K]")
+        if (
+            not up_weight.is_cuda
+            or not down_weight.is_cuda
+            or not up_weight.is_contiguous()
+            or not down_weight.is_contiguous()
+        ):
+            raise ValueError("权重必须是连续的 CUDA Tensor")
+        if (
+            up_weight.dtype != torch.bfloat16
+            or down_weight.dtype != up_weight.dtype
+        ):
+            raise TypeError("权重必须是 bfloat16")
+
+        self.up_weight = up_weight
+        self.down_weight = down_weight
+        self.num_experts = up_weight.shape[0]
+        self.hidden_size = up_weight.shape[2]
+        self.block_m = block_m
+        self.block_k = block_k
+        self.num_warps = num_warps
+        self.num_stages = num_stages
+        self._cached_batch_sizes = None
+        self._cached_batch_sizes_version = -1
+        self._cached_total_rows = -1
+        self._cached_metadata = None
+
+    def clear_metadata_cache(self) -> None:
+        """清除路由元数据；下一次调用会重新构建。"""
+        _clear_metadata(self)
+
+    def __call__(
+        self,
+        grad_output: torch.Tensor,
+        batch_sizes: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        _check_common(
+            grad_output,
+            self.up_weight,
+            batch_sizes,
+        )
+        if grad_output.shape[1] != self.hidden_size:
+            raise ValueError("输出梯度维度与权重不匹配")
+
+        grad_hidden = torch.empty(
+            (grad_output.shape[0], LORA_RANK),
+            device=grad_output.device,
+            dtype=grad_output.dtype,
+        )
+        grad_input = torch.empty_like(grad_output)
+        if grad_output.shape[0] == 0:
+            return grad_hidden, grad_input
+
+        metadata = _get_metadata(
+            self,
+            batch_sizes,
+            grad_output.shape[0],
+            self.block_m,
+            grad_output.device,
+        )
+        cumulative_tiles, token_offsets, token_counts, total_tiles = (
+            metadata
+        )
+        grouped_fused_agrad_kernel[(total_tiles,)](
+            grad_output,
+            self.up_weight,
+            self.down_weight,
+            grad_hidden,
+            grad_input,
+            self.hidden_size,
+            cumulative_tiles,
+            token_offsets,
+            token_counts,
+            grad_output.stride(0),
+            grad_output.stride(1),
+            self.up_weight.stride(0),
+            self.up_weight.stride(1),
+            self.up_weight.stride(2),
+            self.down_weight.stride(0),
+            self.down_weight.stride(1),
+            self.down_weight.stride(2),
+            grad_hidden.stride(0),
+            grad_hidden.stride(1),
+            grad_input.stride(0),
+            grad_input.stride(1),
+            self.num_experts,
+            block_m=self.block_m,
+            block_k=self.block_k,
+            num_warps=self.num_warps,
+            num_stages=self.num_stages,
+        )
+        return grad_hidden, grad_input
+
+
+class LoraBgradGrouped:
+    """计算 rank=16 LoRA grouped GEMM 的权重梯度。"""
+
+    def __init__(
+        self,
+        num_experts: int,
+        hidden_size: int,
+        block_tokens: int = 128,
+        block_n: int = 256,
+        num_warps: int = 4,
+    ):
+        self.num_experts = num_experts
+        self.hidden_size = hidden_size
+        self.block_tokens = block_tokens
+        self.block_n = block_n
+        self.num_warps = num_warps
+        self._cached_batch_sizes = None
+        self._cached_batch_sizes_version = -1
+        self._cached_total_rows = -1
+        self._cached_metadata = None
+
+    def clear_metadata_cache(self) -> None:
+        """清除路由元数据；下一次调用会重新构建。"""
+        _clear_metadata(self)
+
+    def __call__(
+        self,
+        lhs: torch.Tensor,
+        rhs: torch.Tensor,
+        batch_sizes: torch.Tensor,
+    ) -> torch.Tensor:
+        if (
+            lhs.ndim != 2
+            or lhs.shape[1] != LORA_RANK
+            or rhs.ndim != 2
+            or rhs.shape[1] != self.hidden_size
+        ):
+            raise ValueError("lhs/rhs 形状必须是 [N,16] 和 [N,K]")
+        if lhs.shape[0] != rhs.shape[0]:
+            raise ValueError("lhs 和 rhs 行数必须相同")
+        if (
+            not lhs.is_cuda
+            or not rhs.is_cuda
+            or not lhs.is_contiguous()
+            or not rhs.is_contiguous()
+        ):
+            raise ValueError("lhs 和 rhs 必须是连续的 CUDA Tensor")
+        if lhs.dtype != torch.bfloat16 or rhs.dtype != lhs.dtype:
+            raise TypeError("lhs 和 rhs 必须是 bfloat16")
+        if batch_sizes.numel() != self.num_experts:
+            raise ValueError("batch_sizes 的长度必须等于 expert 数")
+
+        output = torch.empty(
+            (self.num_experts, LORA_RANK, self.hidden_size),
+            device=lhs.device,
+            dtype=lhs.dtype,
+        )
+        metadata = _get_metadata(
+            self,
+            batch_sizes,
+            lhs.shape[0],
+            self.block_tokens,
+            lhs.device,
+        )
+        _, token_offsets, token_counts, _ = metadata
+        grid = (
+            self.num_experts,
+            triton.cdiv(self.hidden_size, self.block_n),
+        )
+        grouped_bgrad_kernel[grid](
+            lhs,
+            rhs,
+            output,
+            self.hidden_size,
+            token_offsets,
+            token_counts,
+            lhs.stride(0),
+            lhs.stride(1),
+            rhs.stride(0),
+            rhs.stride(1),
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            block_tokens=self.block_tokens,
+            block_n=self.block_n,
+            num_warps=self.num_warps,
+        )
+        return output
+
+
+class _LoraFusedDownUp(torch.autograd.Function):
+    """三 kernel 反向的融合 LoRA down/up Autograd 实现。"""
+
+    @staticmethod
+    def forward(
+        context: Any,
+        a: torch.Tensor,
+        down_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+        batch_sizes: torch.Tensor,
+    ) -> torch.Tensor:
+        _check_common(a, down_weight, batch_sizes)
+        if down_weight.shape != up_weight.shape:
+            raise ValueError("down 和 up 权重形状必须相同")
+        if down_weight.shape[1] != LORA_RANK:
+            raise ValueError("权重形状必须是 [E, 16, K]")
+        if a.shape[1] != down_weight.shape[2]:
+            raise ValueError("输入和权重的隐藏维度不匹配")
+        if (
+            not up_weight.is_cuda
+            or not up_weight.is_contiguous()
+            or up_weight.dtype != a.dtype
+            or up_weight.device != a.device
+        ):
+            raise ValueError("up 权重的设备、类型或布局不正确")
+
+        block_m = 64
+        block_k = 64
+        block_n = 256
+        num_warps = 4
+        num_stages = 3
+        num_stages_up = 1
+        sizes_cpu = batch_sizes.detach().to(
+            device="cpu",
+            dtype=torch.int64,
+        ).contiguous()
+        if torch.any(sizes_cpu < 0):
+            raise ValueError("batch_sizes 不能包含负数")
+        if int(sizes_cpu.sum()) != a.shape[0]:
+            raise ValueError("batch_sizes 之和必须等于输入行数")
+        metadata = _build_metadata(
+            sizes_cpu,
+            block_m,
+            a.device,
+        )
+        cumulative_tiles, token_offsets, token_counts, total_tiles = (
+            metadata
+        )
+        down_weight_transposed = (
+            down_weight.permute(0, 2, 1).contiguous()
+        )
+        hidden = torch.empty(
+            (a.shape[0], LORA_RANK),
+            device=a.device,
+            dtype=a.dtype,
+        )
+        output = torch.empty_like(a)
+        if total_tiles > 0:
+            grouped_fused_downup_kernel[(total_tiles,)](
+                a,
+                down_weight_transposed,
+                up_weight,
+                hidden,
+                output,
+                a.shape[1],
+                cumulative_tiles,
+                token_offsets,
+                token_counts,
+                a.stride(0),
+                a.stride(1),
+                down_weight_transposed.stride(0),
+                down_weight_transposed.stride(1),
+                down_weight_transposed.stride(2),
+                up_weight.stride(0),
+                up_weight.stride(1),
+                up_weight.stride(2),
+                hidden.stride(0),
+                hidden.stride(1),
+                output.stride(0),
+                output.stride(1),
+                down_weight.shape[0],
+                block_m=block_m,
+                block_k=block_k,
+                block_n=block_n,
+                num_warps=num_warps,
+                num_stages=num_stages,
+                num_stages_up=num_stages_up,
+            )
+
+        context.save_for_backward(
+            a,
+            down_weight,
+            up_weight,
+            hidden,
+            cumulative_tiles,
+            token_offsets,
+            token_counts,
+        )
+        context.total_tiles = total_tiles
+        context.block_m = block_m
+        context.block_k = block_k
+        context.num_warps = num_warps
+        context.num_stages = num_stages
+        return output
+
+    @staticmethod
+    def backward(
+        context: Any,
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
+        (
+            a,
+            down_weight,
+            up_weight,
+            hidden,
+            cumulative_tiles,
+            token_offsets,
+            token_counts,
+        ) = context.saved_tensors
+        grad_output = grad_output.contiguous()
+        grad_hidden = torch.empty_like(hidden)
+        grad_input = torch.empty_like(a)
+        num_experts = down_weight.shape[0]
+        hidden_size = a.shape[1]
+
+        if context.total_tiles > 0:
+            grouped_fused_agrad_kernel[(context.total_tiles,)](
+                grad_output,
+                up_weight,
+                down_weight,
+                grad_hidden,
+                grad_input,
+                hidden_size,
+                cumulative_tiles,
+                token_offsets,
+                token_counts,
+                grad_output.stride(0),
+                grad_output.stride(1),
+                up_weight.stride(0),
+                up_weight.stride(1),
+                up_weight.stride(2),
+                down_weight.stride(0),
+                down_weight.stride(1),
+                down_weight.stride(2),
+                grad_hidden.stride(0),
+                grad_hidden.stride(1),
+                grad_input.stride(0),
+                grad_input.stride(1),
+                num_experts,
+                block_m=context.block_m,
+                block_k=context.block_k,
+                num_warps=context.num_warps,
+                num_stages=context.num_stages,
+            )
+
+        grad_down_weight = torch.empty_like(down_weight)
+        grad_up_weight = torch.empty_like(up_weight)
+        grid = (
+            num_experts,
+            triton.cdiv(hidden_size, 256),
+        )
+        grouped_bgrad_kernel[grid](
+            grad_hidden,
+            a,
+            grad_down_weight,
+            hidden_size,
+            token_offsets,
+            token_counts,
+            grad_hidden.stride(0),
+            grad_hidden.stride(1),
+            a.stride(0),
+            a.stride(1),
+            grad_down_weight.stride(0),
+            grad_down_weight.stride(1),
+            grad_down_weight.stride(2),
+            block_tokens=128,
+            block_n=256,
+            num_warps=4,
+        )
+        grouped_bgrad_kernel[grid](
+            hidden,
+            grad_output,
+            grad_up_weight,
+            hidden_size,
+            token_offsets,
+            token_counts,
+            hidden.stride(0),
+            hidden.stride(1),
+            grad_output.stride(0),
+            grad_output.stride(1),
+            grad_up_weight.stride(0),
+            grad_up_weight.stride(1),
+            grad_up_weight.stride(2),
+            block_tokens=128,
+            block_n=256,
+            num_warps=4,
+        )
+        return (
+            grad_input,
+            grad_down_weight,
+            grad_up_weight,
+            None,
+        )
+
+
+def triton_fused_lora(
+    a: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    batch_sizes: torch.Tensor,
+) -> torch.Tensor:
+    """执行融合前向和三 kernel 反向的 LoRA Grouped GEMM。"""
+    return _LoraFusedDownUp.apply(
+        a,
+        down_weight,
+        up_weight,
+        batch_sizes,
+    )
