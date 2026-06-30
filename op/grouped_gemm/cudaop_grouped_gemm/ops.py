@@ -3,8 +3,25 @@
 from typing import Any
 
 import torch
+import torch.nn.functional as functional
 
 from cudaop_grouped_gemm import _C
+
+
+class _ContiguousGradient(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        context: Any,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        return value
+
+    @staticmethod
+    def backward(
+        context: Any,
+        grad: torch.Tensor,
+    ) -> torch.Tensor:
+        return grad.contiguous()
 
 
 class _GroupedGemm(torch.autograd.Function):
@@ -64,3 +81,26 @@ def gmm(
 ) -> torch.Tensor:
     """按 ``batch_sizes`` 划分 A，并与各组权重执行矩阵乘。"""
     return _GroupedGemm.apply(a, b, batch_sizes, trans_b)
+
+
+def torch_gmm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    batch_sizes: torch.Tensor,
+    trans_b: bool = False,
+) -> torch.Tensor:
+    """使用 PyTorch ``grouped_mm`` 执行与 :func:`gmm` 相同的计算。"""
+    offsets = batch_sizes.to(
+        device=a.device,
+        dtype=torch.int32,
+    ).cumsum(
+        dim=0,
+        dtype=torch.int32,
+    )
+    weight = b.transpose(1, 2) if trans_b else b
+    output = functional.grouped_mm(
+        a,
+        weight,
+        offs=offsets,
+    )
+    return _ContiguousGradient.apply(output)

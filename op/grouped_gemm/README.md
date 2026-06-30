@@ -1,7 +1,11 @@
 # cudaop_grouped_gemm
 
-独立的 CUTLASS BF16 Grouped GEMM Python 包。当前实现由
-`op/lora_moe` 中的 SM120 构建版本拆分而来，支持前向和自动求导。
+独立的 BF16 Grouped GEMM Python 包，包含以下两种实现：
+
+- `gmm`：CUTLASS Grouped GEMM。
+- `torch_gmm`：`torch.nn.functional.grouped_mm`。
+
+两种实现使用相同的调用接口，均支持前向和自动求导。
 
 ## 构建与测试
 
@@ -23,10 +27,11 @@ python test_grouped_gemm.py
 
 ```python
 import torch
-from cudaop_grouped_gemm import gmm
+from cudaop_grouped_gemm import gmm, torch_gmm
 
 sizes = torch.tensor([2, 3], device="cuda")
 a = torch.randn(5, 256, device="cuda", dtype=torch.bfloat16)
 b = torch.randn(2, 32, 256, device="cuda", dtype=torch.bfloat16)
 output = gmm(a, b, sizes, trans_b=True)
+torch_output = torch_gmm(a, b, sizes, trans_b=True)
 ```
