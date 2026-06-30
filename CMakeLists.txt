@@ -35,7 +35,6 @@ include_directories(
 
 # --- Build Explicitly Specified .cu Files ---
 set(OP_SOURCES
-    "op/device_query.cu"
     "op/conv/conv2d_k128.cu"
     "op/conv/conv2d_k64_u8.cu"
     "op/conv/conv2d_k64_u4.cu"
@@ -108,6 +107,30 @@ add_custom_target(lora_moe_standard_test
         lora_moe_ops
     COMMENT
         "Testing the LoRA-MoE Torch implementations"
+    VERBATIM
+)
+
+add_custom_target(cudaop_grouped_gemm
+    COMMAND
+        ${CMAKE_COMMAND} -E env
+        TORCH_CUDA_ARCH_LIST=12.0
+        ${Python3_EXECUTABLE} setup.py build_ext --inplace
+    WORKING_DIRECTORY
+        "${PROJECT_SOURCE_DIR}/op/grouped_gemm"
+    COMMENT
+        "Building the cudaop_grouped_gemm Python CUDA extension"
+    VERBATIM
+)
+
+add_custom_target(cudaop_grouped_gemm_test
+    COMMAND
+        ${Python3_EXECUTABLE} test_grouped_gemm.py
+    WORKING_DIRECTORY
+        "${PROJECT_SOURCE_DIR}/op/grouped_gemm"
+    DEPENDS
+        cudaop_grouped_gemm
+    COMMENT
+        "Testing cudaop_grouped_gemm"
     VERBATIM
 )
 
