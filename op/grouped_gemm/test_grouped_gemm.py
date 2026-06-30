@@ -26,9 +26,11 @@ LOGGER = logging.getLogger("cudaop_grouped_gemm_test")
 BF16_RTOL = 2e-2
 BF16_ATOL = 2e-2
 BF16_GRAD_ATOL = 5e-1
+TORCH_WEIGHT_GRAD_ATOL = 8.0
 WARMUP_ITERATIONS = 20
 BENCHMARK_ITERATIONS = 100
-SIZES = [128, 157, 97, 100, 111, 129, 138, 101] * 10
+SIZES = [128, 157, 97, 100, 111, 129, 138, 101]
+SIZES = [i * 20 for i in SIZES]
 
 
 def reference_down(
@@ -44,6 +46,26 @@ def reference_down(
         )
         offset += size
     return torch.cat(outputs, dim=0)
+
+
+def torch_lora_gmm(
+    a: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    sizes: torch.Tensor,
+) -> torch.Tensor:
+    hidden = torch_gmm(
+        a,
+        down_weight,
+        sizes,
+        True,
+    )
+    return torch_gmm(
+        hidden,
+        up_weight,
+        sizes,
+        False,
+    )
 
 
 def reference_up(
@@ -303,6 +325,7 @@ def run_backward_accuracy() -> None:
         )
 
     cutlass_results = execute(lora_gmm)
+    torch_results = execute(torch_lora_gmm)
     triton_results = execute(triton_fused_lora)
     cutile_results = execute(cutile_fused_lora)
     names = (
@@ -331,25 +354,54 @@ def run_backward_accuracy() -> None:
             rtol=BF16_RTOL,
             atol=BF16_GRAD_ATOL,
         )
+    torch_atols = (
+        BF16_GRAD_ATOL,
+        BF16_GRAD_ATOL,
+        TORCH_WEIGHT_GRAD_ATOL,
+        TORCH_WEIGHT_GRAD_ATOL,
+    )
+    for torch_value, cutlass_value, atol in zip(
+        torch_results,
+        cutlass_results,
+        torch_atols,
+    ):
+        torch.testing.assert_close(
+            torch_value,
+            cutlass_value,
+            rtol=BF16_RTOL,
+            atol=atol,
+        )
 
     LOGGER.info(
-        "%-12s | %-18s | %18s | %18s",
+        "%-12s | %-18s | %18s | %18s | %18s",
         "tensor",
         "shape",
+        "Torch/CUTLASS diff",
         "Triton/CUTLASS diff",
         "cuTile/CUTLASS diff",
     )
-    LOGGER.info("-" * 77)
-    for name, triton_value, cutile_value, cutlass_value in zip(
+    LOGGER.info("-" * 98)
+    for (
+        name,
+        torch_value,
+        triton_value,
+        cutile_value,
+        cutlass_value,
+    ) in zip(
         names,
+        torch_results,
         triton_results,
         cutile_results,
         cutlass_results,
     ):
         LOGGER.info(
-            "%-12s | %-18s | %18.6f | %18.6f",
+            (
+                "%-12s | %-18s | %18.6f | "
+                "%18.6f | %18.6f"
+            ),
             name,
             str(tuple(triton_value.shape)),
+            max_error(torch_value, cutlass_value),
             max_error(triton_value, cutlass_value),
             max_error(cutile_value, cutlass_value),
         )
@@ -640,6 +692,18 @@ def run_performance() -> None:
         )
         output.backward(grad_output)
 
+    def torch_forward_backward() -> None:
+        input_value = a.detach().requires_grad_(True)
+        down_value = down_weight.detach().requires_grad_(True)
+        up_value = up_weight.detach().requires_grad_(True)
+        output = torch_lora_gmm(
+            input_value,
+            down_value,
+            up_value,
+            sizes,
+        )
+        output.backward(grad_output)
+
     def triton_forward_backward() -> None:
         input_value = a.detach().requires_grad_(True)
         down_value = down_weight.detach().requires_grad_(True)
@@ -665,6 +729,7 @@ def run_performance() -> None:
         output.backward(grad_output)
 
     cutlass_backward_us = benchmark(cutlass_forward_backward)
+    torch_backward_us = benchmark(torch_forward_backward)
     triton_backward_us = benchmark(triton_forward_backward)
     cutile_backward_us = benchmark(cutile_forward_backward)
     LOGGER.info("")
@@ -673,7 +738,7 @@ def run_performance() -> None:
             "%-18s | %16s | %18s | %12s | %10s"
         ),
         "implementation",
-        "backward kernels",
+        "backward ops",
         "forward+backward",
         "speedup",
         "result",
@@ -686,6 +751,14 @@ def run_performance() -> None:
         cutlass_backward_us,
         "-",
         "baseline",
+    )
+    LOGGER.info(
+        "%-18s | %16d | %15.3f us | %11.3fx | %10s",
+        "Torch separate",
+        4,
+        torch_backward_us,
+        cutlass_backward_us / torch_backward_us,
+        "pass",
     )
     LOGGER.info(
         "%-18s | %16d | %15.3f us | %11.3fx | %10s",
