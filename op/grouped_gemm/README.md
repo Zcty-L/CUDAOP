@@ -1,11 +1,29 @@
 # cudaop_grouped_gemm
 
-独立的 BF16 Grouped GEMM Python 包，包含以下两种实现：
+独立的 BF16 Grouped GEMM Python 包，包含：
 
-- `gmm`：CUTLASS Grouped GEMM。
-- `torch_gmm`：`torch.nn.functional.grouped_mm`。
+- `gmm`：支持自动求导的 CUTLASS Grouped GEMM。
+- `torch_gmm`：支持自动求导的 `torch.nn.functional.grouped_mm`。
+- `LoraDownGrouped`：Triton LoRA down 前向算子。
+- `LoraUpGrouped`：Triton LoRA up 前向算子。
+- `LoraFusedDownUpGrouped`：融合 down/up，并额外返回供反向使用的
+  `[M, 16]` 中间矩阵。
 
-两种实现使用相同的调用接口，均支持前向和自动求导。
+Triton LoRA 实现固定 rank=16，并拆分为两个 kernel：
+
+```text
+down: [M, K]  @ [E, 16, K].T -> [M, 16]
+up:   [M, 16] @ [E, 16, N]   -> [M, N]
+```
+
+down 构造时会将权重预打包为连续的 `[E, K, 16]`。up 权重本身必须
+采用连续的 `[E, 16, N]` 布局，从而让一次 `tl.dot` 完成完整的
+rank=16 收缩。两个算子会按 `batch_sizes` Tensor 对象及版本号缓存
+路由元数据；路由变化时自动重新构建，也可以调用
+`clear_metadata_cache()` 主动清除。
+
+两个 Triton 类当前只提供前向；训练路径仍使用 `gmm` 或
+`torch_gmm`。
 
 ## 构建与测试
 
@@ -27,11 +45,30 @@ python test_grouped_gemm.py
 
 ```python
 import torch
-from cudaop_grouped_gemm import gmm, torch_gmm
+from cudaop_grouped_gemm import LoraDownGrouped, LoraUpGrouped
 
 sizes = torch.tensor([2, 3], device="cuda")
 a = torch.randn(5, 256, device="cuda", dtype=torch.bfloat16)
-b = torch.randn(2, 32, 256, device="cuda", dtype=torch.bfloat16)
-output = gmm(a, b, sizes, trans_b=True)
-torch_output = torch_gmm(a, b, sizes, trans_b=True)
+down_weight = torch.randn(
+    2,
+    16,
+    256,
+    device="cuda",
+    dtype=torch.bfloat16,
+)
+up_weight = torch.randn_like(down_weight)
+
+down = LoraDownGrouped(down_weight)
+up = LoraUpGrouped(up_weight)
+hidden = down(a, sizes)
+output = up(hidden, sizes)
+
+from cudaop_grouped_gemm import LoraFusedDownUpGrouped
+
+fused = LoraFusedDownUpGrouped(down_weight, up_weight)
+saved_hidden, fused_output = fused(a, sizes)
 ```
+
+`op/lora_moe/gmm_ops.py` 提供了惰性构造入口
+`triton_lora_down`、`triton_lora_up` 和 `triton_lora_fused`。
+使用前需先安装本包，或将 `op/grouped_gemm` 加入 `PYTHONPATH`。

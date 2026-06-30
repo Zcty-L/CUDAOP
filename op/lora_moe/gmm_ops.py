@@ -250,3 +250,27 @@ def gmm(
         batch_sizes,
         trans_b,
     )
+
+
+def triton_lora_down(weight: torch.Tensor):
+    """创建采用 ``[E, 16, K]`` 权重的 Triton LoRA down 算子。"""
+    from cudaop_grouped_gemm import LoraDownGrouped
+
+    return LoraDownGrouped(weight)
+
+
+def triton_lora_up(weight: torch.Tensor):
+    """创建采用 ``[E, 16, N]`` 权重的 Triton LoRA up 算子。"""
+    from cudaop_grouped_gemm import LoraUpGrouped
+
+    return LoraUpGrouped(weight)
+
+
+def triton_lora_fused(
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+):
+    """创建融合 down/up 并保存中间矩阵的 Triton 算子。"""
+    from cudaop_grouped_gemm import LoraFusedDownUpGrouped
+
+    return LoraFusedDownUpGrouped(down_weight, up_weight)
