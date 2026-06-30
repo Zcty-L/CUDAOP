@@ -40,10 +40,16 @@
 - 最终一定需要放到 `CMakeLists` 进行测试验证
 
 
+## 测试 Debug 输出规范
+- 测试需输出配置、主要阶段、关键结果和 `[SUCCESS]` 成功标记
+- 不同测试及主要阶段之间需保留空行
+- Python 使用 `logging`，C++/CUDA 使用 `std::cout`
+
+
 ## 新增算子工作流
 1. 创建 `./op/{name}/` 目录
 2. 实现 kernel
-3. 在 `./CMakeLists.txt` 注册新算子目标
+3. 在 `./CMakeLists.txt` 注册新算子目标 (仅适用于C++, python构建算子不需要)
 4. 添加精度验证和性能测试
 5. 确保编译通过并运行测试
 
