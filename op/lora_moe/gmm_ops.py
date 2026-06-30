@@ -291,3 +291,47 @@ def triton_lora_autograd(
         up_weight,
         batch_sizes,
     )
+
+
+def cutile_lora_down(weight: torch.Tensor):
+    """创建采用 ``[E, 16, K]`` 权重的 cuTile LoRA down 算子。"""
+    from cudaop_grouped_gemm import CuTileLoraDownGrouped
+
+    return CuTileLoraDownGrouped(weight)
+
+
+def cutile_lora_up(weight: torch.Tensor):
+    """创建采用 ``[E, 16, N]`` 权重的 cuTile LoRA up 算子。"""
+    from cudaop_grouped_gemm import CuTileLoraUpGrouped
+
+    return CuTileLoraUpGrouped(weight)
+
+
+def cutile_lora_fused(
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+):
+    """创建融合 down/up 并保存中间矩阵的 cuTile 算子。"""
+    from cudaop_grouped_gemm import CuTileLoraFusedDownUpGrouped
+
+    return CuTileLoraFusedDownUpGrouped(
+        down_weight,
+        up_weight,
+    )
+
+
+def cutile_lora_autograd(
+    a: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    batch_sizes: torch.Tensor,
+) -> torch.Tensor:
+    """调用支持三 kernel 融合反向的 cuTile LoRA 算子。"""
+    from cudaop_grouped_gemm import cutile_fused_lora
+
+    return cutile_fused_lora(
+        a,
+        down_weight,
+        up_weight,
+        batch_sizes,
+    )

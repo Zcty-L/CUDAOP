@@ -1,4 +1,4 @@
-"""CUTLASS、PyTorch 与分阶段 Triton LoRA Grouped GEMM 对比。"""
+"""CUTLASS、PyTorch、Triton 与 cuTile LoRA Grouped GEMM 对比。"""
 
 import logging
 import statistics
@@ -7,9 +7,13 @@ from collections.abc import Callable
 import torch
 
 from cudaop_grouped_gemm import (
+    CuTileLoraDownGrouped,
+    CuTileLoraFusedDownUpGrouped,
+    CuTileLoraUpGrouped,
     LoraDownGrouped,
     LoraFusedDownUpGrouped,
     LoraUpGrouped,
+    cutile_fused_lora,
     gmm,
     lora_gmm,
     torch_gmm,
@@ -86,6 +90,12 @@ def run_accuracy() -> None:
     down = LoraDownGrouped(down_weight)
     up = LoraUpGrouped(up_weight)
     fused = LoraFusedDownUpGrouped(down_weight, up_weight)
+    cutile_down = CuTileLoraDownGrouped(down_weight)
+    cutile_up = CuTileLoraUpGrouped(up_weight)
+    cutile_fused = CuTileLoraFusedDownUpGrouped(
+        down_weight,
+        up_weight,
+    )
 
     expected_hidden = reference_down(
         a.float(),
@@ -95,7 +105,13 @@ def run_accuracy() -> None:
     cutlass_hidden = gmm(a, down_weight, sizes, True)
     torch_hidden = torch_gmm(a, down_weight, sizes, True)
     triton_hidden = down(a, sizes)
-    for actual in (cutlass_hidden, torch_hidden, triton_hidden):
+    cutile_hidden = cutile_down(a, sizes)
+    for actual in (
+        cutlass_hidden,
+        torch_hidden,
+        triton_hidden,
+        cutile_hidden,
+    ):
         torch.testing.assert_close(
             actual.float(),
             expected_hidden,
@@ -116,8 +132,18 @@ def run_accuracy() -> None:
         False,
     )
     triton_output = up(triton_hidden, sizes)
+    cutile_output = cutile_up(cutile_hidden, sizes)
     fused_hidden, fused_output = fused(a, sizes)
-    for actual in (cutlass_output, torch_output, triton_output):
+    cutile_fused_hidden, cutile_fused_output = cutile_fused(
+        a,
+        sizes,
+    )
+    for actual in (
+        cutlass_output,
+        torch_output,
+        triton_output,
+        cutile_output,
+    ):
         torch.testing.assert_close(
             actual.float(),
             expected_output,
@@ -136,20 +162,33 @@ def run_accuracy() -> None:
         rtol=0.0,
         atol=0.0,
     )
+    torch.testing.assert_close(
+        cutile_fused_hidden,
+        cutile_hidden,
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        cutile_fused_output,
+        cutile_output,
+        rtol=0.0,
+        atol=0.0,
+    )
 
     LOGGER.info(
         (
             "%-8s | %-14s | %14s | %14s | "
-            "%14s | %14s"
+            "%14s | %14s | %14s"
         ),
         "stage",
         "output shape",
         "CUTLASS error",
         "Torch error",
         "Triton error",
+        "cuTile error",
         "CUTLASS/Triton",
     )
-    LOGGER.info("-" * 100)
+    LOGGER.info("-" * 117)
     accuracy_rows = (
         (
             "down",
@@ -157,6 +196,7 @@ def run_accuracy() -> None:
             expected_hidden,
             cutlass_hidden,
             torch_hidden,
+            cutile_hidden,
         ),
         (
             "up",
@@ -164,21 +204,30 @@ def run_accuracy() -> None:
             expected_output,
             cutlass_output,
             torch_output,
+            cutile_output,
         ),
     )
-    for stage, triton_value, expected, cutlass_value, torch_value in (
+    for (
+        stage,
+        triton_value,
+        expected,
+        cutlass_value,
+        torch_value,
+        cutile_value,
+    ) in (
         accuracy_rows
     ):
         LOGGER.info(
             (
                 "%-8s | %-14s | %14.6f | %14.6f | "
-                "%14.6f | %14.6f"
+                "%14.6f | %14.6f | %14.6f"
             ),
             stage,
             str(tuple(triton_value.shape)),
             max_error(cutlass_value, expected),
             max_error(torch_value, expected),
             max_error(triton_value, expected),
+            max_error(cutile_value, expected),
             max_error(cutlass_value, triton_value),
         )
 
@@ -201,6 +250,12 @@ def run_accuracy() -> None:
         "final output",
         str(tuple(fused_output.shape)),
         max_error(fused_output, triton_output),
+    )
+    LOGGER.info(
+        "%-14s | %-14s | %18.6f",
+        "cuTile output",
+        str(tuple(cutile_fused_output.shape)),
+        max_error(cutile_fused_output, cutile_output),
     )
 
 
@@ -249,6 +304,7 @@ def run_backward_accuracy() -> None:
 
     cutlass_results = execute(lora_gmm)
     triton_results = execute(triton_fused_lora)
+    cutile_results = execute(cutile_fused_lora)
     names = (
         "output",
         "grad input",
@@ -265,24 +321,37 @@ def run_backward_accuracy() -> None:
             rtol=BF16_RTOL,
             atol=BF16_GRAD_ATOL,
         )
+    for cutile_value, cutlass_value in zip(
+        cutile_results,
+        cutlass_results,
+    ):
+        torch.testing.assert_close(
+            cutile_value,
+            cutlass_value,
+            rtol=BF16_RTOL,
+            atol=BF16_GRAD_ATOL,
+        )
 
     LOGGER.info(
-        "%-12s | %-18s | %18s",
+        "%-12s | %-18s | %18s | %18s",
         "tensor",
         "shape",
         "Triton/CUTLASS diff",
+        "cuTile/CUTLASS diff",
     )
-    LOGGER.info("-" * 56)
-    for name, triton_value, cutlass_value in zip(
+    LOGGER.info("-" * 77)
+    for name, triton_value, cutile_value, cutlass_value in zip(
         names,
         triton_results,
+        cutile_results,
         cutlass_results,
     ):
         LOGGER.info(
-            "%-12s | %-18s | %18.6f",
+            "%-12s | %-18s | %18.6f | %18.6f",
             name,
             str(tuple(triton_value.shape)),
             max_error(triton_value, cutlass_value),
+            max_error(cutile_value, cutlass_value),
         )
 
     empty_sizes = torch.tensor([0, 3, 0, 5])
@@ -322,6 +391,7 @@ def run_backward_accuracy() -> None:
 
     cutlass_empty = execute_empty(lora_gmm)
     triton_empty = execute_empty(triton_fused_lora)
+    cutile_empty = execute_empty(cutile_fused_lora)
     for triton_value, cutlass_value in zip(
         triton_empty,
         cutlass_empty,
@@ -332,10 +402,20 @@ def run_backward_accuracy() -> None:
             rtol=BF16_RTOL,
             atol=BF16_GRAD_ATOL,
         )
-    empty_weight_grads = triton_empty[1:]
-    for weight_grad in empty_weight_grads:
-        if torch.count_nonzero(weight_grad[[0, 2]]).item() != 0:
-            raise AssertionError("空 expert 的权重梯度必须为零")
+    for cutile_value, cutlass_value in zip(
+        cutile_empty,
+        cutlass_empty,
+    ):
+        torch.testing.assert_close(
+            cutile_value,
+            cutlass_value,
+            rtol=BF16_RTOL,
+            atol=BF16_GRAD_ATOL,
+        )
+    for implementation in (triton_empty, cutile_empty):
+        for weight_grad in implementation[1:]:
+            if torch.count_nonzero(weight_grad[[0, 2]]).item() != 0:
+                raise AssertionError("空 expert 的权重梯度必须为零")
     LOGGER.info("")
     LOGGER.info(
         "空 expert 与 K 尾块回归：sizes=%s hidden_size=32 [PASS]",
@@ -384,7 +464,14 @@ def run_performance() -> None:
     down = LoraDownGrouped(down_weight)
     up = LoraUpGrouped(up_weight)
     fused = LoraFusedDownUpGrouped(down_weight, up_weight)
+    cutile_down = CuTileLoraDownGrouped(down_weight)
+    cutile_up = CuTileLoraUpGrouped(up_weight)
+    cutile_fused = CuTileLoraFusedDownUpGrouped(
+        down_weight,
+        up_weight,
+    )
     hidden = down(a, sizes)
+    cutile_hidden = cutile_down(a, sizes)
 
     operations = {
         "CUTLASS down": lambda: gmm(
@@ -413,6 +500,8 @@ def run_performance() -> None:
             False,
         ),
         "Triton up": lambda: up(hidden, sizes),
+        "cuTile down": lambda: cutile_down(a, sizes),
+        "cuTile up": lambda: cutile_up(cutile_hidden, sizes),
     }
     timings = {
         name: benchmark(operation)
@@ -435,6 +524,15 @@ def run_performance() -> None:
     timings["Torch total"] = benchmark(torch_down_up)
     timings["Triton total"] = benchmark(triton_down_up)
     timings["Triton fused"] = benchmark(lambda: fused(a, sizes))
+
+    def cutile_down_up() -> None:
+        current = cutile_down(a, sizes)
+        cutile_up(current, sizes)
+
+    timings["cuTile total"] = benchmark(cutile_down_up)
+    timings["cuTile fused"] = benchmark(
+        lambda: cutile_fused(a, sizes)
+    )
 
     def triton_down_rebuild() -> None:
         down.clear_metadata_cache()
@@ -468,50 +566,64 @@ def run_performance() -> None:
 
     LOGGER.info(
         (
-            "%-8s | %12s | %12s | %12s | "
-            "%16s | %18s"
+            "%-8s | %12s | %12s | %12s | %12s | "
+            "%14s | %14s"
         ),
         "stage",
         "CUTLASS(us)",
         "Torch(us)",
         "Triton(us)",
-        "speedup",
-        "metadata rebuild",
+        "cuTile(us)",
+        "CUTLASS/Triton",
+        "CUTLASS/cuTile",
     )
-    LOGGER.info("-" * 96)
+    LOGGER.info("-" * 111)
     for stage in ("down", "up", "total"):
         cutlass_us = timings[f"CUTLASS {stage}"]
         torch_us = timings[f"Torch {stage}"]
         triton_us = timings[f"Triton {stage}"]
+        cutile_us = timings[f"cuTile {stage}"]
         LOGGER.info(
             (
                 "%-8s | %12.3f | %12.3f | %12.3f | "
-                "%15.3fx | %18.3f"
+                "%12.3f | %13.3fx | %13.3fx"
             ),
             stage,
             cutlass_us,
             torch_us,
             triton_us,
+            cutile_us,
             cutlass_us / triton_us,
-            timings[f"Triton rebuild {stage}"],
+            cutlass_us / cutile_us,
         )
     LOGGER.info(
         (
             "%-8s | %12s | %12s | %12.3f | "
-            "%15.3fx | %18.3f"
+            "%12.3f | %13.3fx | %13.3fx"
         ),
         "fused",
         "-",
         "-",
         timings["Triton fused"],
+        timings["cuTile fused"],
         timings["Triton total"] / timings["Triton fused"],
-        timings["Triton rebuild fused"],
+        timings["cuTile total"] / timings["cuTile fused"],
     )
     LOGGER.info(
         (
-            "speedup：down/up/total=CUTLASS/Triton，"
-            "fused=separate/fused；大于 1 表示 Triton 更快"
+            "speedup：down/up/total=CUTLASS/实现，"
+            "fused=各实现 separate/fused；大于 1 表示后者更快"
         )
+    )
+    LOGGER.info(
+        (
+            "Triton metadata rebuild(us)："
+            "down=%.3f up=%.3f total=%.3f fused=%.3f"
+        ),
+        timings["Triton rebuild down"],
+        timings["Triton rebuild up"],
+        timings["Triton rebuild total"],
+        timings["Triton rebuild fused"],
     )
 
     grad_output = torch.randn_like(a)
@@ -540,8 +652,21 @@ def run_performance() -> None:
         )
         output.backward(grad_output)
 
+    def cutile_forward_backward() -> None:
+        input_value = a.detach().requires_grad_(True)
+        down_value = down_weight.detach().requires_grad_(True)
+        up_value = up_weight.detach().requires_grad_(True)
+        output = cutile_fused_lora(
+            input_value,
+            down_value,
+            up_value,
+            sizes,
+        )
+        output.backward(grad_output)
+
     cutlass_backward_us = benchmark(cutlass_forward_backward)
     triton_backward_us = benchmark(triton_forward_backward)
+    cutile_backward_us = benchmark(cutile_forward_backward)
     LOGGER.info("")
     LOGGER.info(
         (
@@ -568,6 +693,14 @@ def run_performance() -> None:
         3,
         triton_backward_us,
         cutlass_backward_us / triton_backward_us,
+        "pass",
+    )
+    LOGGER.info(
+        "%-18s | %16d | %15.3f us | %11.3fx | %10s",
+        "cuTile fused",
+        3,
+        cutile_backward_us,
+        cutlass_backward_us / cutile_backward_us,
         "pass",
     )
 

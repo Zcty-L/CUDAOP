@@ -9,6 +9,9 @@
 - `LoraFusedDownUpGrouped`：融合 down/up，并额外返回供反向使用的
   `[M, 16]` 中间矩阵。
 - `triton_fused_lora`：支持自动求导的融合接口。
+- `CuTileLoraDownGrouped`、`CuTileLoraUpGrouped`：cuTile 分阶段前向。
+- `CuTileLoraFusedDownUpGrouped`：cuTile 融合前向。
+- `cutile_fused_lora`：支持三 kernel 反向的 cuTile 融合接口。
 
 Triton LoRA 实现固定 rank=16，并拆分为两个 kernel：
 
@@ -40,6 +43,16 @@ bgrad up:
 
 完全分开的反向需要四个 grouped GEMM kernel；Triton 实现将两个
 输入梯度融合，因此使用三个 kernel。
+
+cuTile 实现采用相同的数学拆分和权重布局。它以
+`(row tile, expert)` 为逻辑网格，通过 `token_offsets` 和
+`token_counts` 处理不规则分组，使用 bounds-safe gather/scatter
+覆盖空 expert 和尾块。矩阵乘输入为 BF16，`ct.mma` 使用 FP32
+累加器。
+
+cuTile 需要 CUDA Toolkit 13.1+、支持的 NVIDIA 驱动以及
+`cuda-tile` Python 包。当前测试环境为 `cuda-tile 1.4.0` 和
+SM120。
 
 ## 构建与测试
 
@@ -91,9 +104,25 @@ down_weight.requires_grad_(True)
 up_weight.requires_grad_(True)
 output = triton_fused_lora(a, down_weight, up_weight, sizes)
 output.sum().backward()
+
+from cudaop_grouped_gemm import (
+    CuTileLoraFusedDownUpGrouped,
+    cutile_fused_lora,
+)
+
+cutile_fused = CuTileLoraFusedDownUpGrouped(
+    down_weight,
+    up_weight,
+)
+saved_hidden, fused_output = cutile_fused(a, sizes)
+
+output = cutile_fused_lora(a, down_weight, up_weight, sizes)
+output.sum().backward()
 ```
 
 `op/lora_moe/gmm_ops.py` 提供了惰性构造入口
 `triton_lora_down`、`triton_lora_up`、`triton_lora_fused` 和
-`triton_lora_autograd`。使用前需先安装本包，或将
+`triton_lora_autograd`，以及对应的 `cutile_lora_down`、
+`cutile_lora_up`、`cutile_lora_fused` 和
+`cutile_lora_autograd`。使用前需先安装本包，或将
 `op/grouped_gemm` 加入 `PYTHONPATH`。
