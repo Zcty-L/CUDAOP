@@ -844,12 +844,16 @@ class _CuTileLoraFusedDownUp(torch.autograd.Function):
         batch_sizes: torch.Tensor,
     ) -> torch.Tensor:
         _check_common(a, down_weight, batch_sizes)
-        if down_weight.shape != up_weight.shape:
-            raise ValueError("down 和 up 权重形状必须相同")
         if down_weight.shape[1] != LORA_RANK:
             raise ValueError("权重形状必须是 [E, 16, K]")
         if a.shape[1] != down_weight.shape[2]:
             raise ValueError("输入和权重的隐藏维度不匹配")
+        if (
+            up_weight.ndim != 3
+            or up_weight.shape[0] != down_weight.shape[0]
+            or up_weight.shape[1] != LORA_RANK
+        ):
+            raise ValueError("up 权重形状必须是 [E, 16, N]")
         if (
             not up_weight.is_cuda
             or not up_weight.is_contiguous()
@@ -874,7 +878,11 @@ class _CuTileLoraFusedDownUp(torch.autograd.Function):
             device=a.device,
             dtype=a.dtype,
         )
-        output = torch.empty_like(a)
+        output = torch.empty(
+            (a.shape[0], up_weight.shape[2]),
+            device=a.device,
+            dtype=a.dtype,
+        )
         if max_tiles > 0:
             _launch(
                 (max_tiles, down_weight.shape[0]),
@@ -940,12 +948,12 @@ class _CuTileLoraFusedDownUp(torch.autograd.Function):
 
         grad_down_weight = torch.empty_like(down_weight)
         grad_up_weight = torch.empty_like(up_weight)
-        grid = (
+        down_grid = (
             down_weight.shape[0],
             ct.cdiv(a.shape[1], 256),
         )
         _launch(
-            grid,
+            down_grid,
             grouped_bgrad_kernel,
             (
                 grad_hidden,
@@ -957,8 +965,12 @@ class _CuTileLoraFusedDownUp(torch.autograd.Function):
                 256,
             ),
         )
+        up_grid = (
+            down_weight.shape[0],
+            ct.cdiv(grad_output.shape[1], 256),
+        )
         _launch(
-            grid,
+            up_grid,
             grouped_bgrad_kernel,
             (
                 hidden,

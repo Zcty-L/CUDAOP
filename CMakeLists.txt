@@ -96,15 +96,18 @@ add_custom_target(lora_moe_ops
 
 add_custom_target(lora_moe_standard_test
     COMMAND
+        ${CMAKE_COMMAND} -E env
+        "PYTHONPATH=${PROJECT_SOURCE_DIR}/op/grouped_gemm"
         ${Python3_EXECUTABLE} test_standard.py
     COMMAND
+        ${CMAKE_COMMAND} -E env
+        "PYTHONPATH=${PROJECT_SOURCE_DIR}/op/grouped_gemm"
         ${Python3_EXECUTABLE} test_nonstandard.py
-    COMMAND
-        ${Python3_EXECUTABLE} test_grouped_gemm.py
     WORKING_DIRECTORY
         "${PROJECT_SOURCE_DIR}/op/lora_moe"
     DEPENDS
         lora_moe_ops
+        cudaop_grouped_gemm
     COMMENT
         "Testing the LoRA-MoE Torch implementations"
     VERBATIM
@@ -132,26 +135,4 @@ add_custom_target(cudaop_grouped_gemm_test
     COMMENT
         "Testing cudaop_grouped_gemm"
     VERBATIM
-)
-
-set(
-    CUTLASS_ROOT
-    "${PROJECT_SOURCE_DIR}/../cutlass"
-    CACHE PATH
-    "Path to the CUTLASS source tree"
-)
-
-add_executable(
-    lora_moe_cutlass_grouped_test
-    op/lora_moe/csrc/cutlass_grouped_gemm_test.cu
-)
-target_include_directories(
-    lora_moe_cutlass_grouped_test
-    PRIVATE
-        "${CUTLASS_ROOT}/include"
-)
-target_link_libraries(
-    lora_moe_cutlass_grouped_test
-    PRIVATE
-        CUDA::cudart
 )

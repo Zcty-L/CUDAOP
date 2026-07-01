@@ -207,7 +207,8 @@ def grouped_fused_downup_kernel(
     up_weight,
     hidden,
     output,
-    hidden_size: tl.constexpr,
+    input_size: tl.constexpr,
+    output_size: tl.constexpr,
     cumulative_tiles,
     token_offsets,
     token_counts,
@@ -263,12 +264,12 @@ def grouped_fused_downup_kernel(
     )
     for reduction_start in tl.range(
         0,
-        hidden_size,
+        input_size,
         block_k,
         num_stages=num_stages,
     ):
         reduction_offsets = reduction_start + reduction
-        reduction_mask = reduction_offsets < hidden_size
+        reduction_mask = reduction_offsets < input_size
         a_pointers = (
             a_base
             + rows[:, None] * stride_am
@@ -308,12 +309,12 @@ def grouped_fused_downup_kernel(
     output_base = output + row_start * stride_om
     for output_start in tl.range(
         0,
-        hidden_size,
+        output_size,
         block_n,
         num_stages=num_stages_up,
     ):
         columns = output_start + tl.arange(0, block_n)
-        column_mask = columns < hidden_size
+        column_mask = columns < output_size
         up_pointers = (
             up_base
             + ranks[:, None] * stride_ur
@@ -344,7 +345,8 @@ def grouped_fused_agrad_kernel(
     down_weight,
     grad_hidden,
     grad_input,
-    hidden_size: tl.constexpr,
+    input_size: tl.constexpr,
+    output_size: tl.constexpr,
     cumulative_tiles,
     token_offsets,
     token_counts,
@@ -396,12 +398,12 @@ def grouped_fused_agrad_kernel(
     )
     for reduction_start in tl.range(
         0,
-        hidden_size,
+        output_size,
         block_k,
         num_stages=num_stages,
     ):
         reduction_offsets = reduction_start + reduction
-        reduction_mask = reduction_offsets < hidden_size
+        reduction_mask = reduction_offsets < output_size
         grad_output_pointers = (
             grad_output_base
             + rows[:, None] * stride_gom
@@ -442,9 +444,9 @@ def grouped_fused_agrad_kernel(
 
     down_base = down_weight + expert * stride_de
     grad_input_base = grad_input + row_start * stride_gim
-    for output_start in tl.range(0, hidden_size, block_k):
+    for output_start in tl.range(0, input_size, block_k):
         columns = output_start + reduction
-        column_mask = columns < hidden_size
+        column_mask = columns < input_size
         down_pointers = (
             down_base
             + ranks[:, None] * stride_dr
@@ -917,6 +919,7 @@ class LoraFusedDownUpGrouped:
             hidden,
             output,
             self.hidden_size,
+            self.hidden_size,
             cumulative_tiles,
             token_offsets,
             token_counts,
@@ -1030,6 +1033,7 @@ class LoraFusedAgradGrouped:
             self.down_weight,
             grad_hidden,
             grad_input,
+            self.hidden_size,
             self.hidden_size,
             cumulative_tiles,
             token_offsets,
@@ -1157,12 +1161,16 @@ class _LoraFusedDownUp(torch.autograd.Function):
         batch_sizes: torch.Tensor,
     ) -> torch.Tensor:
         _check_common(a, down_weight, batch_sizes)
-        if down_weight.shape != up_weight.shape:
-            raise ValueError("down 和 up 权重形状必须相同")
         if down_weight.shape[1] != LORA_RANK:
             raise ValueError("权重形状必须是 [E, 16, K]")
         if a.shape[1] != down_weight.shape[2]:
             raise ValueError("输入和权重的隐藏维度不匹配")
+        if (
+            up_weight.ndim != 3
+            or up_weight.shape[0] != down_weight.shape[0]
+            or up_weight.shape[1] != LORA_RANK
+        ):
+            raise ValueError("up 权重形状必须是 [E, 16, N]")
         if (
             not up_weight.is_cuda
             or not up_weight.is_contiguous()
@@ -1201,7 +1209,11 @@ class _LoraFusedDownUp(torch.autograd.Function):
             device=a.device,
             dtype=a.dtype,
         )
-        output = torch.empty_like(a)
+        output = torch.empty(
+            (a.shape[0], up_weight.shape[2]),
+            device=a.device,
+            dtype=a.dtype,
+        )
         if total_tiles > 0:
             grouped_fused_downup_kernel[(total_tiles,)](
                 a,
@@ -1210,6 +1222,7 @@ class _LoraFusedDownUp(torch.autograd.Function):
                 hidden,
                 output,
                 a.shape[1],
+                up_weight.shape[2],
                 cumulative_tiles,
                 token_offsets,
                 token_counts,
@@ -1268,7 +1281,8 @@ class _LoraFusedDownUp(torch.autograd.Function):
         grad_hidden = torch.empty_like(hidden)
         grad_input = torch.empty_like(a)
         num_experts = down_weight.shape[0]
-        hidden_size = a.shape[1]
+        input_size = a.shape[1]
+        output_size = grad_output.shape[1]
 
         if context.total_tiles > 0:
             grouped_fused_agrad_kernel[(context.total_tiles,)](
@@ -1277,7 +1291,8 @@ class _LoraFusedDownUp(torch.autograd.Function):
                 down_weight,
                 grad_hidden,
                 grad_input,
-                hidden_size,
+                input_size,
+                output_size,
                 cumulative_tiles,
                 token_offsets,
                 token_counts,
@@ -1302,15 +1317,15 @@ class _LoraFusedDownUp(torch.autograd.Function):
 
         grad_down_weight = torch.empty_like(down_weight)
         grad_up_weight = torch.empty_like(up_weight)
-        grid = (
+        down_grid = (
             num_experts,
-            triton.cdiv(hidden_size, 256),
+            triton.cdiv(input_size, 256),
         )
-        grouped_bgrad_kernel[grid](
+        grouped_bgrad_kernel[down_grid](
             grad_hidden,
             a,
             grad_down_weight,
-            hidden_size,
+            input_size,
             token_offsets,
             token_counts,
             grad_hidden.stride(0),
@@ -1324,11 +1339,15 @@ class _LoraFusedDownUp(torch.autograd.Function):
             block_n=256,
             num_warps=4,
         )
-        grouped_bgrad_kernel[grid](
+        up_grid = (
+            num_experts,
+            triton.cdiv(output_size, 256),
+        )
+        grouped_bgrad_kernel[up_grid](
             hidden,
             grad_output,
             grad_up_weight,
-            hidden_size,
+            output_size,
             token_offsets,
             token_counts,
             hidden.stride(0),

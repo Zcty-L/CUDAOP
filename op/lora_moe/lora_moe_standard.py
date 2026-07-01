@@ -10,6 +10,8 @@ import torch.nn.functional as F
 class LoRAMoEStandard(nn.Module):
     """每个 expert 包含完整 gate/up/down LoRA 分支的标准 MoE。"""
 
+    _GMM_BACKENDS = ("cutlass", "triton", "cutile")
+
     def __init__(
         self,
         original_mlp: nn.Module,
@@ -17,6 +19,7 @@ class LoRAMoEStandard(nn.Module):
         rank: int,
         lora_alpha: float,
         lora_dropout: float = 0.0,
+        gmm_backend: str = "cutlass",
     ) -> None:
         super().__init__()
 
@@ -26,6 +29,15 @@ class LoRAMoEStandard(nn.Module):
             raise ValueError("rank 必须大于 0")
         if not 0.0 <= lora_dropout < 1.0:
             raise ValueError("lora_dropout 必须位于 [0, 1) 区间")
+        if gmm_backend not in self._GMM_BACKENDS:
+            raise ValueError(
+                f"不支持的 GMM 后端: {gmm_backend}，"
+                f"可选值为 {self._GMM_BACKENDS}"
+            )
+        if gmm_backend != "cutlass" and rank != 16:
+            raise ValueError(
+                f"{gmm_backend} GMM 后端仅支持 rank=16"
+            )
 
         self._validate_original_mlp(original_mlp)
         self.original_mlp = original_mlp
@@ -34,6 +46,7 @@ class LoRAMoEStandard(nn.Module):
         self.lora_alpha = lora_alpha
         self.scaling = lora_alpha / rank
         self.lora_dropout = nn.Dropout(p=lora_dropout)
+        self.gmm_backend = gmm_backend
 
         gate_proj = original_mlp.gate_proj
         up_proj = original_mlp.up_proj
@@ -396,25 +409,43 @@ class LoRAMoEStandard(nn.Module):
         )
 
         batch_sizes = tokens_per_expert.to(torch.long)
-        gate_up_hidden = gmm_ops.gmm(
-            x_dropped,
-            self.gate_up_lora_A,
-            batch_sizes,
-            trans_b=True,
-        )
-        gate_hidden, up_hidden = gate_up_hidden.chunk(2, dim=-1)
-        gate_delta = gmm_ops.gmm(
-            gate_hidden.contiguous(),
-            self.gate_lora_B,
-            batch_sizes,
-            trans_b=True,
-        ) * self.scaling
-        up_delta = gmm_ops.gmm(
-            up_hidden.contiguous(),
-            self.up_lora_B,
-            batch_sizes,
-            trans_b=True,
-        ) * self.scaling
+        if self.gmm_backend == "cutlass":
+            gate_up_hidden = gmm_ops.gmm(
+                x_dropped,
+                self.gate_up_lora_A,
+                batch_sizes,
+                trans_b=True,
+            )
+            gate_hidden, up_hidden = gate_up_hidden.chunk(2, dim=-1)
+            gate_delta = gmm_ops.gmm(
+                gate_hidden.contiguous(),
+                self.gate_lora_B,
+                batch_sizes,
+                trans_b=True,
+            )
+            up_delta = gmm_ops.gmm(
+                up_hidden.contiguous(),
+                self.up_lora_B,
+                batch_sizes,
+                trans_b=True,
+            )
+        else:
+            gate_delta = gmm_ops.lora_gmm(
+                x_dropped,
+                self.gate_up_lora_A[:, :self.rank],
+                self.gate_lora_B,
+                batch_sizes,
+                self.gmm_backend,
+            )
+            up_delta = gmm_ops.lora_gmm(
+                x_dropped,
+                self.gate_up_lora_A[:, self.rank:],
+                self.up_lora_B,
+                batch_sizes,
+                self.gmm_backend,
+            )
+        gate_delta = gate_delta * self.scaling
+        up_delta = up_delta * self.scaling
 
         gate_full = gate_base + gate_delta
         up_full = up_base + up_delta
@@ -437,17 +468,12 @@ class LoRAMoEStandard(nn.Module):
         )
 
         down_base = self.original_mlp.down_proj(intermediate)
-        down_hidden = gmm_ops.gmm(
+        down_delta = gmm_ops.lora_gmm(
             intermediate_per_slot,
             self.down_lora_A,
-            batch_sizes,
-            trans_b=True,
-        )
-        down_delta = gmm_ops.gmm(
-            down_hidden,
             self.down_lora_B,
             batch_sizes,
-            trans_b=True,
+            self.gmm_backend,
         ) * self.scaling
         down_delta_weighted = gmm_ops.scatter(
             down_delta,

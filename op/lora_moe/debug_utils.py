@@ -7,6 +7,7 @@ logging.basicConfig(
     level=logging.DEBUG,
     format="%(message)s",
 )
+logging.getLogger("cuda.tile").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("lora_moe_test")
 
 

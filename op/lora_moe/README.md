@@ -22,8 +22,7 @@ python build.py --arch-list 8.0
 ```bash
 cmake -S . -B build
 cmake --build build --target lora_moe_ops
-cmake --build build --target lora_moe_cutlass_grouped_test
-./build/lora_moe_cutlass_grouped_test
+cmake --build build --target cudaop_grouped_gemm
 ```
 
 ## Python 调用
@@ -43,7 +42,12 @@ print(counts)
 python test_ops.py
 python test_standard.py
 python test_nonstandard.py
-python test_grouped_gemm.py
+```
+
+从源码目录直接运行前，安装 Grouped GEMM Python 包：
+
+```bash
+python -m pip install -e ../grouped_gemm
 ```
 
 `LoRAMoEStandard` 提供三种 Torch 前向路径：
@@ -61,7 +65,25 @@ Group 路径通过 `gmm_ops.py` 统一调用以下后端：
 
 - 路由排序、直方图和前缀和：`lora_moe_ops`。
 - gather/scatter：`triton_kernels.py`。
-- 分组矩阵乘：`lora_moe_ops` 内置的 CUTLASS BF16 Grouped GEMM。
+- 分组矩阵乘：`cudaop_grouped_gemm`，默认使用 CUTLASS BF16 实现。
 
-本地 Grouped GEMM 为 SM120 编译，包含前向、输入梯度和权重梯度三个
-CUTLASS kernel 实例，不依赖外部安装的 `grouped_gemm`。
+Grouped GEMM 的构建、Python 接口及后端对比统一维护在
+`op/grouped_gemm`。LoRA-MoE 不再编译重复的 CUTLASS kernel。
+
+## Grouped GEMM 后端
+
+标准和非标准 LoRA-MoE 都可通过构造参数选择 Group 模式后端：
+
+```python
+module = LoRAMoEStandard(
+    original_mlp=mlp,
+    num_experts=8,
+    rank=16,
+    lora_alpha=4.0,
+    gmm_backend="triton",
+)
+```
+
+`gmm_backend` 支持 `cutlass`、`triton` 和 `cutile`，默认值为
+`cutlass`。Triton 与 cuTile 使用融合 LoRA down/up kernel，目前仅支持
+rank=16；CUTLASS 仍支持通用 rank。

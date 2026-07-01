@@ -1,5 +1,4 @@
 #include "cumsum.h"
-#include "grouped_gemm.h"
 #include "histogram.h"
 #include "indices.h"
 #include "replicate.h"
@@ -16,10 +15,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module)
         "exclusive_cumsum",
         &exclusive_cumsum,
         "Batched exclusive cumulative sum");
-    module.def(
-        "grouped_gemm",
-        &grouped_gemm,
-        "CUTLASS BF16 grouped GEMM");
     module.def("histogram", &histogram, "Even-width histogram");
     module.def(
         "inclusive_cumsum",
