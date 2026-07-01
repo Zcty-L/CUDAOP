@@ -22,6 +22,7 @@ class LoRAMoENonstandard(nn.Module):
         "pad": "_forward_pad",
         "group": "_forward_group",
     }
+    _GMM_BACKENDS = ("cutlass", "triton", "cutile")
 
     def __init__(
         self,
@@ -30,6 +31,7 @@ class LoRAMoENonstandard(nn.Module):
         rank: int,
         lora_alpha: float,
         lora_dropout: float = 0.0,
+        gmm_backend: str = "cutlass",
     ) -> None:
         super().__init__()
 
@@ -39,6 +41,15 @@ class LoRAMoENonstandard(nn.Module):
             raise ValueError("rank 必须大于 0")
         if not 0.0 <= lora_dropout < 1.0:
             raise ValueError("lora_dropout 必须位于 [0, 1) 区间")
+        if gmm_backend not in self._GMM_BACKENDS:
+            raise ValueError(
+                f"不支持的 GMM 后端: {gmm_backend}，"
+                f"可选值为 {self._GMM_BACKENDS}"
+            )
+        if gmm_backend != "cutlass" and rank != 16:
+            raise ValueError(
+                f"{gmm_backend} GMM 后端仅支持 rank=16"
+            )
 
         self._validate_original_mlp(original_mlp)
         self.original_mlp = original_mlp
@@ -46,6 +57,7 @@ class LoRAMoENonstandard(nn.Module):
         self.rank = rank
         self.lora_alpha = lora_alpha
         self.scaling = lora_alpha / rank
+        self.gmm_backend = gmm_backend
 
         for parameter in self.original_mlp.parameters():
             parameter.requires_grad = False
@@ -340,17 +352,12 @@ class LoRAMoENonstandard(nn.Module):
             top_k,
         )
         batch_sizes = tokens_per_expert.to(torch.long)
-        hidden = gmm_ops.gmm(
+        delta_per_slot = gmm_ops.lora_gmm(
             x_gathered,
             lora_A,
-            batch_sizes,
-            trans_b=True,
-        )
-        delta_per_slot = gmm_ops.gmm(
-            hidden,
             lora_B,
             batch_sizes,
-            trans_b=True,
+            self.gmm_backend,
         )
         delta = gmm_ops.scatter(
             delta_per_slot,
