@@ -2,15 +2,17 @@
 #include <fstream>
 #include <iomanip>
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 #include <string>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cudnn.h>
-#include "cuda_utils.cuh"
+#include "config.h"
 #include "ptx_utils.cuh"
 #include "cpu/cpu_ops.h"
 
+using namespace ptx;
 
 __global__ void
 conv2d_4x128x256_groups_kernel(float *inputs, float *weights, float *bias, float *outputs, Conv2DParam param)
@@ -1397,15 +1399,69 @@ int main(int argc, char *argv[])
         return 0;
     }
 
+    std::string csv_path = "benchmark_results_fp32.csv";
+    int iters = 100;
+    int warmup = 10;
+    bool quick = false;
+
+    for (int argi = 1; argi < argc; ++argi)
+    {
+        if (strcmp(argv[argi], "--csv") == 0 && argi + 1 < argc)
+        {
+            csv_path = argv[++argi];
+        }
+        else if (strcmp(argv[argi], "--iters") == 0 && argi + 1 < argc)
+        {
+            iters = std::atoi(argv[++argi]);
+        }
+        else if (strcmp(argv[argi], "--warmup") == 0 && argi + 1 < argc)
+        {
+            warmup = std::atoi(argv[++argi]);
+        }
+        else if (strcmp(argv[argi], "--quick") == 0)
+        {
+            quick = true;
+        }
+    }
+
+    if (iters <= 0)
+    {
+        std::cout << "[ERROR] --iters must be positive" << std::endl;
+        return 1;
+    }
+
     int ns[] = {1, 2, 4, 8, 16, 32};
     int cs[] = {32, 64, 128, 256};
     int hs[] = {40, 80, 160};
+    int ns_quick[] = {1, 4, 16};
+    int cs_quick[] = {32, 128};
+    int hs_quick[] = {40, 80};
     int u = 2, v = 2;
     int kernel_sizes[] = {3, 5, 7, 9, 11};
-    int iters = 0, warmup = 1;
+    int kernel_sizes_quick[] = {3, 7, 11};
 
-    std::ofstream csv("benchmark_results_fp32.csv");
+    int *active_ns = quick ? ns_quick : ns;
+    int *active_cs = quick ? cs_quick : cs;
+    int *active_hs = quick ? hs_quick : hs;
+    int *active_kernel_sizes = quick ? kernel_sizes_quick : kernel_sizes;
+    int ns_count = quick ? 3 : 6;
+    int cs_count = quick ? 2 : 4;
+    int hs_count = quick ? 2 : 3;
+    int kernel_sizes_count = quick ? 3 : 5;
+
+    std::ofstream csv(csv_path);
+    if (!csv.is_open())
+    {
+        std::cout << "[ERROR] failed to open csv: " << csv_path << std::endl;
+        return 1;
+    }
     csv << "k_size,n,c,h,kernel,time_ms,gflops,arith_intensity" << std::endl;
+
+    std::cout << "[CONFIG] csv=" << csv_path
+              << " iters=" << iters
+              << " warmup=" << warmup
+              << " quick=" << (quick ? "true" : "false")
+              << std::endl << std::endl;
 
     std::cout << std::left << std::setw(6) << "k_size" << " |"
               << std::setw(4) << "n" << " |"
@@ -1420,15 +1476,19 @@ int main(int argc, char *argv[])
     cudnnCreate(&cudnn);
     cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
 
-    for (int r : kernel_sizes)
+    for (int r_idx = 0; r_idx < kernel_sizes_count; ++r_idx)
     {
+        int r = active_kernel_sizes[r_idx];
         int s = r, p = r / 2, q = s / 2;
-        for (int n : ns)
+        for (int n_idx = 0; n_idx < ns_count; ++n_idx)
         {
-            for (int c : cs)
+            int n = active_ns[n_idx];
+            for (int c_idx = 0; c_idx < cs_count; ++c_idx)
             {
-                for (int h : hs)
+                int c = active_cs[c_idx];
+                for (int h_idx = 0; h_idx < hs_count; ++h_idx)
                 {
+                    int h = active_hs[h_idx];
                     int w = h, k = c;
                     int out_h = (h - r + 2 * p) / u + 1;
                     int out_w = (w - s + 2 * q) / v + 1;
@@ -1654,5 +1714,8 @@ int main(int argc, char *argv[])
     }
     csv.close();
     cudnnDestroy(cudnn);
+
+    std::cout << std::endl
+              << "[SUCCESS] benchmark finished" << std::endl;
     return 0;
 }

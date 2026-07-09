@@ -44,6 +44,9 @@ set(OP_SOURCES
     "op/conv/conv2d_sn_k64_u8_fp16.cu"
     "op/conv/conv2d_erf_k64_u8.cu"
     "op/conv/conv2d_erf_k64_u8_fp16.cu"
+    "op/dwconv/conv2d_groups_fp32.cu"
+    "op/dwconv/dwconv_k128.cu"
+    "op/dwconv/opt_conv2d_groups_fp32.cu"
     "op/resize/resize_u8.cu"
     "op/mul/mul_u8.cu"
     "op/linear/linear_k128.cu"
@@ -57,6 +60,10 @@ foreach(SRC_FILE ${OP_SOURCES})
     
     # 将该文件编译为独立的可执行程序
     add_executable(${EXE_NAME} ${SRC_FILE})
+
+    if(EXE_NAME STREQUAL "opt_conv2d_groups_fp32")
+        target_sources(${EXE_NAME} PRIVATE op/cpu/cpu_ops.cpp)
+    endif()
     
     # 链接基础 CUDA 库
     target_link_libraries(${EXE_NAME} PRIVATE 
