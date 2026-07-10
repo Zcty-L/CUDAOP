@@ -34,15 +34,15 @@
 }
 
 __global__ void
-conv2d_4x128x256_groups_kernel(
+conv2d_4x64x256_groups_kernel(
     float *inputs,
     float *weights,
     float *bias,
     float *outputs,
     Conv2DParam param)
 {
-    __shared__ __align__(2 * 1024)
-    char smem[4 * 128 * 4 + 4 * 4];
+    __shared__ __align__(1024)
+    char smem[4 * 64 * 4 + 4 * 4];
     auto *smemweight = reinterpret_cast<float *>(smem);
 
     int out_pos = blockIdx.x * 256 + threadIdx.x;
@@ -50,18 +50,18 @@ conv2d_4x128x256_groups_kernel(
     int posw_ori = (out_pos % param.out_w) * param.Sw - param.Pw;
 
     uint32_t weights_sts_addr =
-        ptx::smem_u32addr(smemweight + threadIdx.x * 2);
+        ptx::smem_u32addr(smemweight + threadIdx.x);
     uint32_t weights_lds_addr = ptx::smem_u32addr(smemweight);
 
     const char *weight_ldg_ptr = reinterpret_cast<const char *>(
         weights + blockIdx.y * 4 * param.KhKw
         + threadIdx.x / 64 * param.KhKw
-        + threadIdx.x % 64 * 2);
+        + threadIdx.x % 64);
     auto *input_ptr = inputs
         + blockIdx.z * param.inBatchNumel
         + blockIdx.y * 4 * param.inHW;
 
-    float weight_ldg_reg[2];
+    float weight_ldg_reg;
     float weight_frag[16];
     float input_frag[4][4];
     float output_frag[4];
@@ -73,15 +73,11 @@ conv2d_4x128x256_groups_kernel(
     }
 
     ptx::ldg_nc_0(
-        weight_ldg_reg[0],
+        weight_ldg_reg,
         weight_ldg_ptr,
-        threadIdx.x % 64 * 2 < param.KhKw);
-    ptx::ldg_nc_0(
-        weight_ldg_reg[1],
-        weight_ldg_ptr + sizeof(float),
-        threadIdx.x % 64 * 2 + 1 < param.KhKw);
+        threadIdx.x % 64 < param.KhKw);
 
-    ptx::sts64(weight_ldg_reg[0], weight_ldg_reg[1], weights_sts_addr);
+    ptx::sts32(weight_ldg_reg, weights_sts_addr);
     __syncthreads();
 
     for (int k = 0; k < param.KhKw; k += 4)
@@ -123,19 +119,19 @@ conv2d_4x128x256_groups_kernel(
             weight_frag[5],
             weight_frag[6],
             weight_frag[7],
-            weights_lds_addr + 128 * sizeof(float));
+            weights_lds_addr + 64 * sizeof(float));
         ptx::lds128(
             weight_frag[8],
             weight_frag[9],
             weight_frag[10],
             weight_frag[11],
-            weights_lds_addr + 256 * sizeof(float));
+            weights_lds_addr + 128 * sizeof(float));
         ptx::lds128(
             weight_frag[12],
             weight_frag[13],
             weight_frag[14],
             weight_frag[15],
-            weights_lds_addr + 384 * sizeof(float));
+            weights_lds_addr + 192 * sizeof(float));
         __syncthreads();
 
         weights_lds_addr += 4 * sizeof(float);
@@ -175,15 +171,15 @@ conv2d_4x128x256_groups_kernel(
 }
 
 __global__ void
-conv2d_4x128x256_groups_kernel_biasopt(
+conv2d_4x64x256_groups_kernel_biasopt(
     float *inputs,
     float *weights,
     float *bias,
     float *outputs,
     Conv2DParam param)
 {
-    __shared__ __align__(2 * 1024)
-    char smem[4 * 128 * 4 + 4 * 4];
+    __shared__ __align__(1024)
+    char smem[4 * 64 * 4 + 4 * 4];
     auto *smemweight = reinterpret_cast<float *>(smem);
 
     int out_pos = blockIdx.x * 256 + threadIdx.x;
@@ -191,44 +187,34 @@ conv2d_4x128x256_groups_kernel_biasopt(
     int posw_ori = (out_pos % param.out_w) * param.Sw - param.Pw;
 
     uint32_t weights_sts_addr =
-        ptx::smem_u32addr(smemweight + threadIdx.x * 2);
+        ptx::smem_u32addr(smemweight + threadIdx.x);
     uint32_t weights_lds_addr = ptx::smem_u32addr(smemweight);
 
     const char *weight_ldg_ptr = reinterpret_cast<const char *>(
         weights + blockIdx.y * 4 * param.KhKw
         + threadIdx.x / 64 * param.KhKw
-        + threadIdx.x % 64 * 2);
+        + threadIdx.x % 64);
     auto *input_ptr = inputs
         + blockIdx.z * param.inBatchNumel
         + blockIdx.y * 4 * param.inHW;
 
-    float weight_ldg_reg[2];
+    float weight_ldg_reg;
     float weight_frag[16];
     float input_frag[4][4];
     float output_frag[4];
-    int lane = threadIdx.x & 31;
-    float bias_val = 0.0f;
-    if (lane < 4)
-    {
-        bias_val = bias[blockIdx.y * 4 + lane];
-    }
 
 #pragma unroll
     for (int i = 0; i < 4; ++i)
     {
-        output_frag[i] = __shfl_sync(0xFFFFFFFF, bias_val, i);
+        output_frag[i] = 0.0f;
     }
 
     ptx::ldg_nc_0(
-        weight_ldg_reg[0],
+        weight_ldg_reg,
         weight_ldg_ptr,
-        threadIdx.x % 64 * 2 < param.KhKw);
-    ptx::ldg_nc_0(
-        weight_ldg_reg[1],
-        weight_ldg_ptr + sizeof(float),
-        threadIdx.x % 64 * 2 + 1 < param.KhKw);
+        threadIdx.x % 64 < param.KhKw);
 
-    ptx::sts64(weight_ldg_reg[0], weight_ldg_reg[1], weights_sts_addr);
+    ptx::sts32(weight_ldg_reg, weights_sts_addr);
     __syncthreads();
 
     for (int k = 0; k < param.KhKw; k += 4)
@@ -270,19 +256,19 @@ conv2d_4x128x256_groups_kernel_biasopt(
             weight_frag[5],
             weight_frag[6],
             weight_frag[7],
-            weights_lds_addr + 128 * sizeof(float));
+            weights_lds_addr + 64 * sizeof(float));
         ptx::lds128(
             weight_frag[8],
             weight_frag[9],
             weight_frag[10],
             weight_frag[11],
-            weights_lds_addr + 256 * sizeof(float));
+            weights_lds_addr + 128 * sizeof(float));
         ptx::lds128(
             weight_frag[12],
             weight_frag[13],
             weight_frag[14],
             weight_frag[15],
-            weights_lds_addr + 384 * sizeof(float));
+            weights_lds_addr + 192 * sizeof(float));
         __syncthreads();
 
         weights_lds_addr += 4 * sizeof(float);
@@ -295,6 +281,18 @@ conv2d_4x128x256_groups_kernel_biasopt(
             output_frag[2] += weight_frag[i + 8] * input_frag[2][i];
             output_frag[3] += weight_frag[i + 12] * input_frag[3][i];
         }
+    }
+
+    int lane = threadIdx.x & 31;
+    float bias_val = 0.0f;
+    if (lane < 4)
+    {
+        bias_val = bias[blockIdx.y * 4 + lane];
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        output_frag[i] += __shfl_sync(0xFFFFFFFF, bias_val, i);
     }
 
     int outOffset = blockIdx.z * param.outBatchNumel
@@ -310,15 +308,15 @@ conv2d_4x128x256_groups_kernel_biasopt(
 }
 
 __global__ void
-conv2d_4x128x256_groups_kernel_db(
+conv2d_4x64x256_groups_kernel_db(
     float *inputs,
     float *weights,
     float *bias,
     float *outputs,
     Conv2DParam param)
 {
-    constexpr int kWeightBufferElements = 4 * 128;
-    __shared__ __align__(2 * 1024)
+    constexpr int kWeightBufferElements = 4 * 64;
+    __shared__ __align__(1024)
     float weight_buffers[2][kWeightBufferElements];
 
     uint32_t buffer_addr[2] = {
@@ -339,17 +337,11 @@ conv2d_4x128x256_groups_kernel_db(
     float weight_frag[16];
     float input_frag[4][4];
     float output_frag[4];
-    int lane = threadIdx.x & 31;
-    float bias_val = 0.0f;
-    if (lane < 4)
-    {
-        bias_val = bias[blockIdx.y * 4 + lane];
-    }
 
 #pragma unroll
     for (int i = 0; i < 4; ++i)
     {
-        output_frag[i] = __shfl_sync(0xFFFFFFFF, bias_val, i);
+        output_frag[i] = 0.0f;
     }
 
     bool is_weight_loader = threadIdx.x < 16;
@@ -366,7 +358,7 @@ conv2d_4x128x256_groups_kernel_db(
         ptx::sts32(
             weight_ldg_reg,
             buffer_addr[0]
-                + (weight_channel * 128 + weight_position) * sizeof(float));
+                + (weight_channel * 64 + weight_position) * sizeof(float));
     }
     __syncthreads();
 
@@ -387,7 +379,7 @@ conv2d_4x128x256_groups_kernel_db(
             ptx::sts32(
                 weight_ldg_reg,
                 buffer_addr[next_buffer]
-                    + (weight_channel * 128 + weight_position)
+                    + (weight_channel * 64 + weight_position)
                         * sizeof(float));
         }
 
@@ -428,19 +420,19 @@ conv2d_4x128x256_groups_kernel_db(
             weight_frag[5],
             weight_frag[6],
             weight_frag[7],
-            buffer_addr[current_buffer] + 128 * sizeof(float));
+            buffer_addr[current_buffer] + 64 * sizeof(float));
         ptx::lds128(
             weight_frag[8],
             weight_frag[9],
             weight_frag[10],
             weight_frag[11],
-            buffer_addr[current_buffer] + 256 * sizeof(float));
+            buffer_addr[current_buffer] + 128 * sizeof(float));
         ptx::lds128(
             weight_frag[12],
             weight_frag[13],
             weight_frag[14],
             weight_frag[15],
-            buffer_addr[current_buffer] + 384 * sizeof(float));
+            buffer_addr[current_buffer] + 192 * sizeof(float));
         __syncthreads();
 
         current_buffer ^= 1;
@@ -454,6 +446,18 @@ conv2d_4x128x256_groups_kernel_db(
             output_frag[2] += weight_frag[i + 8] * input_frag[2][i];
             output_frag[3] += weight_frag[i + 12] * input_frag[3][i];
         }
+    }
+
+    int lane = threadIdx.x & 31;
+    float bias_val = 0.0f;
+    if (lane < 4)
+    {
+        bias_val = bias[blockIdx.y * 4 + lane];
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        output_frag[i] += __shfl_sync(0xFFFFFFFF, bias_val, i);
     }
 
     int outOffset = blockIdx.z * param.outBatchNumel
@@ -478,7 +482,7 @@ static void launch_custom(
 {
     dim3 block(256);
     dim3 grid((param.outHW + 255) / 256, param.out_ch / 4, n);
-    conv2d_4x128x256_groups_kernel<<<grid, block>>>(
+    conv2d_4x64x256_groups_kernel<<<grid, block>>>(
         static_cast<float *>(inputs),
         static_cast<float *>(weights),
         static_cast<float *>(bias),
@@ -496,7 +500,7 @@ static void launch_biasopt(
 {
     dim3 block(256);
     dim3 grid((param.outHW + 255) / 256, param.out_ch / 4, n);
-    conv2d_4x128x256_groups_kernel_biasopt<<<grid, block>>>(
+    conv2d_4x64x256_groups_kernel_biasopt<<<grid, block>>>(
         static_cast<float *>(inputs),
         static_cast<float *>(weights),
         static_cast<float *>(bias),
@@ -514,7 +518,7 @@ static void launch_db(
 {
     dim3 block(256);
     dim3 grid((param.outHW + 255) / 256, param.out_ch / 4, n);
-    conv2d_4x128x256_groups_kernel_db<<<grid, block>>>(
+    conv2d_4x64x256_groups_kernel_db<<<grid, block>>>(
         static_cast<float *>(inputs),
         static_cast<float *>(weights),
         static_cast<float *>(bias),
@@ -1152,7 +1156,7 @@ static void run_case(
 
 int main(int argc, char *argv[])
 {
-    std::string csv_path = "benchmark_dwconv_k128_fp32.csv";
+    std::string csv_path = "benchmark_dwconv_k64_fp32.csv";
     int iters = 100;
     int warmup = 10;
     bool quick = false;
@@ -1186,12 +1190,12 @@ int main(int argc, char *argv[])
     int ns[] = {1, 2, 4, 8, 16, 32};
     int cs[] = {32, 64, 128, 256};
     int hs[] = {40, 80, 160};
-    int kernel_sizes[] = {3, 5, 7, 9, 11};
+    int kernel_sizes[] = {3, 5, 7};
 
     int ns_quick[] = {1, 16};
     int cs_quick[] = {32, 128};
     int hs_quick[] = {40, 80};
-    int kernel_sizes_quick[] = {7, 11};
+    int kernel_sizes_quick[] = {3, 7};
 
     int *active_ns = quick ? ns_quick : ns;
     int *active_cs = quick ? cs_quick : cs;
@@ -1200,7 +1204,7 @@ int main(int argc, char *argv[])
     int ns_count = quick ? 2 : 6;
     int cs_count = quick ? 2 : 4;
     int hs_count = quick ? 2 : 3;
-    int kernel_sizes_count = quick ? 2 : 5;
+    int kernel_sizes_count = quick ? 2 : 3;
 
     std::ofstream csv(csv_path);
     if (!csv.is_open())
