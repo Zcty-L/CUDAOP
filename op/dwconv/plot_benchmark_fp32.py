@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 from pathlib import Path
 
@@ -15,6 +16,9 @@ parser.add_argument("--csv", default="benchmark_results_fp32.csv")
 parser.add_argument("--out-dir", default=".")
 args = parser.parse_args()
 
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger(__name__)
+
 csv_path = Path(args.csv)
 out_dir = Path(args.out_dir)
 out_dir.mkdir(parents=True, exist_ok=True)
@@ -25,6 +29,7 @@ sns.set_style("whitegrid")
 colors = {
     "custom": "#2196F3",
     "biasopt": "#9C27B0",
+    "db": "#FF5722",
     "dbuf": "#FF5722",
     "cudnn_nchw": "#FF9800",
     "cudnn_nhwc": "#4CAF50",
@@ -52,6 +57,7 @@ for ks in ksizes:
             for kernel in [
                 "custom",
                 "biasopt",
+                "db",
                 "dbuf",
                 "cudnn_nchw",
                 "cudnn_nhwc",
@@ -81,4 +87,4 @@ for ks in ksizes:
     fig.tight_layout()
     output_path = out_dir / f"benchmark_fp32_k{ks}.png"
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    print(f"Saved {output_path}")
+    logger.info("Saved %s", output_path)
