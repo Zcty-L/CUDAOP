@@ -46,6 +46,8 @@ set(OP_SOURCES
     "op/conv/conv2d_erf_k64_u8_fp16.cu"
     "op/dwconv/conv2d_groups_fp32.cu"
     "op/dwconv/dwconv_k128.cu"
+    "op/dwconv/dwconv_k32.cu"
+    "op/dwconv/dwconv_k64.cu"
     "op/dwconv/opt_conv2d_groups_fp32.cu"
     "op/resize/resize_u8.cu"
     "op/mul/mul_u8.cu"

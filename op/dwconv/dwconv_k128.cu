@@ -309,6 +309,165 @@ conv2d_4x128x256_groups_kernel_biasopt(
     }
 }
 
+__global__ void
+conv2d_4x128x256_groups_kernel_db(
+    float *inputs,
+    float *weights,
+    float *bias,
+    float *outputs,
+    Conv2DParam param)
+{
+    constexpr int kWeightBufferElements = 4 * 128;
+    __shared__ __align__(2 * 1024)
+    float weight_buffers[2][kWeightBufferElements];
+
+    uint32_t buffer_addr[2] = {
+        ptx::smem_u32addr(weight_buffers[0]),
+        ptx::smem_u32addr(weight_buffers[1])};
+
+    int out_pos = blockIdx.x * 256 + threadIdx.x;
+    int posh_ori = (out_pos / param.out_w) * param.Sh - param.Ph;
+    int posw_ori = (out_pos % param.out_w) * param.Sw - param.Pw;
+
+    const char *weight_group_base = reinterpret_cast<const char *>(
+        weights + blockIdx.y * 4 * param.KhKw);
+    auto *input_ptr = inputs
+        + blockIdx.z * param.inBatchNumel
+        + blockIdx.y * 4 * param.inHW;
+
+    float weight_ldg_reg = 0.0f;
+    float weight_frag[16];
+    float input_frag[4][4];
+    float output_frag[4];
+    int lane = threadIdx.x & 31;
+    float bias_val = 0.0f;
+    if (lane < 4)
+    {
+        bias_val = bias[blockIdx.y * 4 + lane];
+    }
+
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        output_frag[i] = __shfl_sync(0xFFFFFFFF, bias_val, i);
+    }
+
+    bool is_weight_loader = threadIdx.x < 16;
+    int weight_channel = threadIdx.x / 4;
+    int weight_position = threadIdx.x % 4;
+    if (is_weight_loader)
+    {
+        ptx::ldg_nc_0(
+            weight_ldg_reg,
+            weight_group_base
+                + (weight_channel * param.KhKw + weight_position)
+                    * sizeof(float),
+            weight_position < param.KhKw);
+        ptx::sts32(
+            weight_ldg_reg,
+            buffer_addr[0]
+                + (weight_channel * 128 + weight_position) * sizeof(float));
+    }
+    __syncthreads();
+
+    int current_buffer = 0;
+    int next_buffer = 1;
+    for (int k = 0; k < param.KhKw; k += 4)
+    {
+        int next_k = k + 4;
+        if (next_k < param.KhKw && is_weight_loader)
+        {
+            int load_position = next_k + weight_position;
+            ptx::ldg_nc_0(
+                weight_ldg_reg,
+                weight_group_base
+                    + (weight_channel * param.KhKw + load_position)
+                        * sizeof(float),
+                load_position < param.KhKw);
+            ptx::sts32(
+                weight_ldg_reg,
+                buffer_addr[next_buffer]
+                    + (weight_channel * 128 + weight_position)
+                        * sizeof(float));
+        }
+
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+        {
+            int tap = k + i;
+            int curH = posh_ori + tap / param.Kw;
+            int curW = posw_ori + tap % param.Kw;
+            int in_offset = curH * param.in_w + curW;
+            bool guard = curH >= 0 && curW >= 0
+                && curW < param.in_w && curH < param.in_h;
+
+            if (guard)
+            {
+                input_frag[0][i] = input_ptr[in_offset];
+                input_frag[1][i] = input_ptr[in_offset + param.inHW];
+                input_frag[2][i] = input_ptr[in_offset + param.inHW * 2];
+                input_frag[3][i] = input_ptr[in_offset + param.inHW * 3];
+            }
+            else
+            {
+                input_frag[0][i] = 0.0f;
+                input_frag[1][i] = 0.0f;
+                input_frag[2][i] = 0.0f;
+                input_frag[3][i] = 0.0f;
+            }
+        }
+
+        ptx::lds128(
+            weight_frag[0],
+            weight_frag[1],
+            weight_frag[2],
+            weight_frag[3],
+            buffer_addr[current_buffer]);
+        ptx::lds128(
+            weight_frag[4],
+            weight_frag[5],
+            weight_frag[6],
+            weight_frag[7],
+            buffer_addr[current_buffer] + 128 * sizeof(float));
+        ptx::lds128(
+            weight_frag[8],
+            weight_frag[9],
+            weight_frag[10],
+            weight_frag[11],
+            buffer_addr[current_buffer] + 256 * sizeof(float));
+        ptx::lds128(
+            weight_frag[12],
+            weight_frag[13],
+            weight_frag[14],
+            weight_frag[15],
+            buffer_addr[current_buffer] + 384 * sizeof(float));
+        __syncthreads();
+
+        current_buffer ^= 1;
+        next_buffer ^= 1;
+
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+        {
+            output_frag[0] += weight_frag[i] * input_frag[0][i];
+            output_frag[1] += weight_frag[i + 4] * input_frag[1][i];
+            output_frag[2] += weight_frag[i + 8] * input_frag[2][i];
+            output_frag[3] += weight_frag[i + 12] * input_frag[3][i];
+        }
+    }
+
+    int outOffset = blockIdx.z * param.outBatchNumel
+        + blockIdx.y * 4 * param.outHW
+        + out_pos;
+    if (out_pos < param.outHW)
+    {
+        outputs[outOffset + param.outHW * 0] = output_frag[0];
+        outputs[outOffset + param.outHW * 1] = output_frag[1];
+        outputs[outOffset + param.outHW * 2] = output_frag[2];
+        outputs[outOffset + param.outHW * 3] = output_frag[3];
+    }
+}
+
 static void launch_custom(
     void *inputs,
     void *weights,
@@ -343,6 +502,110 @@ static void launch_biasopt(
         static_cast<float *>(bias),
         static_cast<float *>(outputs),
         param);
+}
+
+static void launch_db(
+    void *inputs,
+    void *weights,
+    void *bias,
+    void *outputs,
+    Conv2DParam param,
+    uint32_t n)
+{
+    dim3 block(256);
+    dim3 grid((param.outHW + 255) / 256, param.out_ch / 4, n);
+    conv2d_4x128x256_groups_kernel_db<<<grid, block>>>(
+        static_cast<float *>(inputs),
+        static_cast<float *>(weights),
+        static_cast<float *>(bias),
+        static_cast<float *>(outputs),
+        param);
+}
+
+__global__ void compare_outputs_kernel(
+    const float *reference,
+    const float *actual,
+    int numel,
+    float tolerance,
+    unsigned int *max_abs_error_bits,
+    unsigned long long *mismatch_count)
+{
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = index; i < numel; i += stride)
+    {
+        float abs_error = fabsf(reference[i] - actual[i]);
+        atomicMax(max_abs_error_bits, __float_as_uint(abs_error));
+        if (!(abs_error <= tolerance))
+        {
+            atomicAdd(mismatch_count, 1ULL);
+        }
+    }
+}
+
+static void validate_db(
+    void *inputs,
+    void *weights,
+    void *bias,
+    void *outputs,
+    Conv2DParam param,
+    uint32_t n,
+    int out_numel)
+{
+    float *reference_d = nullptr;
+    unsigned int *max_abs_error_bits_d = nullptr;
+    unsigned long long *mismatch_count_d = nullptr;
+    CUDA_CHECK(cudaMalloc(&reference_d, out_numel * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&max_abs_error_bits_d, sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&mismatch_count_d, sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMemset(max_abs_error_bits_d, 0, sizeof(unsigned int)));
+    CUDA_CHECK(cudaMemset(mismatch_count_d, 0, sizeof(unsigned long long)));
+
+    launch_biasopt(inputs, weights, bias, reference_d, param, n);
+    launch_db(inputs, weights, bias, outputs, param, n);
+    int compare_blocks = (out_numel + 255) / 256;
+    compare_blocks = compare_blocks < 1024 ? compare_blocks : 1024;
+    compare_outputs_kernel<<<compare_blocks, 256>>>(
+        reference_d,
+        static_cast<float *>(outputs),
+        out_numel,
+        1.0e-5f,
+        max_abs_error_bits_d,
+        mismatch_count_d);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    unsigned int max_abs_error_bits = 0;
+    unsigned long long mismatch_count = 0;
+    CUDA_CHECK(cudaMemcpy(
+        &max_abs_error_bits,
+        max_abs_error_bits_d,
+        sizeof(unsigned int),
+        cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        &mismatch_count,
+        mismatch_count_d,
+        sizeof(unsigned long long),
+        cudaMemcpyDeviceToHost));
+    float max_abs_error = 0.0f;
+    std::memcpy(
+        &max_abs_error,
+        &max_abs_error_bits,
+        sizeof(max_abs_error));
+
+    CUDA_CHECK(cudaFree(reference_d));
+    CUDA_CHECK(cudaFree(max_abs_error_bits_d));
+    CUDA_CHECK(cudaFree(mismatch_count_d));
+
+    std::cout << "[VERIFY] db vs biasopt: max_abs_error="
+              << std::scientific << max_abs_error
+              << " mismatch=" << mismatch_count << "/" << out_numel
+              << std::fixed << std::endl;
+    if (mismatch_count != 0)
+    {
+        std::cout << "[ERROR] db correctness check failed" << std::endl;
+        std::exit(1);
+    }
 }
 
 using KernelLaunch = void (*)(
@@ -640,6 +903,15 @@ static void run_case(
 
     Conv2DParam param = make_param(n, c, h, w, r, s, u, v, p, q);
 
+    validate_db(
+        input_d,
+        weight_d,
+        bias_d,
+        output_d,
+        param,
+        n,
+        out_numel);
+
     float t_custom = benchmark_kernel(
         launch_custom,
         input_d,
@@ -670,6 +942,27 @@ static void run_case(
         h,
         "biasopt",
         t_biasopt,
+        flops,
+        arith_intensity);
+
+    float t_db = benchmark_kernel(
+        launch_db,
+        input_d,
+        weight_d,
+        bias_d,
+        output_d,
+        param,
+        n,
+        warmup,
+        iters);
+    write_result(
+        csv,
+        r,
+        n,
+        c,
+        h,
+        "db",
+        t_db,
         flops,
         arith_intensity);
 
