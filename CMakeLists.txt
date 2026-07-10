@@ -35,7 +35,6 @@ include_directories(
 
 # --- Build Explicitly Specified .cu Files ---
 set(OP_SOURCES
-    "op/device_query.cu"
     "op/conv/conv2d_k128.cu"
     "op/conv/conv2d_k64_u8.cu"
     "op/conv/conv2d_k64_u4.cu"
@@ -44,6 +43,20 @@ set(OP_SOURCES
     "op/conv/conv2d_sn_k64_u8_fp16.cu"
     "op/conv/conv2d_erf_k64_u8.cu"
     "op/conv/conv2d_erf_k64_u8_fp16.cu"
+    "op/dwconv/conv2d_groups_fp32.cu"
+    "op/dwconv/dwconv_k128.cu"
+    "op/dwconv/dwconv_k128_fp16.cu"
+    "op/dwconv/dwconv_k32.cu"
+    "op/dwconv/dwconv_k32_fp16.cu"
+    "op/dwconv/dwconv_k64.cu"
+    "op/dwconv/dwconv_k64_fp16.cu"
+    "op/dwconv/dwconv_spike_k32.cu"
+    "op/dwconv/dwconv_spike_k32_fp16.cu"
+    "op/dwconv/dwconv_spike_k64.cu"
+    "op/dwconv/dwconv_spike_k64_fp16.cu"
+    "op/dwconv/dwconv_spike_k128.cu"
+    "op/dwconv/dwconv_spike_k128_fp16.cu"
+    "op/dwconv/opt_conv2d_groups_fp32.cu"
     "op/resize/resize_u8.cu"
     "op/mul/mul_u8.cu"
     "op/linear/linear_k128.cu"
@@ -57,6 +70,10 @@ foreach(SRC_FILE ${OP_SOURCES})
     
     # 将该文件编译为独立的可执行程序
     add_executable(${EXE_NAME} ${SRC_FILE})
+
+    if(EXE_NAME STREQUAL "opt_conv2d_groups_fp32")
+        target_sources(${EXE_NAME} PRIVATE op/cpu/cpu_ops.cpp)
+    endif()
     
     # 链接基础 CUDA 库
     target_link_libraries(${EXE_NAME} PRIVATE 
@@ -97,38 +114,43 @@ add_custom_target(lora_moe_ops
 
 add_custom_target(lora_moe_standard_test
     COMMAND
+        ${CMAKE_COMMAND} -E env
+        "PYTHONPATH=${PROJECT_SOURCE_DIR}/op/grouped_gemm"
         ${Python3_EXECUTABLE} test_standard.py
     COMMAND
+        ${CMAKE_COMMAND} -E env
+        "PYTHONPATH=${PROJECT_SOURCE_DIR}/op/grouped_gemm"
         ${Python3_EXECUTABLE} test_nonstandard.py
-    COMMAND
-        ${Python3_EXECUTABLE} test_grouped_gemm.py
     WORKING_DIRECTORY
         "${PROJECT_SOURCE_DIR}/op/lora_moe"
     DEPENDS
         lora_moe_ops
+        cudaop_grouped_gemm
     COMMENT
         "Testing the LoRA-MoE Torch implementations"
     VERBATIM
 )
 
-set(
-    CUTLASS_ROOT
-    "${PROJECT_SOURCE_DIR}/../cutlass"
-    CACHE PATH
-    "Path to the CUTLASS source tree"
+add_custom_target(cudaop_grouped_gemm
+    COMMAND
+        ${CMAKE_COMMAND} -E env
+        TORCH_CUDA_ARCH_LIST=12.0
+        ${Python3_EXECUTABLE} setup.py build_ext --inplace
+    WORKING_DIRECTORY
+        "${PROJECT_SOURCE_DIR}/op/grouped_gemm"
+    COMMENT
+        "Building the cudaop_grouped_gemm Python CUDA extension"
+    VERBATIM
 )
 
-add_executable(
-    lora_moe_cutlass_grouped_test
-    op/lora_moe/csrc/cutlass_grouped_gemm_test.cu
-)
-target_include_directories(
-    lora_moe_cutlass_grouped_test
-    PRIVATE
-        "${CUTLASS_ROOT}/include"
-)
-target_link_libraries(
-    lora_moe_cutlass_grouped_test
-    PRIVATE
-        CUDA::cudart
+add_custom_target(cudaop_grouped_gemm_test
+    COMMAND
+        ${Python3_EXECUTABLE} test_grouped_gemm.py
+    WORKING_DIRECTORY
+        "${PROJECT_SOURCE_DIR}/op/grouped_gemm"
+    DEPENDS
+        cudaop_grouped_gemm
+    COMMENT
+        "Testing cudaop_grouped_gemm"
+    VERBATIM
 )

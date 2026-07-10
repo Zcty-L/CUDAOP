@@ -119,7 +119,6 @@ cmake --build build --target <cmake目标> -j
 
 ### 1.5 创建实验记录
 
-
 在最终报告中维护以下表格。优化期间可先记录在 `/tmp/opt_kernel_<kernel_name>.md`，但 `/tmp` 只作为运行中草稿。
 阶段性停止、`[BLOCKED]` 或最终交付前，必须将可读报告写入 `docs/opt_kernel/<kernel_name>.md`。不得只交付 `/tmp` 路径；临时 profile 文件不得提交到仓库。
 
@@ -215,7 +214,6 @@ ncu -f --set basic --kernel-name regex:<kernel名称正则> \
 5. 计算单元：warp primitive、Tensor Core 或架构专用指令。
 6. 微调：展开、编译属性和较小参数搜索。
 
-
 制定计划时必须先输出“高级机制适配性判断”，不得只给微调项。至少覆盖：
 ```markdown
 | 机制 | 适用条件 | 当前 kernel 是否满足 | 预期收益 | 风险 | 是否实验 |
@@ -289,7 +287,7 @@ compute-sanitizer --tool memcheck ./build/<cmake目标> <运行参数>
 
 ## 阶段 6 - 交付
 
-仓库可见路径：`docs/opt_kernel/<kernel_name>.md`。
+将报告写入仓库可见路径：`docs/opt_kernel/<kernel_name>.md`。
 若存在 `/tmp/opt_kernel_<kernel_name>.md`，将其中有效内容整理或同步到上述路径；删除或省略临时命令噪声、绝对临时 profile 路径和失败实验中不影响结论的冗余日志。
 
 报告模板：
