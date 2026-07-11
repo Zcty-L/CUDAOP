@@ -35,6 +35,7 @@ include_directories(
 
 # --- Build Explicitly Specified .cu Files ---
 set(OP_SOURCES
+    "op/device_query.cu"
     "op/conv/conv2d_k128.cu"
     "op/conv/conv2d_k64_u8.cu"
     "op/conv/conv2d_k64_u4.cu"
@@ -43,7 +44,6 @@ set(OP_SOURCES
     "op/conv/conv2d_sn_k64_u8_fp16.cu"
     "op/conv/conv2d_erf_k64_u8.cu"
     "op/conv/conv2d_erf_k64_u8_fp16.cu"
-    "op/dwconv/conv2d_groups_fp32.cu"
     "op/dwconv/dwconv_k128.cu"
     "op/dwconv/dwconv_k128_fp16.cu"
     "op/dwconv/dwconv_k32.cu"
