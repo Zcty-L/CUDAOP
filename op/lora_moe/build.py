@@ -13,12 +13,26 @@ import torch
 ROOT = Path(__file__).resolve().parent
 
 
+def resolve_arch_list(requested: str | None) -> str:
+    if requested:
+        return requested
+
+    configured = os.environ.get("TORCH_CUDA_ARCH_LIST")
+    if configured:
+        return configured
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "未检测到 CUDA GPU；请使用 --arch-list 显式指定目标架构"
+        )
+
+    major, minor = torch.cuda.get_device_capability()
+    return f"{major}.{minor}"
+
+
 def build(arch_list: str | None) -> None:
     env = os.environ.copy()
-    if arch_list:
-        env["TORCH_CUDA_ARCH_LIST"] = arch_list
-    elif not env.get("TORCH_CUDA_ARCH_LIST"):
-        env["TORCH_CUDA_ARCH_LIST"] = "12.0"
+    env["TORCH_CUDA_ARCH_LIST"] = resolve_arch_list(arch_list)
 
     subprocess.run(
         [
@@ -59,7 +73,7 @@ def main() -> None:
         "--arch-list",
         help=(
             "CUDA architectures passed through TORCH_CUDA_ARCH_LIST "
-            "(default: existing environment value, otherwise 12.0)"
+            "(default: existing environment value, otherwise current GPU)"
         ),
     )
     args = parser.parse_args()

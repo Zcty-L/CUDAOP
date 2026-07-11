@@ -27,8 +27,7 @@ description: >-
 ```
 能够根据输入定位唯一目标 kernel 的 launch site、launch wrapper 和模板实例化，包括输入、输出、数据类型、布局、形状范围和数值语义，
 如果用户没有提供足够的定位信息，先列出文件中的候选 kernel 名称与定义行号，请用户指定目标，不得自行选择。找不到唯一匹配时输出 `[BLOCKED]`。
-
-架构选择优先级为：用户显式参数、`CMAKE_CUDA_ARCHITECTURES`、当前 GPU 计算能力。三者不一致时停止并说明，不得静默使用默认架构。
+架构选择使用查询到的当前 GPU 计算能力，除非用户显式指定目标 SM。
 
 ## 阶段 0 - 预检
 
@@ -48,14 +47,17 @@ rg -n "<源文件名>|<cmake目标>" CMakeLists.txt
 
 ### 0.2 检查 GPU
 
-通过 CMake 构建并运行设备查询：
+先查询 GPU，再用查询到的原生 SM 通过 CMake 构建并运行设备查询：
 
 ```bash
-cmake -S . -B build
+nvidia-smi --query-gpu=index,name,compute_cap,utilization.gpu,utilization.memory --format=csv
+cmake -S . -B build -DCUDAOP_CUDA_ARCHITECTURES=<查询值>
 cmake --build build --target device_query -j
 ./build/device_query
-nvidia-smi --query-gpu=name,compute_cap,utilization.gpu,utilization.memory --format=csv
 ```
+
+若存在多张不同计算能力的 GPU，先确定 benchmark 实际使用的 device，再使用该 device 的计算能力。
+若需要跨设备发布，由用户显式给出架构列表，这与单设备 kernel 优化基线分开处理。
 
 记录：
 - GPU 名称、计算能力和 SM 数量；
@@ -95,7 +97,7 @@ nvidia-smi --query-gpu=name,compute_cap,utilization.gpu,utilization.memory --for
 ### 1.2 编译基线
 
 ```bash
-cmake -S . -B build
+cmake -S . -B build -DCUDAOP_CUDA_ARCHITECTURES=<目标SM>
 cmake --build build --target <cmake目标> -j
 ```
 
@@ -113,6 +115,7 @@ cmake --build build --target <cmake目标> -j
 报告 100 次结果的 mean、median、min、max 和标准差。极短 kernel 可一次计时批量 launch，但必须除以 launch 次数，并在报告中写明批量大小。批量计时时，warmup 与正式样本使用相同批量大小。
 目标实现和参考实现分开预热、分开测试，不在同一组 benchmark 内交替执行。每个实现记录预热时长、批量大小和正式样本数。
 同一配置至少重复整组 benchmark 3 次。若组间中位数波动超过 2%，先排查 GPU 负载、温度、时钟和缓存状态，不进入实验阶段。
+组间中位数波动统一按以下公式计算：group_median_spread = (max(group_median) - min(group_median)) / median(group_median)，报告百分比时将该结果乘以 100%。
 默认不要求锁定 GPU 频率；若发现动态频率、功耗限制或 Laptop GPU 导致波动，在记录和最终报告中注明，不把锁频结果当作默认性能上限。
 若动态时钟设备经预热仍无法将组间中位数波动控制在 2% 内，默认标记 `[BLOCKED]`，仅继续静态分析和制定暂定计划。
 若用户明确接受噪声阈值策略，可继续探索实验；实验结果只能标记为暂定结论，判定规则见阶段 4。

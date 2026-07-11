@@ -1,12 +1,71 @@
 cmake_minimum_required(VERSION 3.18)
+
+# Query the current GPU on every configure so that a stale CMake cache from
+# another platform cannot pin the old SM. Callers that intentionally
+# cross-compile can use -DCUDAOP_CUDA_ARCHITECTURES=<arch>.
+set(
+    CUDAOP_CUDA_ARCHITECTURES
+    ""
+    CACHE STRING
+    "Explicit CUDA architectures; empty selects the current GPU"
+)
+if(CUDAOP_CUDA_ARCHITECTURES)
+    set(
+        CMAKE_CUDA_ARCHITECTURES
+        "${CUDAOP_CUDA_ARCHITECTURES}"
+        CACHE STRING
+        "CUDA architectures"
+        FORCE
+    )
+else()
+    execute_process(
+        COMMAND
+            nvidia-smi
+            --query-gpu=compute_cap
+            --format=csv,noheader,nounits
+        RESULT_VARIABLE CUDAOP_GPU_QUERY_RESULT
+        OUTPUT_VARIABLE CUDAOP_GPU_COMPUTE_CAPS
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(NOT CUDAOP_GPU_QUERY_RESULT EQUAL 0 OR NOT CUDAOP_GPU_COMPUTE_CAPS)
+        message(
+            FATAL_ERROR
+            "Cannot query the current GPU compute capability. "
+            "Use -DCUDAOP_CUDA_ARCHITECTURES=<arch> explicitly."
+        )
+    endif()
+
+    string(REPLACE "\r" "" CUDAOP_GPU_COMPUTE_CAPS "${CUDAOP_GPU_COMPUTE_CAPS}")
+    string(REPLACE "\n" ";" CUDAOP_GPU_COMPUTE_CAPS "${CUDAOP_GPU_COMPUTE_CAPS}")
+    list(FILTER CUDAOP_GPU_COMPUTE_CAPS EXCLUDE REGEX "^$")
+    list(REMOVE_DUPLICATES CUDAOP_GPU_COMPUTE_CAPS)
+    list(LENGTH CUDAOP_GPU_COMPUTE_CAPS CUDAOP_GPU_ARCH_COUNT)
+    if(NOT CUDAOP_GPU_ARCH_COUNT EQUAL 1)
+        message(
+            FATAL_ERROR
+            "Detected GPUs with different compute capabilities: "
+            "${CUDAOP_GPU_COMPUTE_CAPS}. Use "
+            "-DCUDAOP_CUDA_ARCHITECTURES=<arch> for the benchmark GPU."
+        )
+    endif()
+
+    list(GET CUDAOP_GPU_COMPUTE_CAPS 0 CUDAOP_GPU_COMPUTE_CAP)
+    string(REPLACE "." "" CUDAOP_NATIVE_CUDA_ARCH "${CUDAOP_GPU_COMPUTE_CAP}")
+    set(
+        CMAKE_CUDA_ARCHITECTURES
+        "${CUDAOP_NATIVE_CUDA_ARCH}"
+        CACHE STRING
+        "CUDA architectures"
+        FORCE
+    )
+endif()
+
 project(CUDAOP LANGUAGES CUDA CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_BUILD_TYPE Release)
 set(CMAKE_CUDA_STANDARD 17)
-
-# Target SM 120 for 5070 Ti
-set(CMAKE_CUDA_ARCHITECTURES 120)
 
 # Linux / WSL2 Configuration
 if (UNIX)
@@ -102,9 +161,7 @@ endforeach()
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_custom_target(lora_moe_ops
     COMMAND
-        ${CMAKE_COMMAND} -E env
-        TORCH_CUDA_ARCH_LIST=12.0
-        ${Python3_EXECUTABLE} setup.py build_ext --inplace
+        ${Python3_EXECUTABLE} build.py
     WORKING_DIRECTORY
         "${PROJECT_SOURCE_DIR}/op/lora_moe"
     COMMENT
@@ -133,9 +190,7 @@ add_custom_target(lora_moe_standard_test
 
 add_custom_target(cudaop_grouped_gemm
     COMMAND
-        ${CMAKE_COMMAND} -E env
-        TORCH_CUDA_ARCH_LIST=12.0
-        ${Python3_EXECUTABLE} setup.py build_ext --inplace
+        ${Python3_EXECUTABLE} build.py
     WORKING_DIRECTORY
         "${PROJECT_SOURCE_DIR}/op/grouped_gemm"
     COMMENT
