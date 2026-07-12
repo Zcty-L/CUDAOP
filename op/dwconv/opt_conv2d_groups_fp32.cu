@@ -281,6 +281,99 @@ static void launch_specialized(
 }
 
 __global__ void
+conv2d_1x128x256_groups_k7_kernel(
+    const float *inputs,
+    const float *weights,
+    const float *bias,
+    float *outputs,
+    Conv2DParam param)
+{
+    constexpr int kernel_size = 7;
+    constexpr int kernel_elements = kernel_size * kernel_size;
+    __shared__ float shared_weights[kernel_elements];
+    __shared__ float shared_bias;
+
+    if (threadIdx.x < kernel_elements)
+    {
+        shared_weights[threadIdx.x] = weights[
+            blockIdx.y * kernel_elements + threadIdx.x];
+    }
+    if (threadIdx.x == 0)
+    {
+        shared_bias = bias[blockIdx.y];
+    }
+    __syncthreads();
+
+    int out_pos = blockIdx.x * blockDim.x + threadIdx.x;
+    int posh_origin =
+        (out_pos / param.out_w) * param.Sh - param.Ph;
+    int posw_origin =
+        (out_pos % param.out_w) * param.Sw - param.Pw;
+    const float *input_channel = inputs
+        + blockIdx.z * param.inBatchNumel
+        + blockIdx.y * param.inHW;
+    float accumulator = 0.0f;
+
+    for (int tap_base = 0;
+         tap_base < kernel_elements;
+         tap_base += 4)
+    {
+        float input_values[4];
+        float weight_values[4];
+#pragma unroll
+        for (int index = 0; index < 4; ++index)
+        {
+            int tap = tap_base + index;
+            int kernel_h = tap / kernel_size;
+            int kernel_w = tap % kernel_size;
+            int input_h = posh_origin + kernel_h;
+            int input_w = posw_origin + kernel_w;
+            bool valid = tap < kernel_elements
+                && input_h >= 0 && input_w >= 0
+                && input_h < param.in_h && input_w < param.in_w;
+            int input_offset = input_h * param.in_w + input_w;
+            ptx::ldg32_nc_0(
+                input_values[index],
+                input_channel + input_offset,
+                valid);
+            weight_values[index] = tap < kernel_elements
+                ? shared_weights[tap]
+                : 0.0f;
+        }
+#pragma unroll
+        for (int index = 0; index < 4; ++index)
+        {
+            accumulator += weight_values[index] * input_values[index];
+        }
+    }
+
+    if (out_pos < param.outHW)
+    {
+        int output_offset = blockIdx.z * param.outBatchNumel
+            + blockIdx.y * param.outHW + out_pos;
+        outputs[output_offset] = accumulator + shared_bias;
+    }
+}
+
+static void launch_k7_single_channel(
+    void *inputs,
+    void *weights,
+    void *bias,
+    void *outputs,
+    Conv2DParam param,
+    uint32_t n)
+{
+    dim3 block(256);
+    dim3 grid((param.outHW + 255) / 256, param.out_ch, n);
+    conv2d_1x128x256_groups_k7_kernel<<<grid, block>>>(
+        static_cast<const float *>(inputs),
+        static_cast<const float *>(weights),
+        static_cast<const float *>(bias),
+        static_cast<float *>(outputs),
+        param);
+}
+
+__global__ void
 conv2d_4x16x16_shared_input_kernel(
     const float *inputs,
     const float *weights,
@@ -486,8 +579,19 @@ static void launch_target(
         }
         else if (param.Kh == 7 && param.Kw == 7)
         {
-            launch_specialized<7>(
-                inputs, weights, bias, outputs, param, n);
+            size_t grouped_blocks =
+                static_cast<size_t>((param.outHW + 255) / 256)
+                * (param.out_ch / 4) * n;
+            if (grouped_blocks < 104)
+            {
+                launch_k7_single_channel(
+                    inputs, weights, bias, outputs, param, n);
+            }
+            else
+            {
+                launch_specialized<7>(
+                    inputs, weights, bias, outputs, param, n);
+            }
         }
         else
         {
@@ -1033,6 +1137,8 @@ int main(int argc, char **argv)
         {"dispatch_out31", 7, 1, 32, 61, 61, 2, 512},
         {"dispatch_out32", 7, 1, 32, 63, 63, 2, 512},
         {"dispatch_out33", 7, 1, 32, 65, 65, 2, 512},
+        {"dispatch_blocks96", 7, 1, 32, 107, 107, 2, 256},
+        {"dispatch_blocks104", 7, 1, 32, 111, 111, 2, 256},
         {"rectangular", 7, 1, 32, 65, 81, 2, 512}
     };
 
