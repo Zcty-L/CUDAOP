@@ -60,6 +60,7 @@ struct Stats
     }                                                                      \
 }
 
+template <int KernelSize>
 __global__ void
 conv2d_4x128x256_fp16_groups_kernel(
     const __half *inputs,
@@ -68,6 +69,12 @@ conv2d_4x128x256_fp16_groups_kernel(
     __half *outputs,
     Conv2DParam param)
 {
+    constexpr bool specialized = KernelSize > 0;
+    constexpr int specialized_elements = KernelSize * KernelSize;
+    int kernel_width = specialized ? KernelSize : param.Kw;
+    int kernel_elements = specialized
+        ? specialized_elements
+        : param.KhKw;
     __shared__ __half2 smem_weights[4 * kKernelCapacity];
     __shared__ __half2 smem_bias[4];
 
@@ -85,10 +92,10 @@ conv2d_4x128x256_fp16_groups_kernel(
         int channel_pair = index / kKernelCapacity;
         int kernel_pos = index % kKernelCapacity;
         __half2 value = __float2half2_rn(0.0f);
-        if (kernel_pos < static_cast<int>(param.KhKw))
+        if (kernel_pos < kernel_elements)
         {
-            int weight_offset = blockIdx.y * 4 * param.KhKw
-                + channel_pair * param.KhKw + kernel_pos;
+            int weight_offset = blockIdx.y * 4 * kernel_elements
+                + channel_pair * kernel_elements + kernel_pos;
             value = packed_weights[weight_offset];
         }
         smem_weights[index] = value;
@@ -122,7 +129,7 @@ conv2d_4x128x256_fp16_groups_kernel(
             smem_bias[channel_pair]);
     }
 
-    for (int k = 0; k < static_cast<int>(param.KhKw); k += 4)
+    for (int k = 0; k < kernel_elements; k += 4)
     {
         __half2 input_frag[4][4];
 
@@ -131,10 +138,10 @@ conv2d_4x128x256_fp16_groups_kernel(
         {
             int kernel_pos = k + i;
             int cur_h = posh_ori
-                + kernel_pos / static_cast<int>(param.Kw);
+                + kernel_pos / kernel_width;
             int cur_w = posw_ori
-                + kernel_pos % static_cast<int>(param.Kw);
-            bool valid = kernel_pos < static_cast<int>(param.KhKw)
+                + kernel_pos % kernel_width;
+            bool valid = kernel_pos < kernel_elements
                 && cur_h >= 0
                 && cur_h < static_cast<int>(param.in_h)
                 && cur_w >= 0
@@ -189,7 +196,8 @@ conv2d_4x128x256_fp16_groups_kernel(
     }
 }
 
-static void launch_baseline(
+template <int KernelSize>
+static void launch_specialized(
     const __half *inputs,
     const __half2 *packed_weights,
     const __half *bias,
@@ -202,12 +210,47 @@ static void launch_baseline(
         (param.outHW + block.x - 1) / block.x,
         param.out_ch / 8,
         n);
-    conv2d_4x128x256_fp16_groups_kernel<<<grid, block>>>(
+    conv2d_4x128x256_fp16_groups_kernel<KernelSize><<<grid, block>>>(
         inputs,
         packed_weights,
         bias,
         outputs,
         param);
+}
+
+static void launch_baseline(
+    const __half *inputs,
+    const __half2 *packed_weights,
+    const __half *bias,
+    __half *outputs,
+    const Conv2DParam &param,
+    int n)
+{
+    if (param.Kh == 3 && param.Kw == 3)
+    {
+        launch_specialized<3>(
+            inputs, packed_weights, bias, outputs, param, n);
+    }
+    else if (param.Kh == 5 && param.Kw == 5)
+    {
+        launch_specialized<5>(
+            inputs, packed_weights, bias, outputs, param, n);
+    }
+    else if (param.Kh == 7 && param.Kw == 7)
+    {
+        launch_specialized<7>(
+            inputs, packed_weights, bias, outputs, param, n);
+    }
+    else if (param.Kh == 11 && param.Kw == 11)
+    {
+        launch_specialized<11>(
+            inputs, packed_weights, bias, outputs, param, n);
+    }
+    else
+    {
+        launch_specialized<0>(
+            inputs, packed_weights, bias, outputs, param, n);
+    }
 }
 
 static Stats calculate_stats(std::vector<float> values)
