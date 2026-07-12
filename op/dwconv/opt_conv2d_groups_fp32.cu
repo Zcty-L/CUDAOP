@@ -41,6 +41,7 @@ __device__ __forceinline__ int swizzle_shared_input_x(int input_x)
     return input_x ^ ((input_x >> 3) & 1);
 }
 
+template <int KernelSize>
 __global__ void
 conv2d_4x128x256_groups_kernel(
     float *inputs,
@@ -49,6 +50,13 @@ conv2d_4x128x256_groups_kernel(
     float *outputs,
     Conv2DParam param)
 {
+    constexpr bool specialized_kernel = KernelSize > 0;
+    constexpr int specialized_kernel_elements = KernelSize * KernelSize;
+    int kernel_width = specialized_kernel ? KernelSize : param.Kw;
+    int kernel_elements = specialized_kernel
+        ? specialized_kernel_elements
+        : param.KhKw;
+
     __shared__ __align__(2 * 1024)
     char smem[4 * 128 * 4 + 4 * 4];
     auto *smemweight = reinterpret_cast<float *>(smem);
@@ -62,8 +70,8 @@ conv2d_4x128x256_groups_kernel(
     uint32_t weights_lds_addr = ptx::smem_u32addr(smemweight);
 
     const char *weight_ldg_ptr = reinterpret_cast<const char *>(
-        weights + blockIdx.y * 4 * param.KhKw
-        + threadIdx.x / 64 * param.KhKw
+        weights + blockIdx.y * 4 * kernel_elements
+        + threadIdx.x / 64 * kernel_elements
         + threadIdx.x % 64 * 2);
     auto *input_ptr = inputs
         + blockIdx.z * param.inBatchNumel
@@ -83,25 +91,26 @@ conv2d_4x128x256_groups_kernel(
     ptx::ldg_nc_0(
         weight_ldg_reg[0],
         weight_ldg_ptr,
-        threadIdx.x % 64 * 2 < param.KhKw);
+        threadIdx.x % 64 * 2 < kernel_elements);
     ptx::ldg_nc_0(
         weight_ldg_reg[1],
         weight_ldg_ptr + sizeof(float),
-        threadIdx.x % 64 * 2 + 1 < param.KhKw);
+        threadIdx.x % 64 * 2 + 1 < kernel_elements);
 
     ptx::sts64(weight_ldg_reg[0], weight_ldg_reg[1], weights_sts_addr);
     __syncthreads();
 
-    for (int k = 0; k < param.KhKw; k += 4)
+    for (int k = 0; k < kernel_elements; k += 4)
     {
 #pragma unroll
         for (int i = 0; i < 4; ++i)
         {
             int tap = k + i;
-            int curH = posh_ori + tap / param.Kw;
-            int curW = posw_ori + tap % param.Kw;
+            int curH = posh_ori + tap / kernel_width;
+            int curW = posw_ori + tap % kernel_width;
             int in_offset = curH * param.in_w + curW;
-            bool guard = curH >= 0 && curW >= 0
+            bool guard = tap < kernel_elements
+                && curH >= 0 && curW >= 0
                 && curW < param.in_w && curH < param.in_h;
 
             if (guard)
@@ -190,7 +199,26 @@ static void launch_custom(
 {
     dim3 block(256);
     dim3 grid((param.outHW + 255) / 256, param.out_ch / 4, n);
-    conv2d_4x128x256_groups_kernel<<<grid, block>>>(
+    conv2d_4x128x256_groups_kernel<0><<<grid, block>>>(
+        static_cast<float *>(inputs),
+        static_cast<float *>(weights),
+        static_cast<float *>(bias),
+        static_cast<float *>(outputs),
+        param);
+}
+
+template <int KernelSize>
+static void launch_specialized(
+    void *inputs,
+    void *weights,
+    void *bias,
+    void *outputs,
+    Conv2DParam param,
+    uint32_t n)
+{
+    dim3 block(256);
+    dim3 grid((param.outHW + 255) / 256, param.out_ch / 4, n);
+    conv2d_4x128x256_groups_kernel<KernelSize><<<grid, block>>>(
         static_cast<float *>(inputs),
         static_cast<float *>(weights),
         static_cast<float *>(bias),
@@ -392,7 +420,25 @@ static void launch_target(
 {
     if (!supports_shared_input(param))
     {
-        launch_custom(inputs, weights, bias, outputs, param, n);
+        if (param.Kh == 3 && param.Kw == 3)
+        {
+            launch_specialized<3>(
+                inputs, weights, bias, outputs, param, n);
+        }
+        else if (param.Kh == 5 && param.Kw == 5)
+        {
+            launch_specialized<5>(
+                inputs, weights, bias, outputs, param, n);
+        }
+        else if (param.Kh == 7 && param.Kw == 7)
+        {
+            launch_specialized<7>(
+                inputs, weights, bias, outputs, param, n);
+        }
+        else
+        {
+            launch_custom(inputs, weights, bias, outputs, param, n);
+        }
         return;
     }
 
