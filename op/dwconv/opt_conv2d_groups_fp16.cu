@@ -888,6 +888,7 @@ int main(int argc, char *argv[])
     const CaseConfig cases[] = {
         {"throughput", 7, 64, 128, 80, 80, 2, 4},
         {"main", 7, 4, 128, 80, 80, 2, 64},
+        {"small", 7, 1, 32, 43, 43, 2, 512},
         {"common", 5, 1, 32, 80, 80, 2, 512},
         {"aligned", 3, 2, 64, 64, 64, 2, 512},
         {"boundary", 3, 1, 32, 43, 43, 2, 1024},
