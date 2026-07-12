@@ -588,6 +588,11 @@ static void launch_baseline(
         launch_pair<7>(
             inputs, packed_weights, bias, outputs, param, n);
     }
+    else if (param.Kh == 9 && param.Kw == 9)
+    {
+        launch_pair<9>(
+            inputs, packed_weights, bias, outputs, param, n);
+    }
     else if (param.Kh == 11 && param.Kw == 11)
     {
         if (supports_shared_input(param))
