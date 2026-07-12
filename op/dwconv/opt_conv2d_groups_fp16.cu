@@ -21,9 +21,6 @@ constexpr int kSharedTileH = 16;
 constexpr int kSharedTileW = 16;
 constexpr int kSharedBlockSize = kSharedTileH * kSharedTileW;
 constexpr int kSharedChannelPairs = 4;
-constexpr int kSharedKernelSize = 11;
-constexpr int kSharedKernelElements =
-    kSharedKernelSize * kSharedKernelSize;
 constexpr int kSharedWeightStride = 128;
 constexpr int kSharedWeightElements =
     kSharedChannelPairs * kSharedWeightStride;
@@ -349,6 +346,7 @@ __device__ __forceinline__ int swizzle_shared_input_x(int input_x)
     return input_x ^ ((input_x >> 3) & 1);
 }
 
+template <int KernelSize>
 __global__ void
 conv2d_8x16x16_fp16_shared_input_kernel(
     const __half *inputs,
@@ -357,15 +355,16 @@ conv2d_8x16x16_fp16_shared_input_kernel(
     __half *outputs,
     Conv2DParam param)
 {
+    constexpr int kernel_elements = KernelSize * KernelSize;
     extern __shared__ __align__(16) __half2 shared[];
     __half2 *shared_weights = shared;
     __half2 *shared_bias = shared_weights + kSharedWeightElements;
     __half2 *shared_inputs = shared_bias + kSharedChannelPairs;
 
     int input_tile_h =
-        (kSharedTileH - 1) * param.Sh + kSharedKernelSize;
+        (kSharedTileH - 1) * param.Sh + KernelSize;
     int input_tile_w =
-        (kSharedTileW - 1) * param.Sw + kSharedKernelSize;
+        (kSharedTileW - 1) * param.Sw + KernelSize;
     int shared_input_stride = input_tile_w + 1;
     int input_tile_hw = input_tile_h * input_tile_w;
     int tiles_w = (param.out_w + kSharedTileW - 1) / kSharedTileW;
@@ -383,11 +382,11 @@ conv2d_8x16x16_fp16_shared_input_kernel(
         int tap = index / kSharedChannelPairs;
         int channel_pair = index % kSharedChannelPairs;
         __half2 value = __float2half2_rn(0.0f);
-        if (tap < kSharedKernelElements)
+        if (tap < kernel_elements)
         {
             value = packed_weights[
-                blockIdx.y * kSharedChannelPairs * kSharedKernelElements
-                + channel_pair * kSharedKernelElements + tap];
+                blockIdx.y * kSharedChannelPairs * kernel_elements
+                + channel_pair * kernel_elements + tap];
         }
         shared_weights[index] = value;
     }
@@ -464,19 +463,19 @@ conv2d_8x16x16_fp16_shared_input_kernel(
         shared_bias[3]
     };
     for (int kernel_h = 0;
-         kernel_h < kSharedKernelSize;
+         kernel_h < KernelSize;
          ++kernel_h)
     {
         int shared_input_h = local_output_h * param.Sh + kernel_h;
         for (int kernel_w = 0;
-             kernel_w < kSharedKernelSize;
+             kernel_w < KernelSize;
              ++kernel_w)
         {
             int shared_input_w = local_output_w * param.Sw + kernel_w;
             int shared_input_x = swizzle_shared_input_x(shared_input_w);
             int input_offset =
                 shared_input_h * shared_input_stride + shared_input_x;
-            int tap = kernel_h * kSharedKernelSize + kernel_w;
+            int tap = kernel_h * KernelSize + kernel_w;
             __half2 input_values[kSharedChannelPairs];
             __half2 weight_values[kSharedChannelPairs];
             uint32_t input_address = ptx::smem_u32addr(
@@ -539,12 +538,13 @@ static bool supports_shared_input(const Conv2DParam &param)
 {
     constexpr size_t maximum_shared_bytes = 48 * 1024;
     return param.out_ch % 8 == 0
-        && param.Kh == kSharedKernelSize
-        && param.Kw == kSharedKernelSize
+        && param.Kh == param.Kw
+        && (param.Kh == 9 || param.Kh == 11)
         && shared_input_bytes(param) <= maximum_shared_bytes;
 }
 
-static void launch_k11_shared_input(
+template <int KernelSize>
+static void launch_shared_input(
     const __half *inputs,
     const __half2 *packed_weights,
     const __half *bias,
@@ -556,7 +556,7 @@ static void launch_k11_shared_input(
     int tiles_w = (param.out_w + kSharedTileW - 1) / kSharedTileW;
     dim3 block(kSharedBlockSize);
     dim3 grid(tiles_h * tiles_w, param.out_ch / 8, n);
-    conv2d_8x16x16_fp16_shared_input_kernel
+    conv2d_8x16x16_fp16_shared_input_kernel<KernelSize>
         <<<grid, block, shared_input_bytes(param)>>>(
             inputs,
             packed_weights,
@@ -590,14 +590,25 @@ static void launch_baseline(
     }
     else if (param.Kh == 9 && param.Kw == 9)
     {
-        launch_pair<9>(
-            inputs, packed_weights, bias, outputs, param, n);
+        size_t pair_blocks = static_cast<size_t>(
+            (param.outHW + 255) / 256)
+            * (param.out_ch / 2) * n;
+        if (pair_blocks >= 140 && supports_shared_input(param))
+        {
+            launch_shared_input<9>(
+                inputs, packed_weights, bias, outputs, param, n);
+        }
+        else
+        {
+            launch_pair<9>(
+                inputs, packed_weights, bias, outputs, param, n);
+        }
     }
     else if (param.Kh == 11 && param.Kw == 11)
     {
         if (supports_shared_input(param))
         {
-            launch_k11_shared_input(
+            launch_shared_input<11>(
                 inputs, packed_weights, bias, outputs, param, n);
         }
         else
@@ -1250,6 +1261,12 @@ int main(int argc, char *argv[])
         {"k5_throughput", 5, 64, 128, 80, 80, 2, 4},
         {"boundary", 3, 1, 32, 43, 43, 2, 1024},
         {"k9", 9, 1, 32, 80, 80, 2, 256},
+        {"k9_blocks128", 9, 1, 32, 89, 89, 2, 128},
+        {"k9_blocks140", 9, 1, 40, 80, 80, 2, 128},
+        {"k9_blocks168", 9, 1, 48, 80, 80, 2, 128},
+        {"k9_blocks224", 9, 1, 64, 80, 80, 2, 128},
+        {"k9_blocks448", 9, 1, 128, 80, 80, 2, 128},
+        {"k9_main", 9, 4, 128, 80, 80, 2, 64},
         {"k9_throughput", 9, 64, 128, 80, 80, 2, 16},
         {"k11_throughput", 11, 64, 128, 80, 80, 2, 16},
         {"k11_tail", 11, 1, 32, 43, 43, 2, 256},
