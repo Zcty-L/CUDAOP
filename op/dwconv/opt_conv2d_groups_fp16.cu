@@ -13,9 +13,20 @@
 #include <cudnn.h>
 
 #include "config.h"
+#include "ptx_utils.cuh"
 
 constexpr int kKernelCapacity = 128;
 constexpr const char *kTargetName = "opt_conv2d_groups_fp16";
+constexpr int kSharedTileH = 16;
+constexpr int kSharedTileW = 16;
+constexpr int kSharedBlockSize = kSharedTileH * kSharedTileW;
+constexpr int kSharedChannelPairs = 4;
+constexpr int kSharedKernelSize = 11;
+constexpr int kSharedKernelElements =
+    kSharedKernelSize * kSharedKernelSize;
+constexpr int kSharedWeightStride = 128;
+constexpr int kSharedWeightElements =
+    kSharedChannelPairs * kSharedWeightStride;
 
 struct CaseConfig
 {
@@ -332,6 +343,227 @@ static void launch_k7_pair(
         param);
 }
 
+__device__ __forceinline__ int swizzle_shared_input_x(int input_x)
+{
+    return input_x ^ ((input_x >> 3) & 1);
+}
+
+__global__ void
+conv2d_8x16x16_fp16_shared_input_kernel(
+    const __half *inputs,
+    const __half2 *packed_weights,
+    const __half *bias,
+    __half *outputs,
+    Conv2DParam param)
+{
+    extern __shared__ __align__(16) __half2 shared[];
+    __half2 *shared_weights = shared;
+    __half2 *shared_bias = shared_weights + kSharedWeightElements;
+    __half2 *shared_inputs = shared_bias + kSharedChannelPairs;
+
+    int input_tile_h =
+        (kSharedTileH - 1) * param.Sh + kSharedKernelSize;
+    int input_tile_w =
+        (kSharedTileW - 1) * param.Sw + kSharedKernelSize;
+    int shared_input_stride = input_tile_w + 1;
+    int input_tile_hw = input_tile_h * input_tile_w;
+    int tiles_w = (param.out_w + kSharedTileW - 1) / kSharedTileW;
+    int tile_h = blockIdx.x / tiles_w;
+    int tile_w = blockIdx.x % tiles_w;
+    int output_h_origin = tile_h * kSharedTileH;
+    int output_w_origin = tile_w * kSharedTileW;
+    int input_h_origin = output_h_origin * param.Sh - param.Ph;
+    int input_w_origin = output_w_origin * param.Sw - param.Pw;
+
+    for (int index = threadIdx.x;
+         index < kSharedWeightElements;
+         index += blockDim.x)
+    {
+        int tap = index / kSharedChannelPairs;
+        int channel_pair = index % kSharedChannelPairs;
+        __half2 value = __float2half2_rn(0.0f);
+        if (tap < kSharedKernelElements)
+        {
+            value = packed_weights[
+                blockIdx.y * kSharedChannelPairs * kSharedKernelElements
+                + channel_pair * kSharedKernelElements + tap];
+        }
+        shared_weights[index] = value;
+    }
+
+    if (threadIdx.x < kSharedChannelPairs)
+    {
+        int channel = blockIdx.y * 8 + threadIdx.x * 2;
+        shared_bias[threadIdx.x] = __halves2half2(
+            bias[channel],
+            bias[channel + 1]);
+    }
+
+    const __half *input_group = inputs
+        + blockIdx.z * param.inBatchNumel
+        + blockIdx.y * 8 * param.inHW;
+    for (int spatial = threadIdx.x;
+         spatial < input_tile_hw;
+         spatial += blockDim.x)
+    {
+        int tile_input_h = spatial / input_tile_w;
+        int tile_input_w = spatial % input_tile_w;
+        int input_h = input_h_origin + tile_input_h;
+        int input_w = input_w_origin + tile_input_w;
+        bool valid = input_h >= 0 && input_w >= 0
+            && input_h < param.in_h && input_w < param.in_w;
+        int input_offset = input_h * param.in_w + input_w;
+        __half2 input_values[kSharedChannelPairs];
+#pragma unroll
+        for (int channel_pair = 0;
+             channel_pair < kSharedChannelPairs;
+             ++channel_pair)
+        {
+            if (valid)
+            {
+                const __half *pair_input = input_group
+                    + channel_pair * 2 * param.inHW + input_offset;
+                input_values[channel_pair] = __halves2half2(
+                    pair_input[0],
+                    pair_input[param.inHW]);
+            }
+            else
+            {
+                input_values[channel_pair] = __float2half2_rn(0.0f);
+            }
+        }
+        int shared_input_x = swizzle_shared_input_x(tile_input_w);
+        int shared_input_offset =
+            tile_input_h * shared_input_stride + shared_input_x;
+        uint32_t shared_input_address = ptx::smem_u32addr(
+            shared_inputs
+            + shared_input_offset * kSharedChannelPairs);
+        ptx::sts128(
+            input_values[0],
+            input_values[1],
+            input_values[2],
+            input_values[3],
+            shared_input_address);
+    }
+    __syncthreads();
+
+    int local_output_h = threadIdx.x / kSharedTileW;
+    int local_output_w = threadIdx.x % kSharedTileW;
+    int output_h = output_h_origin + local_output_h;
+    int output_w = output_w_origin + local_output_w;
+    if (output_h >= param.out_h || output_w >= param.out_w)
+    {
+        return;
+    }
+
+    __half2 accumulators[kSharedChannelPairs] = {
+        shared_bias[0],
+        shared_bias[1],
+        shared_bias[2],
+        shared_bias[3]
+    };
+    for (int kernel_h = 0;
+         kernel_h < kSharedKernelSize;
+         ++kernel_h)
+    {
+        int shared_input_h = local_output_h * param.Sh + kernel_h;
+        for (int kernel_w = 0;
+             kernel_w < kSharedKernelSize;
+             ++kernel_w)
+        {
+            int shared_input_w = local_output_w * param.Sw + kernel_w;
+            int shared_input_x = swizzle_shared_input_x(shared_input_w);
+            int input_offset =
+                shared_input_h * shared_input_stride + shared_input_x;
+            int tap = kernel_h * kSharedKernelSize + kernel_w;
+            __half2 input_values[kSharedChannelPairs];
+            __half2 weight_values[kSharedChannelPairs];
+            uint32_t input_address = ptx::smem_u32addr(
+                shared_inputs + input_offset * kSharedChannelPairs);
+            uint32_t weight_address = ptx::smem_u32addr(
+                shared_weights + tap * kSharedChannelPairs);
+            ptx::lds128(
+                input_values[0],
+                input_values[1],
+                input_values[2],
+                input_values[3],
+                input_address);
+            ptx::lds128(
+                weight_values[0],
+                weight_values[1],
+                weight_values[2],
+                weight_values[3],
+                weight_address);
+#pragma unroll
+            for (int channel_pair = 0;
+                 channel_pair < kSharedChannelPairs;
+                 ++channel_pair)
+            {
+                accumulators[channel_pair] = __hfma2(
+                    weight_values[channel_pair],
+                    input_values[channel_pair],
+                    accumulators[channel_pair]);
+            }
+        }
+    }
+
+    int output_position = output_h * param.out_w + output_w;
+    int output_base = blockIdx.z * param.outBatchNumel
+        + blockIdx.y * 8 * param.outHW + output_position;
+#pragma unroll
+    for (int channel_pair = 0;
+         channel_pair < kSharedChannelPairs;
+         ++channel_pair)
+    {
+        outputs[output_base + channel_pair * 2 * param.outHW] =
+            accumulators[channel_pair].x;
+        outputs[output_base
+                + (channel_pair * 2 + 1) * param.outHW] =
+            accumulators[channel_pair].y;
+    }
+}
+
+static size_t shared_input_bytes(const Conv2DParam &param)
+{
+    int input_tile_h = (kSharedTileH - 1) * param.Sh + param.Kh;
+    int input_tile_w = (kSharedTileW - 1) * param.Sw + param.Kw;
+    int shared_input_stride = input_tile_w + 1;
+    size_t input_elements = static_cast<size_t>(kSharedChannelPairs)
+        * input_tile_h * shared_input_stride;
+    return (kSharedWeightElements + kSharedChannelPairs + input_elements)
+        * sizeof(__half2);
+}
+
+static bool supports_shared_input(const Conv2DParam &param)
+{
+    constexpr size_t maximum_shared_bytes = 48 * 1024;
+    return param.out_ch % 8 == 0
+        && param.Kh == kSharedKernelSize
+        && param.Kw == kSharedKernelSize
+        && shared_input_bytes(param) <= maximum_shared_bytes;
+}
+
+static void launch_k11_shared_input(
+    const __half *inputs,
+    const __half2 *packed_weights,
+    const __half *bias,
+    __half *outputs,
+    const Conv2DParam &param,
+    int n)
+{
+    int tiles_h = (param.out_h + kSharedTileH - 1) / kSharedTileH;
+    int tiles_w = (param.out_w + kSharedTileW - 1) / kSharedTileW;
+    dim3 block(kSharedBlockSize);
+    dim3 grid(tiles_h * tiles_w, param.out_ch / 8, n);
+    conv2d_8x16x16_fp16_shared_input_kernel
+        <<<grid, block, shared_input_bytes(param)>>>(
+            inputs,
+            packed_weights,
+            bias,
+            outputs,
+            param);
+}
+
 static void launch_baseline(
     const __half *inputs,
     const __half2 *packed_weights,
@@ -357,8 +589,16 @@ static void launch_baseline(
     }
     else if (param.Kh == 11 && param.Kw == 11)
     {
-        launch_specialized<11>(
-            inputs, packed_weights, bias, outputs, param, n);
+        if (supports_shared_input(param))
+        {
+            launch_k11_shared_input(
+                inputs, packed_weights, bias, outputs, param, n);
+        }
+        else
+        {
+            launch_specialized<11>(
+                inputs, packed_weights, bias, outputs, param, n);
+        }
     }
     else
     {
@@ -1004,6 +1244,9 @@ int main(int argc, char *argv[])
         {"k9", 9, 1, 32, 80, 80, 2, 256},
         {"k11_throughput", 11, 64, 128, 80, 80, 2, 16},
         {"k11_tail", 11, 1, 32, 43, 43, 2, 256},
+        {"k11_rectangular", 11, 1, 32, 65, 81, 2, 256},
+        {"k11_stride1", 11, 1, 32, 43, 43, 1, 256},
+        {"k11_fallback_stride3", 11, 1, 32, 43, 43, 3, 256},
         {"rectangular", 7, 1, 32, 65, 81, 2, 512},
         {"stride1", 3, 1, 32, 43, 43, 1, 512},
         {"min_channels", 7, 1, 8, 43, 43, 2, 1024},
