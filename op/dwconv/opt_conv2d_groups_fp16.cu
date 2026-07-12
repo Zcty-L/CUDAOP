@@ -223,6 +223,115 @@ static void launch_specialized(
         param);
 }
 
+__global__ void
+conv2d_1x128x256_fp16_groups_k7_kernel(
+    const __half *inputs,
+    const __half2 *packed_weights,
+    const __half *bias,
+    __half *outputs,
+    Conv2DParam param)
+{
+    constexpr int kernel_size = 7;
+    constexpr int kernel_elements = kernel_size * kernel_size;
+    constexpr int shared_capacity = 52;
+    __shared__ __half2 shared_weights[shared_capacity];
+    __shared__ __half2 shared_bias;
+
+    int tid = threadIdx.x;
+    if (tid < shared_capacity)
+    {
+        shared_weights[tid] = tid < kernel_elements
+            ? packed_weights[blockIdx.y * kernel_elements + tid]
+            : __float2half2_rn(0.0f);
+    }
+    if (tid == 0)
+    {
+        int channel = blockIdx.y * 2;
+        shared_bias = __halves2half2(
+            bias[channel],
+            bias[channel + 1]);
+    }
+    __syncthreads();
+
+    int out_pos = blockIdx.x * blockDim.x + tid;
+    int posh_origin = (out_pos / static_cast<int>(param.out_w))
+        * static_cast<int>(param.Sh) - static_cast<int>(param.Ph);
+    int posw_origin = (out_pos % static_cast<int>(param.out_w))
+        * static_cast<int>(param.Sw) - static_cast<int>(param.Pw);
+    const __half *input_pair = inputs
+        + blockIdx.z * param.inBatchNumel
+        + blockIdx.y * 2 * param.inHW;
+    __half2 output_value = shared_bias;
+
+    for (int tap_base = 0;
+         tap_base < kernel_elements;
+         tap_base += 4)
+    {
+        __half2 input_values[4];
+#pragma unroll
+        for (int index = 0; index < 4; ++index)
+        {
+            int tap = tap_base + index;
+            int input_h = posh_origin + tap / kernel_size;
+            int input_w = posw_origin + tap % kernel_size;
+            bool valid = tap < kernel_elements
+                && input_h >= 0
+                && input_h < static_cast<int>(param.in_h)
+                && input_w >= 0
+                && input_w < static_cast<int>(param.in_w);
+            if (valid)
+            {
+                int input_offset = input_h * param.in_w + input_w;
+                input_values[index] = __halves2half2(
+                    input_pair[input_offset],
+                    input_pair[input_offset + param.inHW]);
+            }
+            else
+            {
+                input_values[index] = __float2half2_rn(0.0f);
+            }
+        }
+
+#pragma unroll
+        for (int index = 0; index < 4; ++index)
+        {
+            output_value = __hfma2(
+                shared_weights[tap_base + index],
+                input_values[index],
+                output_value);
+        }
+    }
+
+    if (out_pos < static_cast<int>(param.outHW))
+    {
+        int output_offset = blockIdx.z * param.outBatchNumel
+            + blockIdx.y * 2 * param.outHW + out_pos;
+        outputs[output_offset] = output_value.x;
+        outputs[output_offset + param.outHW] = output_value.y;
+    }
+}
+
+static void launch_k7_pair(
+    const __half *inputs,
+    const __half2 *packed_weights,
+    const __half *bias,
+    __half *outputs,
+    const Conv2DParam &param,
+    int n)
+{
+    dim3 block(256);
+    dim3 grid(
+        (param.outHW + block.x - 1) / block.x,
+        param.out_ch / 2,
+        n);
+    conv2d_1x128x256_fp16_groups_k7_kernel<<<grid, block>>>(
+        inputs,
+        packed_weights,
+        bias,
+        outputs,
+        param);
+}
+
 static void launch_baseline(
     const __half *inputs,
     const __half2 *packed_weights,
@@ -243,7 +352,7 @@ static void launch_baseline(
     }
     else if (param.Kh == 7 && param.Kw == 7)
     {
-        launch_specialized<7>(
+        launch_k7_pair(
             inputs, packed_weights, bias, outputs, param, n);
     }
     else if (param.Kh == 11 && param.Kw == 11)
@@ -898,7 +1007,9 @@ int main(int argc, char *argv[])
         {"rectangular", 7, 1, 32, 65, 81, 2, 512},
         {"stride1", 3, 1, 32, 43, 43, 1, 512},
         {"min_channels", 7, 1, 8, 43, 43, 2, 1024},
-        {"non_power_channels", 7, 1, 40, 43, 43, 2, 512}
+        {"non_power_channels", 7, 1, 40, 43, 43, 2, 512},
+        {"k7_blocks96", 7, 1, 32, 153, 153, 2, 256},
+        {"k7_blocks104", 7, 1, 32, 161, 161, 2, 256}
     };
 
     const char *selected_case = nullptr;
