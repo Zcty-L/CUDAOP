@@ -11,7 +11,7 @@ cd /home/if/Codes/CUDAOP/op/lora_moe
 python build.py
 ```
 
-默认针对 `sm_120` 编译。可通过参数指定其他 GPU 架构：
+默认查询当前 GPU 并针对其原生 SM 编译。也可通过参数显式指定目标架构：
 
 ```bash
 python build.py --arch-list 8.0

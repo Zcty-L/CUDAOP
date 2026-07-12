@@ -6,8 +6,27 @@ import subprocess
 import sys
 from pathlib import Path
 
+import torch
+
 
 ROOT = Path(__file__).resolve().parent
+
+
+def resolve_arch_list(requested: str | None) -> str:
+    if requested:
+        return requested
+
+    configured = os.environ.get("TORCH_CUDA_ARCH_LIST")
+    if configured:
+        return configured
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "未检测到 CUDA GPU；请使用 --arch-list 显式指定目标架构"
+        )
+
+    major, minor = torch.cuda.get_device_capability()
+    return f"{major}.{minor}"
 
 
 def main() -> None:
@@ -15,16 +34,12 @@ def main() -> None:
     parser.add_argument(
         "--arch-list",
         default=None,
-        help="TORCH_CUDA_ARCH_LIST，默认使用 12.0",
+        help="TORCH_CUDA_ARCH_LIST，默认查询当前 GPU",
     )
     args = parser.parse_args()
 
     env = os.environ.copy()
-    env["TORCH_CUDA_ARCH_LIST"] = (
-        args.arch_list
-        or env.get("TORCH_CUDA_ARCH_LIST")
-        or "12.0"
-    )
+    env["TORCH_CUDA_ARCH_LIST"] = resolve_arch_list(args.arch_list)
     subprocess.run(
         [
             sys.executable,

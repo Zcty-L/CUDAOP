@@ -14,6 +14,30 @@ __device__ __forceinline__ uint32_t smem_u32addr(const void *ptr)
 }
 
 // =============================================================================
+// Global Memory Prefetch
+// =============================================================================
+//
+// Instruction: prefetch.global.L1
+// Source: NVIDIA PTX ISA, data movement and conversion instructions
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html
+// Purpose: issue a cache prefetch for a global memory address without allocating
+// a destination register.
+
+__device__ __forceinline__ void prefetch_global_l1(
+    const void *ptr,
+    bool guard)
+{
+    asm volatile (
+        "{.reg .pred p;\n"
+        " setp.ne.b32 p, %1, 0;\n"
+        " @p prefetch.global.L1 [%0];\n"
+        "}"
+        :
+        : "l"(ptr), "r"((int)guard)
+    );
+}
+
+// =============================================================================
 // Standard Non-Coherent Loads (ldg_nc)
 // =============================================================================
 

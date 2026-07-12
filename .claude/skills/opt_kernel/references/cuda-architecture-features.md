@@ -58,7 +58,7 @@ Toolkit 支持某个 PTX ISA 不等于目标 GPU 支持其中全部指令。
 
 ## 使用步骤
 
-1. 按用户参数、`CMAKE_CUDA_ARCHITECTURES`、GPU 计算能力的优先级确定唯一目标。
+1. 用户显式指定 target 时使用指定值；否则查询实际测试 GPU 的计算能力并使用原生 target，不为兼容性降低 SM，也不沿用仓库默认值或旧 CMake cache。
 2. 使用 `nvcc --version` 确认 Toolkit，再由 PTX 发布表确认可用 PTX ISA。
 3. 先按本表排除不兼容机制，再读取具体指令的 Target ISA Notes、对齐、同步和内存一致性要求。
 4. 优先使用 CUDA C++、libcu++ 或库级接口。必须使用 PTX 时，仅在 `op/ptx_utils.cuh` 添加，并注明指令、官方来源和用途。
