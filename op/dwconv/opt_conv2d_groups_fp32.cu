@@ -113,19 +113,73 @@ conv2d_4x128x256_groups_kernel(
                 && curH >= 0 && curW >= 0
                 && curW < param.in_w && curH < param.in_h;
 
-            if (guard)
+            if constexpr (KernelSize == 3)
             {
-                input_frag[0][i] = input_ptr[in_offset];
-                input_frag[1][i] = input_ptr[in_offset + param.inHW];
-                input_frag[2][i] = input_ptr[in_offset + param.inHW * 2];
-                input_frag[3][i] = input_ptr[in_offset + param.inHW * 3];
+                if (guard)
+                {
+                    ptx::ldg32_nc_0(
+                        input_frag[0][i],
+                        input_ptr + in_offset,
+                        true);
+                    ptx::ldg32_nc_0(
+                        input_frag[1][i],
+                        input_ptr + in_offset + param.inHW,
+                        true);
+                    ptx::ldg32_nc_0(
+                        input_frag[2][i],
+                        input_ptr + in_offset + param.inHW * 2,
+                        true);
+                    ptx::ldg32_nc_0(
+                        input_frag[3][i],
+                        input_ptr + in_offset + param.inHW * 3,
+                        true);
+                }
+                else
+                {
+                    input_frag[0][i] = 0.0f;
+                    input_frag[1][i] = 0.0f;
+                    input_frag[2][i] = 0.0f;
+                    input_frag[3][i] = 0.0f;
+                }
+            }
+            else if constexpr (specialized_kernel)
+            {
+                ptx::ldg32_nc_0(
+                    input_frag[0][i],
+                    input_ptr + in_offset,
+                    guard);
+                ptx::ldg32_nc_0(
+                    input_frag[1][i],
+                    input_ptr + in_offset + param.inHW,
+                    guard);
+                ptx::ldg32_nc_0(
+                    input_frag[2][i],
+                    input_ptr + in_offset + param.inHW * 2,
+                    guard);
+                ptx::ldg32_nc_0(
+                    input_frag[3][i],
+                    input_ptr + in_offset + param.inHW * 3,
+                    guard);
             }
             else
             {
-                input_frag[0][i] = 0.0f;
-                input_frag[1][i] = 0.0f;
-                input_frag[2][i] = 0.0f;
-                input_frag[3][i] = 0.0f;
+                if (guard)
+                {
+                    input_frag[0][i] = input_ptr[in_offset];
+                    input_frag[1][i] = input_ptr[
+                        in_offset + param.inHW];
+                    input_frag[2][i] = input_ptr[
+                        in_offset + param.inHW * 2];
+                    input_frag[3][i] = input_ptr[
+                        in_offset + param.inHW * 3];
+                }
+                else
+                {
+                    input_frag[0][i] = 0.0f;
+                    input_frag[1][i] = 0.0f;
+                    input_frag[2][i] = 0.0f;
+                    input_frag[3][i] = 0.0f;
+                }
             }
         }
 
