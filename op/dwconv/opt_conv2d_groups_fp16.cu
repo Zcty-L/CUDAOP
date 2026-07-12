@@ -234,17 +234,17 @@ static void launch_specialized(
         param);
 }
 
+template <int KernelSize>
 __global__ void
-conv2d_1x128x256_fp16_groups_k7_kernel(
+conv2d_1x128x256_fp16_groups_kernel(
     const __half *inputs,
     const __half2 *packed_weights,
     const __half *bias,
     __half *outputs,
     Conv2DParam param)
 {
-    constexpr int kernel_size = 7;
-    constexpr int kernel_elements = kernel_size * kernel_size;
-    constexpr int shared_capacity = 52;
+    constexpr int kernel_elements = KernelSize * KernelSize;
+    constexpr int shared_capacity = (kernel_elements + 3) / 4 * 4;
     __shared__ __half2 shared_weights[shared_capacity];
     __shared__ __half2 shared_bias;
 
@@ -283,8 +283,8 @@ conv2d_1x128x256_fp16_groups_k7_kernel(
         for (int index = 0; index < 4; ++index)
         {
             int tap = tap_base + index;
-            int input_h = posh_origin + tap / kernel_size;
-            int input_w = posw_origin + tap % kernel_size;
+            int input_h = posh_origin + tap / KernelSize;
+            int input_w = posw_origin + tap % KernelSize;
             bool valid = tap < kernel_elements
                 && input_h >= 0
                 && input_h < static_cast<int>(param.in_h)
@@ -322,7 +322,8 @@ conv2d_1x128x256_fp16_groups_k7_kernel(
     }
 }
 
-static void launch_k7_pair(
+template <int KernelSize>
+static void launch_pair(
     const __half *inputs,
     const __half2 *packed_weights,
     const __half *bias,
@@ -335,7 +336,7 @@ static void launch_k7_pair(
         (param.outHW + block.x - 1) / block.x,
         param.out_ch / 2,
         n);
-    conv2d_1x128x256_fp16_groups_k7_kernel<<<grid, block>>>(
+    conv2d_1x128x256_fp16_groups_kernel<KernelSize><<<grid, block>>>(
         inputs,
         packed_weights,
         bias,
@@ -574,17 +575,17 @@ static void launch_baseline(
 {
     if (param.Kh == 3 && param.Kw == 3)
     {
-        launch_specialized<3>(
+        launch_pair<3>(
             inputs, packed_weights, bias, outputs, param, n);
     }
     else if (param.Kh == 5 && param.Kw == 5)
     {
-        launch_specialized<5>(
+        launch_pair<5>(
             inputs, packed_weights, bias, outputs, param, n);
     }
     else if (param.Kh == 7 && param.Kw == 7)
     {
-        launch_k7_pair(
+        launch_pair<7>(
             inputs, packed_weights, bias, outputs, param, n);
     }
     else if (param.Kh == 11 && param.Kw == 11)
