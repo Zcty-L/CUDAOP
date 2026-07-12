@@ -71,11 +71,16 @@ conv2d_4x128x256_fp16_groups_kernel(
 {
     constexpr bool specialized = KernelSize > 0;
     constexpr int specialized_elements = KernelSize * KernelSize;
+    constexpr int specialized_capacity =
+        (specialized_elements + 3) / 4 * 4;
+    constexpr int shared_capacity = specialized
+        ? specialized_capacity
+        : kKernelCapacity;
     int kernel_width = specialized ? KernelSize : param.Kw;
     int kernel_elements = specialized
         ? specialized_elements
         : param.KhKw;
-    __shared__ __half2 smem_weights[4 * kKernelCapacity];
+    __shared__ __half2 smem_weights[4 * shared_capacity];
     __shared__ __half2 smem_bias[4];
 
     int tid = threadIdx.x;
@@ -86,11 +91,11 @@ conv2d_4x128x256_fp16_groups_kernel(
         * static_cast<int>(param.Sw) - static_cast<int>(param.Pw);
 
     for (int index = tid;
-         index < 4 * kKernelCapacity;
+         index < 4 * shared_capacity;
          index += blockDim.x)
     {
-        int channel_pair = index / kKernelCapacity;
-        int kernel_pos = index % kKernelCapacity;
+        int channel_pair = index / shared_capacity;
+        int kernel_pos = index % shared_capacity;
         __half2 value = __float2half2_rn(0.0f);
         if (kernel_pos < kernel_elements)
         {
@@ -172,7 +177,7 @@ conv2d_4x128x256_fp16_groups_kernel(
             for (int i = 0; i < 4; ++i)
             {
                 __half2 weight =
-                    smem_weights[channel_pair * kKernelCapacity + k + i];
+                    smem_weights[channel_pair * shared_capacity + k + i];
                 output_frag[channel_pair] = __hfma2(
                     weight,
                     input_frag[channel_pair][i],
