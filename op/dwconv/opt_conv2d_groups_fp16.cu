@@ -1,6 +1,8 @@
+#include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -14,6 +16,27 @@
 
 constexpr int kKernelCapacity = 128;
 constexpr const char *kTargetName = "opt_conv2d_groups_fp16";
+
+struct CaseConfig
+{
+    const char *name;
+    int r;
+    int n;
+    int c;
+    int h;
+    int w;
+    int stride;
+    int launches_per_sample;
+};
+
+struct Stats
+{
+    float mean;
+    float median;
+    float minimum;
+    float maximum;
+    float stddev;
+};
 
 #define CUDA_CHECK(call)                                                   \
 {                                                                          \
@@ -166,33 +189,6 @@ conv2d_4x128x256_fp16_groups_kernel(
     }
 }
 
-__global__ void compare_fp16_outputs(
-    const __half *actual,
-    const __half *expected,
-    int numel,
-    float tolerance,
-    unsigned int *mismatch_count)
-{
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index < numel)
-    {
-        float actual_value = __half2float(actual[index]);
-        float expected_value = __half2float(expected[index]);
-        if (fabsf(actual_value - expected_value) > tolerance)
-        {
-            atomicAdd(mismatch_count, 1U);
-        }
-    }
-}
-
-using KernelLaunch = void (*)(
-    const __half *,
-    const __half2 *,
-    const __half *,
-    __half *,
-    const Conv2DParam &,
-    int);
-
 static void launch_baseline(
     const __half *inputs,
     const __half2 *packed_weights,
@@ -214,41 +210,47 @@ static void launch_baseline(
         param);
 }
 
-static float benchmark_kernel(
-    KernelLaunch launch,
-    const __half *inputs,
-    const __half2 *packed_weights,
-    const __half *bias,
-    __half *outputs,
-    const Conv2DParam &param,
-    int n,
-    int warmup,
-    int iters)
+static Stats calculate_stats(std::vector<float> values)
 {
-    for (int i = 0; i < warmup; ++i)
+    std::sort(values.begin(), values.end());
+    double sum = 0.0;
+    for (float value : values)
     {
-        launch(inputs, packed_weights, bias, outputs, param, n);
+        sum += value;
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
 
-    cudaEvent_t start;
-    cudaEvent_t stop;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-    CUDA_CHECK(cudaEventRecord(start));
-    for (int i = 0; i < iters; ++i)
+    double mean = sum / values.size();
+    double variance = 0.0;
+    for (float value : values)
     {
-        launch(inputs, packed_weights, bias, outputs, param, n);
+        double delta = value - mean;
+        variance += delta * delta;
     }
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
+    variance /= values.size();
 
-    float elapsed_ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
-    CUDA_CHECK(cudaGetLastError());
-    return elapsed_ms / iters;
+    return {
+        static_cast<float>(mean),
+        values[values.size() / 2],
+        values.front(),
+        values.back(),
+        static_cast<float>(std::sqrt(variance))
+    };
+}
+
+static void print_stats(
+    const char *implementation,
+    int group,
+    const Stats &stats)
+{
+    std::cout << "  " << std::left << std::setw(16) << implementation
+              << " group=" << group
+              << " mean=" << std::fixed << std::setprecision(6)
+              << stats.mean
+              << " median=" << stats.median
+              << " min=" << stats.minimum
+              << " max=" << stats.maximum
+              << " stddev=" << stats.stddev
+              << " ms" << std::endl;
 }
 
 static float benchmark_cudnn(
@@ -319,6 +321,74 @@ static float benchmark_cudnn(
     return elapsed_ms / iters;
 }
 
+template <typename Launch>
+static void preheat(Launch launch, int duration_ms)
+{
+    auto start = std::chrono::steady_clock::now();
+    auto duration = std::chrono::milliseconds(duration_ms);
+    do
+    {
+        for (int launch_index = 0; launch_index < 100; ++launch_index)
+        {
+            launch();
+        }
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+    } while (std::chrono::steady_clock::now() - start < duration);
+}
+
+template <typename Launch>
+static Stats measure_launch_stats(
+    Launch launch,
+    int warmup,
+    int iterations,
+    int launches_per_sample)
+{
+    auto warmup_start = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < warmup; ++iteration)
+    {
+        for (int launch_index = 0;
+             launch_index < launches_per_sample;
+             ++launch_index)
+        {
+            launch();
+        }
+    }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    auto warmup_end = std::chrono::steady_clock::now();
+    double warmup_ms = std::chrono::duration<double, std::milli>(
+        warmup_end - warmup_start).count();
+    std::cout << "  warmup_elapsed_ms=" << std::fixed
+              << std::setprecision(3) << warmup_ms << std::endl;
+
+    cudaEvent_t start;
+    cudaEvent_t stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    std::vector<float> samples;
+    samples.reserve(iterations);
+    for (int iteration = 0; iteration < iterations; ++iteration)
+    {
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int launch_index = 0;
+             launch_index < launches_per_sample;
+             ++launch_index)
+        {
+            launch();
+        }
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float elapsed_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+        samples.push_back(elapsed_ms / launches_per_sample);
+    }
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    return calculate_stats(samples);
+}
+
 static Conv2DParam make_param(
     int c,
     int h,
@@ -352,33 +422,6 @@ static Conv2DParam make_param(
     return param;
 }
 
-static void fill_input_nhwc(
-    const __half *input_nchw,
-    __half *input_nhwc,
-    int n,
-    int c,
-    int h,
-    int w)
-{
-    for (int ni = 0; ni < n; ++ni)
-    {
-        for (int hi = 0; hi < h; ++hi)
-        {
-            for (int wi = 0; wi < w; ++wi)
-            {
-                for (int ci = 0; ci < c; ++ci)
-                {
-                    int nchw_index = ni * c * h * w
-                        + ci * h * w + hi * w + wi;
-                    int nhwc_index = ni * h * w * c
-                        + hi * w * c + wi * c + ci;
-                    input_nhwc[nhwc_index] = input_nchw[nchw_index];
-                }
-            }
-        }
-    }
-}
-
 static void pack_weights(
     const __half *weights,
     __half2 *packed_weights,
@@ -398,82 +441,83 @@ static void pack_weights(
     }
 }
 
-static void write_result(
-    std::ofstream &csv,
-    int r,
-    int n,
-    int c,
-    int h,
-    const std::string &kernel,
-    float time_ms,
-    double flops,
-    double arithmetic_intensity)
-{
-    double gflops = flops / (time_ms / 1000.0);
-    csv << r << "," << n << "," << c << "," << h << ","
-        << kernel << "," << time_ms << "," << gflops << ","
-        << arithmetic_intensity << std::endl;
-
-    std::cout << std::left << std::setw(6) << r << " |"
-              << std::setw(4) << n << " |"
-              << std::setw(4) << c << " |"
-              << std::setw(4) << h << " |"
-              << std::setw(12) << kernel << " |"
-              << std::fixed << std::setprecision(6)
-              << std::setw(12) << time_ms << " |"
-              << std::setw(12) << gflops << " |"
-              << std::setw(12) << arithmetic_intensity << std::endl;
-}
-
-static void verify_output(
+static bool verify_output(
     const std::string &implementation,
     const __half *actual_output,
     const __half *cudnn_output,
-    int out_numel)
+    int out_numel,
+    float atol,
+    float rtol)
 {
-    unsigned int *mismatch_count_d = nullptr;
-    CUDA_CHECK(cudaMalloc(&mismatch_count_d, sizeof(unsigned int)));
-    CUDA_CHECK(cudaMemset(mismatch_count_d, 0, sizeof(unsigned int)));
-    compare_fp16_outputs<<<(out_numel + 255) / 256, 256>>>(
-        actual_output,
-        cudnn_output,
-        out_numel,
-        0.1f,
-        mismatch_count_d);
-
-    unsigned int mismatch_count = 0;
+    std::vector<__half> actual(out_numel);
+    std::vector<__half> expected(out_numel);
     CUDA_CHECK(cudaMemcpy(
-        &mismatch_count,
-        mismatch_count_d,
-        sizeof(unsigned int),
+        actual.data(),
+        actual_output,
+        out_numel * sizeof(__half),
         cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(mismatch_count_d));
+    CUDA_CHECK(cudaMemcpy(
+        expected.data(),
+        cudnn_output,
+        out_numel * sizeof(__half),
+        cudaMemcpyDeviceToHost));
+
+    float max_abs_error = 0.0f;
+    float max_rel_error = 0.0f;
+    size_t error_count = 0;
+    for (int index = 0; index < out_numel; ++index)
+    {
+        float actual_value = __half2float(actual[index]);
+        float expected_value = __half2float(expected[index]);
+        float abs_error = std::abs(actual_value - expected_value);
+        float denominator = std::max(std::abs(expected_value), 1.0e-6f);
+        float rel_error = abs_error / denominator;
+        max_abs_error = std::max(max_abs_error, abs_error);
+        max_rel_error = std::max(max_rel_error, rel_error);
+        if (abs_error > atol && rel_error > rtol)
+        {
+            ++error_count;
+        }
+    }
 
     std::cout << "[VERIFY] " << implementation
-              << " vs cuDNN NCHW: mismatch="
-              << mismatch_count << "/" << out_numel
-              << " tolerance=0.1" << std::endl;
-    if (mismatch_count != 0)
-    {
-        std::cout << "[ERROR] FP16 correctness check failed" << std::endl;
-        std::exit(1);
-    }
+              << " vs cuDNN NCHW"
+              << " max_abs_error=" << std::scientific << max_abs_error
+              << " max_rel_error=" << max_rel_error
+              << " errors=" << error_count << "/" << out_numel
+              << " atol=" << atol
+              << " rtol=" << rtol
+              << std::defaultfloat << std::endl;
+    return error_count == 0;
 }
 
-static void run_case(
+static bool run_case(
     cudnnHandle_t cudnn,
     cudnnConvolutionFwdAlgo_t algo,
-    std::ofstream &csv,
-    int r,
-    int n,
-    int c,
-    int h,
-    int warmup,
-    int iters)
+    const CaseConfig &config,
+    bool benchmark)
 {
-    int w = h;
-    int stride = 2;
+    constexpr int warmup = 20;
+    constexpr int iterations = 100;
+    constexpr int groups = 3;
+    constexpr float atol = 1.0e-2f;
+    constexpr float rtol = 1.0e-2f;
+    int r = config.r;
+    int n = config.n;
+    int c = config.c;
+    int h = config.h;
+    int w = config.w;
+    int stride = config.stride;
     int padding = r / 2;
+    if (r <= 0 || r * r > kKernelCapacity
+        || n <= 0 || c <= 0 || c % 8 != 0
+        || h <= 0 || w <= 0 || stride <= 0)
+    {
+        std::cout << "[ERROR] unsupported config: " << config.name
+                  << ", require C % 8 == 0 and K * K <= 128"
+                  << std::endl;
+        return false;
+    }
     Conv2DParam param = make_param(c, h, w, r, stride, padding);
     int in_numel = n * param.inBatchNumel;
     int out_numel = n * param.outBatchNumel;
@@ -484,13 +528,34 @@ static void run_case(
         in_numel + out_numel + weight_numel + c) * sizeof(__half);
     double arithmetic_intensity = flops * 1e9 / total_bytes;
 
+    uint32_t grid_x = (param.outHW + 255) / 256;
+    size_t grid_blocks = static_cast<size_t>(grid_x)
+        * (c / 8) * n;
+    double full_waves = static_cast<double>(grid_blocks)
+        / (128.0 * 6.0);
+    std::cout << "\n[CONFIG] " << config.name
+              << " dtype=fp16"
+              << " N=" << n
+              << " C=" << c
+              << " H=" << h
+              << " W=" << w
+              << " K=" << r
+              << " stride=" << stride
+              << " out=" << param.out_h << "x" << param.out_w
+              << " grid=(" << grid_x << "," << c / 8 << "," << n << ")"
+              << " blocks=" << grid_blocks
+              << " waves_at_6_blocks_per_sm=" << std::fixed
+              << std::setprecision(2) << full_waves
+              << " block=256"
+              << " atol=" << atol
+              << " rtol=" << rtol
+              << std::defaultfloat << std::endl;
+
     __half *input_h = nullptr;
-    __half *input_nhwc_h = nullptr;
     __half *weight_h = nullptr;
     __half2 *packed_weight_h = nullptr;
     __half *bias_h = nullptr;
     CUDA_CHECK(cudaMallocHost(&input_h, in_numel * sizeof(__half)));
-    CUDA_CHECK(cudaMallocHost(&input_nhwc_h, in_numel * sizeof(__half)));
     CUDA_CHECK(cudaMallocHost(&weight_h, weight_numel * sizeof(__half)));
     CUDA_CHECK(cudaMallocHost(
         &packed_weight_h,
@@ -512,18 +577,15 @@ static void run_case(
         float value = static_cast<float>((std::rand() & 127) - 64) / 512.0f;
         bias_h[i] = __float2half_rn(value);
     }
-    fill_input_nhwc(input_h, input_nhwc_h, n, c, h, w);
     pack_weights(weight_h, packed_weight_h, c, r * r);
 
     __half *input_d = nullptr;
-    __half *input_nhwc_d = nullptr;
     __half *weight_d = nullptr;
     __half2 *packed_weight_d = nullptr;
     __half *bias_d = nullptr;
     __half *baseline_output_d = nullptr;
     __half *cudnn_output_d = nullptr;
     CUDA_CHECK(cudaMalloc(&input_d, in_numel * sizeof(__half)));
-    CUDA_CHECK(cudaMalloc(&input_nhwc_d, in_numel * sizeof(__half)));
     CUDA_CHECK(cudaMalloc(&weight_d, weight_numel * sizeof(__half)));
     CUDA_CHECK(cudaMalloc(
         &packed_weight_d,
@@ -535,11 +597,6 @@ static void run_case(
     CUDA_CHECK(cudaMemcpy(
         input_d,
         input_h,
-        in_numel * sizeof(__half),
-        cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(
-        input_nhwc_d,
-        input_nhwc_h,
         in_numel * sizeof(__half),
         cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(
@@ -558,42 +615,26 @@ static void run_case(
         c * sizeof(__half),
         cudaMemcpyHostToDevice));
 
-    float baseline_time = benchmark_kernel(
-        launch_baseline,
+    std::cout << "[STAGE] correctness baseline" << std::endl;
+    launch_baseline(
         input_d,
         packed_weight_d,
         bias_d,
         baseline_output_d,
         param,
-        n,
-        warmup,
-        iters);
-    write_result(
-        csv,
-        r,
-        n,
-        c,
-        h,
-        "baseline",
-        baseline_time,
-        flops,
-        arithmetic_intensity);
+        n);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     cudnnTensorDescriptor_t input_desc;
     cudnnTensorDescriptor_t output_desc;
-    cudnnTensorDescriptor_t input_nhwc_desc;
-    cudnnTensorDescriptor_t output_nhwc_desc;
     cudnnTensorDescriptor_t bias_desc;
     cudnnFilterDescriptor_t filter_desc;
-    cudnnFilterDescriptor_t filter_nhwc_desc;
     cudnnConvolutionDescriptor_t conv_desc;
     CUDNN_CHECK(cudnnCreateTensorDescriptor(&input_desc));
     CUDNN_CHECK(cudnnCreateTensorDescriptor(&output_desc));
-    CUDNN_CHECK(cudnnCreateTensorDescriptor(&input_nhwc_desc));
-    CUDNN_CHECK(cudnnCreateTensorDescriptor(&output_nhwc_desc));
     CUDNN_CHECK(cudnnCreateTensorDescriptor(&bias_desc));
     CUDNN_CHECK(cudnnCreateFilterDescriptor(&filter_desc));
-    CUDNN_CHECK(cudnnCreateFilterDescriptor(&filter_nhwc_desc));
     CUDNN_CHECK(cudnnCreateConvolutionDescriptor(&conv_desc));
 
     CUDNN_CHECK(cudnnSetTensor4dDescriptor(
@@ -654,7 +695,9 @@ static void run_case(
     {
         CUDA_CHECK(cudaMalloc(&workspace, workspace_size));
     }
-    float nchw_time = benchmark_cudnn(
+    std::cout << "[STAGE] correctness reference=cuDNN_NCHW"
+              << std::endl;
+    benchmark_cudnn(
         cudnn,
         input_desc,
         filter_desc,
@@ -666,18 +709,8 @@ static void run_case(
         cudnn_output_d,
         workspace,
         workspace_size,
-        warmup,
-        iters);
-    write_result(
-        csv,
-        r,
-        n,
-        c,
-        h,
-        "cudnn_nchw",
-        nchw_time,
-        flops,
-        arithmetic_intensity);
+        0,
+        1);
     float alpha = 1.0f;
     CUDNN_CHECK(cudnnAddTensor(
         cudnn,
@@ -687,216 +720,207 @@ static void run_case(
         &alpha,
         output_desc,
         cudnn_output_d));
-    verify_output(
+    bool correct = verify_output(
         "baseline",
         baseline_output_d,
         cudnn_output_d,
-        out_numel);
+        out_numel,
+        atol,
+        rtol);
 
-    CUDNN_CHECK(cudnnSetTensor4dDescriptor(
-        input_nhwc_desc,
-        CUDNN_TENSOR_NHWC,
-        CUDNN_DATA_HALF,
-        n,
-        c,
-        h,
-        w));
-    CUDNN_CHECK(cudnnSetTensor4dDescriptor(
-        output_nhwc_desc,
-        CUDNN_TENSOR_NHWC,
-        CUDNN_DATA_HALF,
-        n,
-        c,
-        param.out_h,
-        param.out_w));
-    CUDNN_CHECK(cudnnSetFilter4dDescriptor(
-        filter_nhwc_desc,
-        CUDNN_DATA_HALF,
-        CUDNN_TENSOR_NHWC,
-        c,
-        1,
-        r,
-        r));
-
-    size_t workspace_nhwc_size = 0;
-    CUDNN_CHECK(cudnnGetConvolutionForwardWorkspaceSize(
-        cudnn,
-        input_nhwc_desc,
-        filter_nhwc_desc,
-        conv_desc,
-        output_nhwc_desc,
-        algo,
-        &workspace_nhwc_size));
-    void *workspace_nhwc = nullptr;
-    if (workspace_nhwc_size > 0)
+    if (benchmark)
     {
-        CUDA_CHECK(cudaMalloc(&workspace_nhwc, workspace_nhwc_size));
+        int launches_per_sample = config.launches_per_sample;
+        std::cout << "[STAGE] performance"
+                  << " warmup=" << warmup
+                  << " samples=" << iterations
+                  << " groups=" << groups
+                  << " launches_per_sample=" << launches_per_sample
+                  << " arithmetic_intensity=" << std::fixed
+                  << std::setprecision(3) << arithmetic_intensity
+                  << std::defaultfloat << std::endl;
+        auto baseline_launch = [&]()
+        {
+            launch_baseline(
+                input_d,
+                packed_weight_d,
+                bias_d,
+                baseline_output_d,
+                param,
+                n);
+        };
+        float beta = 0.0f;
+        auto cudnn_nchw_launch = [&]()
+        {
+            CUDNN_CHECK(cudnnConvolutionForward(
+                cudnn,
+                &alpha,
+                input_desc,
+                input_d,
+                filter_desc,
+                weight_d,
+                conv_desc,
+                algo,
+                workspace,
+                workspace_size,
+                &beta,
+                output_desc,
+                cudnn_output_d));
+            CUDNN_CHECK(cudnnAddTensor(
+                cudnn,
+                &alpha,
+                bias_desc,
+                bias_d,
+                &alpha,
+                output_desc,
+                cudnn_output_d));
+        };
+
+        constexpr int preheat_ms = 1000;
+        std::cout << "[PREHEAT] baseline duration_ms="
+                  << preheat_ms << std::endl;
+        preheat(baseline_launch, preheat_ms);
+        std::cout << "[BENCHMARK] baseline" << std::endl;
+        for (int group = 1; group <= groups; ++group)
+        {
+            print_stats(
+                "baseline",
+                group,
+                measure_launch_stats(
+                    baseline_launch,
+                    warmup,
+                    iterations,
+                    launches_per_sample));
+        }
+        std::cout << "[PREHEAT] cudnn_nchw duration_ms="
+                  << preheat_ms << std::endl;
+        preheat(cudnn_nchw_launch, preheat_ms);
+        std::cout << "[BENCHMARK] cudnn_nchw_with_bias" << std::endl;
+        for (int group = 1; group <= groups; ++group)
+        {
+            print_stats(
+                "cudnn_nchw",
+                group,
+                measure_launch_stats(
+                    cudnn_nchw_launch,
+                    warmup,
+                    iterations,
+                    launches_per_sample));
+        }
     }
-    float nhwc_time = benchmark_cudnn(
-        cudnn,
-        input_nhwc_desc,
-        filter_nhwc_desc,
-        conv_desc,
-        output_nhwc_desc,
-        algo,
-        input_nhwc_d,
-        weight_d,
-        cudnn_output_d,
-        workspace_nhwc,
-        workspace_nhwc_size,
-        warmup,
-        iters);
-    write_result(
-        csv,
-        r,
-        n,
-        c,
-        h,
-        "cudnn_nhwc",
-        nhwc_time,
-        flops,
-        arithmetic_intensity);
 
     if (workspace != nullptr)
     {
         CUDA_CHECK(cudaFree(workspace));
     }
-    if (workspace_nhwc != nullptr)
-    {
-        CUDA_CHECK(cudaFree(workspace_nhwc));
-    }
     CUDNN_CHECK(cudnnDestroyTensorDescriptor(input_desc));
     CUDNN_CHECK(cudnnDestroyTensorDescriptor(output_desc));
-    CUDNN_CHECK(cudnnDestroyTensorDescriptor(input_nhwc_desc));
-    CUDNN_CHECK(cudnnDestroyTensorDescriptor(output_nhwc_desc));
     CUDNN_CHECK(cudnnDestroyTensorDescriptor(bias_desc));
     CUDNN_CHECK(cudnnDestroyFilterDescriptor(filter_desc));
-    CUDNN_CHECK(cudnnDestroyFilterDescriptor(filter_nhwc_desc));
     CUDNN_CHECK(cudnnDestroyConvolutionDescriptor(conv_desc));
 
     CUDA_CHECK(cudaFree(input_d));
-    CUDA_CHECK(cudaFree(input_nhwc_d));
     CUDA_CHECK(cudaFree(weight_d));
     CUDA_CHECK(cudaFree(packed_weight_d));
     CUDA_CHECK(cudaFree(bias_d));
     CUDA_CHECK(cudaFree(baseline_output_d));
     CUDA_CHECK(cudaFree(cudnn_output_d));
     CUDA_CHECK(cudaFreeHost(input_h));
-    CUDA_CHECK(cudaFreeHost(input_nhwc_h));
     CUDA_CHECK(cudaFreeHost(weight_h));
     CUDA_CHECK(cudaFreeHost(packed_weight_h));
     CUDA_CHECK(cudaFreeHost(bias_h));
+
+    std::cout << (correct ? "[SUCCESS] " : "[FAILED] ")
+              << config.name << std::endl;
+    return correct;
 }
 
 int main(int argc, char *argv[])
 {
-    std::string csv_path = std::string("benchmark_")
-        + kTargetName + ".csv";
-    int iters = 100;
-    int warmup = 10;
-    bool quick = false;
+    const CaseConfig cases[] = {
+        {"throughput", 7, 64, 128, 80, 80, 2, 4},
+        {"main", 7, 4, 128, 80, 80, 2, 64},
+        {"common", 5, 1, 32, 80, 80, 2, 512},
+        {"aligned", 3, 2, 64, 64, 64, 2, 512},
+        {"boundary", 3, 1, 32, 43, 43, 2, 1024},
+        {"k9", 9, 1, 32, 80, 80, 2, 256},
+        {"k11_throughput", 11, 64, 128, 80, 80, 2, 16},
+        {"k11_tail", 11, 1, 32, 43, 43, 2, 256},
+        {"rectangular", 7, 1, 32, 65, 81, 2, 512},
+        {"stride1", 3, 1, 32, 43, 43, 1, 512},
+        {"min_channels", 7, 1, 8, 43, 43, 2, 1024},
+        {"non_power_channels", 7, 1, 40, 43, 43, 2, 512}
+    };
 
-    for (int argi = 1; argi < argc; ++argi)
+    const char *selected_case = nullptr;
+    bool correctness_only = false;
+    bool profile = false;
+    for (int argument = 1; argument < argc; ++argument)
     {
-        if (std::strcmp(argv[argi], "--csv") == 0 && argi + 1 < argc)
+        if (std::strcmp(argv[argument], "--case") == 0
+            && argument + 1 < argc)
         {
-            csv_path = argv[++argi];
+            selected_case = argv[++argument];
         }
-        else if (std::strcmp(argv[argi], "--iters") == 0
-                 && argi + 1 < argc)
+        else if (std::strcmp(argv[argument], "--profile") == 0
+                 && argument + 1 < argc)
         {
-            iters = std::atoi(argv[++argi]);
+            profile = true;
+            selected_case = argv[++argument];
         }
-        else if (std::strcmp(argv[argi], "--warmup") == 0
-                 && argi + 1 < argc)
+        else if (std::strcmp(argv[argument], "--correctness-only") == 0)
         {
-            warmup = std::atoi(argv[++argi]);
+            correctness_only = true;
         }
-        else if (std::strcmp(argv[argi], "--quick") == 0)
+        else
         {
-            quick = true;
+            std::cout << "[ERROR] unknown argument: "
+                      << argv[argument] << std::endl;
+            return EXIT_FAILURE;
         }
     }
-    if (iters <= 0 || warmup < 0)
-    {
-        std::cout << "[ERROR] invalid benchmark iteration config" << std::endl;
-        return 1;
-    }
-
-    std::vector<int> ns = quick
-        ? std::vector<int> {1, 16}
-        : std::vector<int> {1, 2, 4, 8, 16, 32};
-    std::vector<int> cs = quick
-        ? std::vector<int> {32, 128}
-        : std::vector<int> {32, 64, 128, 256};
-    std::vector<int> hs = quick
-        ? std::vector<int> {40, 80}
-        : std::vector<int> {40, 80, 160};
-    std::vector<int> kernel_sizes;
-    if (kKernelCapacity == 32)
-    {
-        kernel_sizes = {3, 5};
-    }
-    else if (kKernelCapacity == 64)
-    {
-        kernel_sizes = quick
-            ? std::vector<int> {3, 7}
-            : std::vector<int> {3, 5, 7};
-    }
-    else
-    {
-        kernel_sizes = quick
-            ? std::vector<int> {7, 11}
-            : std::vector<int> {3, 5, 7, 9, 11};
-    }
-
-    std::ofstream csv(csv_path);
-    if (!csv.is_open())
-    {
-        std::cout << "[ERROR] failed to open csv: " << csv_path << std::endl;
-        return 1;
-    }
-    csv << "k_size,n,c,h,kernel,time_ms,gflops,arith_intensity"
-        << std::endl;
 
     std::cout << "[CONFIG] target=" << kTargetName
               << " capacity=" << kKernelCapacity
-              << " csv=" << csv_path
-              << " iters=" << iters
-              << " warmup=" << warmup
-              << " quick=" << (quick ? "true" : "false")
-              << std::endl << std::endl;
-    std::cout << std::left << std::setw(6) << "k_size" << " |"
-              << std::setw(4) << "n" << " |"
-              << std::setw(4) << "c" << " |"
-              << std::setw(4) << "h" << " |"
-              << std::setw(12) << "kernel" << " |"
-              << std::setw(12) << "time_ms" << " |"
-              << std::setw(12) << "gflops" << " |"
-              << std::setw(12) << "ai" << std::endl;
+              << " warmup=20 samples=100 groups=3"
+              << " selected_case="
+              << (selected_case == nullptr ? "all" : selected_case)
+              << " correctness_only="
+              << (correctness_only ? "true" : "false")
+              << " profile=" << (profile ? "true" : "false")
+              << std::endl;
 
-    std::srand(42);
     cudnnHandle_t cudnn;
     CUDNN_CHECK(cudnnCreate(&cudnn));
     cudnnConvolutionFwdAlgo_t algo =
         CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
-    for (int r : kernel_sizes)
+
+    bool success = true;
+    bool found = selected_case == nullptr;
+    for (const CaseConfig &config : cases)
     {
-        for (int n : ns)
+        if (selected_case != nullptr
+            && std::strcmp(config.name, selected_case) != 0)
         {
-            for (int c : cs)
-            {
-                for (int h : hs)
-                {
-                    run_case(cudnn, algo, csv, r, n, c, h, warmup, iters);
-                }
-            }
+            continue;
         }
+        found = true;
+        std::srand(20260712);
+        bool benchmark = selected_case != nullptr
+            && !correctness_only && !profile;
+        success = run_case(cudnn, algo, config, benchmark) && success;
     }
     CUDNN_CHECK(cudnnDestroy(cudnn));
-    csv.close();
 
-    std::cout << std::endl
-              << "[SUCCESS] benchmark finished" << std::endl;
-    return 0;
+    if (!found)
+    {
+        std::cout << "[ERROR] unknown case: " << selected_case << std::endl;
+        return EXIT_FAILURE;
+    }
+
+    std::cout << "\n"
+              << (success ? "[SUCCESS] fp16 baseline"
+                          : "[FAILED] fp16 baseline")
+              << std::endl;
+    return success ? EXIT_SUCCESS : EXIT_FAILURE;
 }
