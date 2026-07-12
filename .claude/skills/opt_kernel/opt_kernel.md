@@ -42,7 +42,7 @@ rg -n "cuda_utils\\.cuh|printf\\s*\\(" <kernel文件路径>
 rg -n "<源文件名>|<cmake目标>" CMakeLists.txt
 ```
 
-修改代码前，从稳定基线为每个 kernel 优化任务创建一个 `feat/{op_name}_opt` 分支。实验轮次不另建分支；每次确认 `KEEP` 后立即创建一个独立的 `perf:` commit，一次 commit 只包含一个有效优化及其必要测试和实验记录。仅分析时无需新建分支。
+修改代码前，从稳定基线为每个 kernel 优化任务创建一个 `feat/opt_{op_name}` 分支。实验轮次不另建分支；每次确认 `KEEP` 后立即创建一个独立的 `perf:` commit，一次 commit 只包含一个有效优化及其必要测试和实验记录。仅分析时无需新建分支。
 工作树已有用户修改时，只暂存本任务且能明确归属的文件或 hunk，不得把无关修改带入优化 commit；若与实验改动无法分离，先请求用户处理。
 结合定义行号阅读目标 kernel、函数签名、相邻注释及全部 launch site。若目标是模板 kernel，记录被测配置实际使用的模板参数和编译后 kernel 名称。
 
@@ -124,8 +124,19 @@ cmake --build build --target <cmake目标> -j
 
 ### 1.5 创建实验记录
 
-在最终报告中维护以下表格。优化期间可先记录在 `/tmp/opt_kernel_<kernel_name>.md`，但 `/tmp` 只作为运行中草稿。
-阶段性停止、`[BLOCKED]` 或最终交付前，必须将可读报告写入 `docs/opt_kernel/<kernel_name>.md`。不得只交付 `/tmp` 路径；临时 profile 文件不得提交到仓库。
+```text
+docs/opt_kernel/opt_<op_name>/opt_kernel_<kernel_id>_<gpu>_<YYYYMMDD>.md
+```
+
+- `kernel_id` 使用简短唯一标识；完整 kernel 名、源码位置写入正文。
+- `gpu` 使用具体型号，日期使用基线冻结日。
+- 每个 GPU、日期和基线单独建报告；同日新轮次添加 `_02`，历史报告只引用链接。
+
+```text
+docs/opt_kernel/opt_dwconv/opt_kernel_conv2d_groups_rtx4090_20260712.md
+```
+
+优化期间可使用同名 `/tmp` 草稿；停止或交付前必须写入仓库，且不提交临时 profile。
 
 ```markdown
 | 轮次 | 假设/改动 | 正确性 | median ms | mean ms | 相对当前基线 | 决策 | Commit |
@@ -309,8 +320,16 @@ compute-sanitizer --tool synccheck ./build/<cmake目标> --correctness-only --ca
 
 ## 阶段 6 - 交付
 
-将报告写入仓库可见路径：`docs/opt_kernel/<kernel_name>.md`。
-若存在 `/tmp/opt_kernel_<kernel_name>.md`，将其中有效内容整理或同步到上述路径；删除或省略临时命令噪声、绝对临时 profile 路径和失败实验中不影响结论的冗余日志。
+将报告写入阶段 1.5 确定的独立路径，不得覆盖或追加到其他 GPU、日期或基线的报告。
+若存在对应的 `/tmp` 草稿，将其中有效内容整理或同步到上述路径；删除或省略临时命令噪声、绝对临时 profile 路径和失败实验中不影响结论的冗余日志。
+
+阶段 0-4 可按执行顺序维护草稿；进入阶段 6 后必须按决策重新组织，不能继续追加阶段流水账。最终报告遵循以下规则：
+- 开头先给出最终实现、dispatch/fallback、主要性能和状态。
+- 环境、测试配置、正确性和 sanitizer 各总结一次。
+- 将计划和执行合并为实验表，每个实验只保留改动、关键结果、决策和 Commit。
+- NCU 只保留 baseline、final 及支撑关键决策的指标，不复制原始日志或完整命令。
+- 不重复代码 diff、阶段摘要和已被最终数据取代的暂定分析；代码细节由 Commit 承担。
+- 不设硬性行数；以读者能快速定位结论且结果可复现为准。
 
 报告中的 latency 取 3 个 group median 的中位数，并同时保留各组 median 和 `group_median_spread`；若没有同语义 GPU 参考实现，`Reference ms` 明确写 `N/A`。
 条件优化必须写明 dispatch 条件及 fallback，验证项必须列出实际命令范围、配置数、sanitizer 错误数和 NCU 对比条件。

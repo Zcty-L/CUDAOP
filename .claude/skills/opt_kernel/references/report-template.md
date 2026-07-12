@@ -3,48 +3,41 @@
 ```markdown
 # <kernel_name> 优化报告
 
-## 环境
-- GPU：
-- 计算能力：
-- CUDA / Driver：
-- CMake target：
-- 编译架构：
-- GPU 时钟与波动：
+## 结论
+- 状态：
+- 主要结果：
+- 适用范围：
+- 关联历史报告：
 
-## 测试配置
-- 输入与布局：
-- 数据类型：
-- 正确性容差：
-- warmup / iterations：
+## 最终实现与 Dispatch
+| 条件 | 实现 | 关键改动 | Fallback |
+|------|------|----------|----------|
 
-## 基线
+## 最终性能
+| 配置 | Baseline group medians | Final group medians | Speedup | Final spread | Reference |
+|------|------------------------|---------------------|--------:|-------------:|----------:|
+
+## 正确性与安全检查
 - 正确性：
-- median latency：
-- 参考实现：
-- registers / shared memory：
+- compute-sanitizer：
+- 边界路径：
 
-## 瓶颈结论
-- 主瓶颈：
-- 证据：
-- 次要瓶颈：
-- 分析限制：
+## 环境与测试
+- 日期 / GPU / SM：
+- CUDA / Driver / NCU：
+- 源文件 / kernel / CMake target：
+- 数据类型 / 输入范围 / 容差：
+- warmup / samples / groups：
+
+## 资源与关键性能证据
+| 路径 | Registers | Shared memory | Spill | Baseline / Final NCU | 关键指标 |
+|------|----------:|--------------:|------:|----------------------|----------|
 
 ## 实验记录
-| 轮次 | 假设/改动 | 正确性 | median ms | 相对当前基线 | 决策 | Commit |
-|-----:|-----------|:------:|----------:|---------------:|:----:|:------:|
+| 轮次 | 改动 | 关键结果 | 决策 | Commit |
+|-----:|------|----------|:----:|:------:|
 
-## 最终结果
-| 配置 | Baseline ms | Final ms | Speedup | Reference ms |
-|------|------------:|---------:|--------:|-------------:|
-
-## 验证
-- 边界测试：
-- compute-sanitizer：
-- Nsight Compute：
-
-## 结论
-- 接受的优化：
-- 最终加速比：
+## 剩余限制
 - 剩余瓶颈：
 - 未执行项及原因：
 - 性能可信度限制：
