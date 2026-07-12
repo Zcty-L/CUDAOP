@@ -42,7 +42,8 @@ rg -n "cuda_utils\\.cuh|printf\\s*\\(" <kernel文件路径>
 rg -n "<源文件名>|<cmake目标>" CMakeLists.txt
 ```
 
-修改代码前，从稳定基线为每个 kernel 优化任务创建一个 `feat/{op_name}_opt` 分支。实验轮次不另建分支；只提交正确且有收益的版本。仅分析时无需新建分支。
+修改代码前，从稳定基线为每个 kernel 优化任务创建一个 `feat/{op_name}_opt` 分支。实验轮次不另建分支；每次确认 `KEEP` 后立即创建一个独立的 `perf:` commit，一次 commit 只包含一个有效优化及其必要测试和实验记录。仅分析时无需新建分支。
+工作树已有用户修改时，只暂存本任务且能明确归属的文件或 hunk，不得把无关修改带入优化 commit；若与实验改动无法分离，先请求用户处理。
 结合定义行号阅读目标 kernel、函数签名、相邻注释及全部 launch site。若目标是模板 kernel，记录被测配置实际使用的模板参数和编译后 kernel 名称。
 
 ### 0.2 检查 GPU
@@ -91,6 +92,7 @@ cmake --build build --target device_query -j
 选择吞吐饱和配置时，记录 grid blocks、active blocks/SM 和 waves/SM；建议至少 8-10 个 full waves，不满足时说明小 grid 或 tail wave 影响。
 性能提升和瓶颈判断默认以吞吐饱和配置为主；业务配置用于记录真实场景表现和检查防回退。
 若用户指定唯一业务 shape 为优化目标，将其作为主要性能配置，吞吐饱和配置仅作辅助分析。
+分别冻结每个配置的基线。测试矩阵用于选择不同条件路径，不要求一个 kernel 实现对所有配置同时最优。
 
 若已有 cuBLAS、cuDNN、CUTLASS 或其他参考实现，在相同输入、布局、精度、stream 和计时范围下测量并记录。参考库不是正确性基线的替代品。
 
@@ -126,9 +128,9 @@ cmake --build build --target <cmake目标> -j
 阶段性停止、`[BLOCKED]` 或最终交付前，必须将可读报告写入 `docs/opt_kernel/<kernel_name>.md`。不得只交付 `/tmp` 路径；临时 profile 文件不得提交到仓库。
 
 ```markdown
-| 轮次 | 假设/改动 | 正确性 | median ms | mean ms | 相对当前基线 | 决策 |
-|-----:|-----------|:------:|----------:|----------:|---------------:|:----:|
-| 0 | baseline | PASS | 0.000000 | 0.000000 | 0.00% | KEEP |
+| 轮次 | 假设/改动 | 正确性 | median ms | mean ms | 相对当前基线 | 决策 | Commit |
+|-----:|-----------|:------:|----------:|--------:|---------------:|:----:|:------:|
+| 0 | baseline | PASS | 0.000000 | 0.000000 | 0.00% | KEEP | abc1234 |
 ```
 
 ## 阶段 2 - 瓶颈分析
@@ -243,12 +245,21 @@ ncu -f --set basic --kernel-name regex:<kernel名称正则> \
 6. 运行主要配置 benchmark。
 7. 必要时运行定向 Nsight Compute profile。
 8. 记录结果并决定 `KEEP`、`REVERT` 或 `CRASH`。
-9. 只有 `KEEP` 的实现才能成为下一轮基线。
+9. `KEEP` 前补齐适用条件、fallback 和 dispatch 边界测试，再重跑完整正确性与必测性能配置。
+10. 将一次有效优化及其必要测试、报告记录提交为独立 `perf:` commit；记录短 commit hash，该 commit 成为下一轮基线。
+
+```bash
+git commit -m "perf: <kernel名称> <有效优化>"
+git rev-parse --short HEAD
+```
 
 实现成本较高时，保留当前最近的最佳 kernel，新建以机制命名的实验 kernel 实现复杂方案，并在同一测试中对比。决策后，`KEEP` 替换原实现，`REVERT` 删除实验 kernel。
 
-失败实验只撤销本轮由执行者引入的改动，不得使用会覆盖用户修改的 Git 命令。
+每轮实验从最近的 `KEEP` commit 开始。失败实验只撤销本轮尚未提交的改动，不得改写已有 `KEEP` commit，也不得使用会覆盖用户修改的 Git 命令。
 普通实验不保留 `#ifdef` 基线、旧 kernel 或 `_v2` 变体；最终代码只保留接受的实现，历史由 Git commit、diff 和实验表承担。
+
+多配置下分别判断收益。若某一配置或一类配置获得稳定大幅提升，而其他配置不适合该实现，不得整体撤销；保留优化 kernel，并按运行时参数增加条件 dispatch，让未受益配置回落到最近的已提交基线。
+优先用 K、stride、对齐、布局或尺寸范围等可解释条件；只有用户明确把某个固定 shape 列为目标时，才使用精确 H/W 条件。提交前必须补测 dispatch 条件两侧及边界值，确保最终组合在全部必测配置上不回退。
 
 ### 决策规则
 
@@ -257,18 +268,19 @@ ncu -f --set basic --kernel-name regex:<kernel名称正则> \
 | 结果 | 决策 |
 |------|------|
 | 任一正确性配置失败 | `REVERT` |
-| 任一必测配置稳定回退超过 2% | `REVERT` |
+| 任一必测配置稳定回退超过 2%，且无法用可靠条件隔离 | `REVERT` |
+| 任一配置提升至少 5% 且至少为噪声上界的 3 倍，可由运行时条件可靠选择 | `KEEP` 条件路径，其他配置 fallback |
 | 主要配置提升至少 5%，且其他配置不回退 | `KEEP`，作为新基线继续 |
-| 提升 2% 到 5%，跨 3 组测试稳定 | `KEEP`，降低后续优先级 |
+| 提升 2% 到 5%，跨 3 组测试稳定，且最终 dispatch 无必测回退 | `KEEP`，降低后续优先级 |
 | 提升不足 2% | 视为噪声，`REVERT` |
 | 编译、运行或 profile 失败 | 记录 `CRASH`，修复或尝试下一假设 |
 
-除非用户另有目标，满足任一条件时停止：
+`KEEP` 表示最终 dispatch 组合通过验证，不表示候选 kernel 必须覆盖全部配置。每次 `KEEP` 只提交一次；同一实验为补齐正确性、dispatch 或报告所做的必要修正并入该 commit，不拆成多个微小 commit。
 
-- 连续两个有效实验没有提升；
-- 所有高优先级假设已验证；
-- 性能达到硬件或参考实现的合理上限；
-- 环境不再满足稳定测量条件。
+连续两个实验没有提升时只重新分析瓶颈和优先级，不得直接停止；存在未验证的高优先级结构性方案时必须继续。除非用户另有目标，仅在满足以下任一条件时停止：
+- 所有高优先级假设均已验证或排除，且每个主要瓶颈至少验证过一个结构性方案；
+- 已用硬件吞吐、有效带宽、指令利用率或同语义参考实现量化证明达到合理上限，且没有尚未验证的可信优化路径；
+- 环境不再满足稳定测量条件，无法继续形成可信决策。
 
 进入实验循环后应自主推进，不因每轮结果暂停询问；只有需要改变语义、扩大修改范围或缺少关键输入时才请求用户决策。
 
@@ -276,18 +288,23 @@ ncu -f --set basic --kernel-name regex:<kernel名称正则> \
 
 对最终保留版本重新执行：
 
-1. 全部正确性测试。
-2. 全部性能配置， warmup、正式测试、3 组重复。
-3. 基线、最终实现和参考库的统一对比。
-4. `ptxas -v` 资源对比。
-5. 定向 Nsight Compute 对比。
+1. 阶段 1 冻结的全部必测正确性配置，并覆盖每条接受的条件路径及 fallback。
+2. 阶段 1 冻结的全部必测性能配置，沿用相同的预热、正式样本、批量和 3 组重复。
+3. 用冻结的原始基线与最终实现对比；仅当阶段 1 已建立同语义 GPU 参考实现时才对比参考库，否则在报告中记为 `N/A`。
+4. 通过干净的 CMake 构建确认目标 SM，并记录每条最终 kernel 路径的 `ptxas -v` registers、shared memory 和 spill。
+5. 对主要吞吐配置及每条接受的条件路径做 Nsight Compute 对比。基线与最终实现必须使用相同 GPU、输入、section、时钟策略和 launch 位置；
+可复用同环境下冻结的基线报告，不得为了 profile 把旧 kernel 留在最终源码中。
 
 ```bash
-compute-sanitizer --tool memcheck ./build/<cmake目标> <运行参数>
+compute-sanitizer --tool memcheck ./build/<cmake目标> --correctness-only
 ```
+`memcheck` 必须覆盖完整正确性矩阵。每条接受的 shared memory、异步复制或显式同步路径，还必须选择一个包含边界或尾部的代表配置运行 `racecheck` 和 `synccheck`：
 
-如项目使用 race-prone shared memory、异步复制或复杂同步，按需增加 `racecheck` 和 `synccheck`。工具不可用时在报告中说明。
-
+```bash
+compute-sanitizer --tool racecheck ./build/<cmake目标> --correctness-only --case <代表配置>
+compute-sanitizer --tool synccheck ./build/<cmake目标> --correctness-only --case <代表配置>
+```
+任一 sanitizer 报错都视为阶段 5 失败；修复后必须对最终代码重跑受影响测试和完整正确性矩阵。工具不可用时记录工具、版本和阻塞原因，不得写成“已通过”。
 最终代码必须只包含被接受的实现，不保留失败实验、临时可执行文件、profile 报告或备份文件。
 
 ## 阶段 6 - 交付
@@ -295,63 +312,14 @@ compute-sanitizer --tool memcheck ./build/<cmake目标> <运行参数>
 将报告写入仓库可见路径：`docs/opt_kernel/<kernel_name>.md`。
 若存在 `/tmp/opt_kernel_<kernel_name>.md`，将其中有效内容整理或同步到上述路径；删除或省略临时命令噪声、绝对临时 profile 路径和失败实验中不影响结论的冗余日志。
 
-报告模板：
-
-```markdown
-# <kernel_name> 优化报告
-
-## 环境
-- GPU：
-- 计算能力：
-- CUDA / Driver：
-- CMake target：
-- 编译架构：
-- GPU 时钟与波动：
-
-## 测试配置
-- 输入与布局：
-- 数据类型：
-- 正确性容差：
-- warmup / iterations：
-
-## 基线
-- 正确性：
-- median latency：
-- 参考实现：
-- registers / shared memory：
-
-## 瓶颈结论
-- 主瓶颈：
-- 证据：
-- 次要瓶颈：
-- 分析限制：
-
-## 实验记录
-| 轮次 | 假设/改动 | 正确性 | median ms | 相对当前基线 | 决策 |
-|-----:|-----------|:------:|----------:|---------------:|:----:|
-
-## 最终结果
-| 配置 | Baseline ms | Final ms | Speedup | Reference ms |
-|------|------------:|---------:|--------:|-------------:|
-
-## 验证
-- 边界测试：
-- compute-sanitizer：
-- Nsight Compute：
-
-## 结论
-- 接受的优化：
-- 最终加速比：
-- 剩余瓶颈：
-- 未执行项及原因：
-- 性能可信度限制：
-
-[SUCCESS]
-```
+报告中的 latency 取 3 个 group median 的中位数，并同时保留各组 median 和 `group_median_spread`；若没有同语义 GPU 参考实现，`Reference ms` 明确写 `N/A`。
+条件优化必须写明 dispatch 条件及 fallback，验证项必须列出实际命令范围、配置数、sanitizer 错误数和 NCU 对比条件。
+进入阶段 6 时读取并使用 [优化报告模板](references/report-template.md)，按实际结果补充内容，不得保留空占位符。
 
 只有同时满足以下条件才能输出 `[SUCCESS]`：
 
 - 最终代码通过全部必测正确性配置；
+- 阶段 5 要求的 sanitizer 均已执行且为零错误；
 - 至少一个主要配置获得超过噪声阈值的提升；
 - 报告完整记录环境、基线、实验和最终结果。
 
