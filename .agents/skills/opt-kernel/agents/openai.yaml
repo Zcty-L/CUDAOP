@@ -1,0 +1,4 @@
+interface:
+  display_name: "CUDA Kernel 优化"
+  short_description: "分析、实验并验证 CUDA kernel 性能优化"
+  default_prompt: "使用 $opt-kernel 优化指定的 CUDA kernel，并完成基线、实验、验证与报告。"

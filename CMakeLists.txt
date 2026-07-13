@@ -157,6 +157,78 @@ foreach(SRC_FILE ${OP_SOURCES})
     message(STATUS "Added standalone target: ${EXE_NAME}")
 endforeach()
 
+# Compare separate Conv2D + LIF kernels against the fused Conv2D-LIF kernel.
+add_executable(
+    conv2d_lif_fusion_cmp
+    op/conv/conv2d_lif_fusion_cmp.cu
+    op/conv/conv2d_k64_u8.cu
+    op/conv/conv2d_sn_k64_u8.cu
+)
+target_compile_definitions(
+    conv2d_lif_fusion_cmp
+    PRIVATE
+        CONV2D_K64_U8_BENCH_INC
+        CONV2D_SN_K64_U8_BENCH_INC
+)
+target_link_libraries(
+    conv2d_lif_fusion_cmp
+    PRIVATE
+        CUDA::cudart
+        CUDA::cuda_driver
+        CUDA::cublas
+)
+if(TARGET CUDA::cudnn)
+    target_link_libraries(conv2d_lif_fusion_cmp PRIVATE CUDA::cudnn)
+elseif(CUDNN_LIBRARY)
+    target_link_libraries(conv2d_lif_fusion_cmp PRIVATE ${CUDNN_LIBRARY})
+    target_include_directories(
+        conv2d_lif_fusion_cmp
+        PRIVATE
+            ${CUDNN_INCLUDE}
+    )
+endif()
+target_compile_options(
+    conv2d_lif_fusion_cmp
+    PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v;-Wno-deprecated-gpu-targets>
+)
+
+# Compare separate FP16 Conv2D + LIF against the fused FP16 kernel.
+add_executable(
+    conv2d_lif_fusion_cmp_fp16
+    op/conv/conv2d_lif_fusion_cmp_fp16.cu
+    op/conv/conv2d_k64_u8_fp16.cu
+    op/conv/conv2d_sn_k64_u8_fp16.cu
+)
+target_compile_definitions(
+    conv2d_lif_fusion_cmp_fp16
+    PRIVATE
+        CONV2D_K64_U8_FP16_BENCH_INC
+        CONV2D_SN_FP16_BENCH_INC
+)
+target_link_libraries(
+    conv2d_lif_fusion_cmp_fp16
+    PRIVATE
+        CUDA::cudart
+        CUDA::cuda_driver
+        CUDA::cublas
+)
+if(TARGET CUDA::cudnn)
+    target_link_libraries(conv2d_lif_fusion_cmp_fp16 PRIVATE CUDA::cudnn)
+elseif(CUDNN_LIBRARY)
+    target_link_libraries(conv2d_lif_fusion_cmp_fp16 PRIVATE ${CUDNN_LIBRARY})
+    target_include_directories(
+        conv2d_lif_fusion_cmp_fp16
+        PRIVATE
+            ${CUDNN_INCLUDE}
+    )
+endif()
+target_compile_options(
+    conv2d_lif_fusion_cmp_fp16
+    PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v;-Wno-deprecated-gpu-targets>
+)
+
 # Build the PyTorch CUDA extension from Python. This target is intentionally
 # opt-in because it depends on the active Python environment and PyTorch.
 find_package(Python3 COMPONENTS Interpreter REQUIRED)

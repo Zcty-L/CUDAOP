@@ -3,7 +3,7 @@
 #include <cmath>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include "cuda_utils.cuh"
+#include "config.h"
 #include "ptx_utils.cuh"
 
 // =============================================================================
@@ -357,6 +357,108 @@ void snn_conv2d_fp16acc_launch(
         <<<grid, block>>>(d_inputs, d_weights_padded, d_bias, d_outputs, param, out_ch_padded);
 }
 
+void snn_conv2d_fp16acc_1x1_s1_launch(
+    const uint8_t *d_inputs,
+    const __half *d_weights_padded,
+    const __half2 *d_bias,
+    __half *d_outputs,
+    Conv2DParam &param,
+    int T,
+    int out_ch_padded)
+{
+    switch (T)
+    {
+        case 1:
+            snn_conv2d_fp16acc_launch<1, 1, 1, 1, 1, 0, 0>(
+                d_inputs, d_weights_padded, d_bias, d_outputs,
+                param, out_ch_padded);
+            break;
+        case 2:
+            snn_conv2d_fp16acc_launch<2, 1, 1, 1, 1, 0, 0>(
+                d_inputs, d_weights_padded, d_bias, d_outputs,
+                param, out_ch_padded);
+            break;
+        case 3:
+            snn_conv2d_fp16acc_launch<3, 1, 1, 1, 1, 0, 0>(
+                d_inputs, d_weights_padded, d_bias, d_outputs,
+                param, out_ch_padded);
+            break;
+        case 4:
+            snn_conv2d_fp16acc_launch<4, 1, 1, 1, 1, 0, 0>(
+                d_inputs, d_weights_padded, d_bias, d_outputs,
+                param, out_ch_padded);
+            break;
+    }
+}
+
+void snn_conv2d_fp16acc_3x3_s1_launch(
+    const uint8_t *d_inputs,
+    const __half *d_weights_padded,
+    const __half2 *d_bias,
+    __half *d_outputs,
+    Conv2DParam &param,
+    int T,
+    int out_ch_padded)
+{
+    switch (T)
+    {
+        case 1:
+            snn_conv2d_fp16acc_launch<1, 3, 3, 1, 1, 1, 1>(
+                d_inputs, d_weights_padded, d_bias, d_outputs,
+                param, out_ch_padded);
+            break;
+        case 2:
+            snn_conv2d_fp16acc_launch<2, 3, 3, 1, 1, 1, 1>(
+                d_inputs, d_weights_padded, d_bias, d_outputs,
+                param, out_ch_padded);
+            break;
+        case 3:
+            snn_conv2d_fp16acc_launch<3, 3, 3, 1, 1, 1, 1>(
+                d_inputs, d_weights_padded, d_bias, d_outputs,
+                param, out_ch_padded);
+            break;
+        case 4:
+            snn_conv2d_fp16acc_launch<4, 3, 3, 1, 1, 1, 1>(
+                d_inputs, d_weights_padded, d_bias, d_outputs,
+                param, out_ch_padded);
+            break;
+    }
+}
+
+void snn_conv2d_fp16acc_3x3_s2_launch(
+    const uint8_t *d_inputs,
+    const __half *d_weights_padded,
+    const __half2 *d_bias,
+    __half *d_outputs,
+    Conv2DParam &param,
+    int T,
+    int out_ch_padded)
+{
+    switch (T)
+    {
+        case 1:
+            snn_conv2d_fp16acc_launch<1, 3, 3, 2, 2, 1, 1>(
+                d_inputs, d_weights_padded, d_bias, d_outputs,
+                param, out_ch_padded);
+            break;
+        case 2:
+            snn_conv2d_fp16acc_launch<2, 3, 3, 2, 2, 1, 1>(
+                d_inputs, d_weights_padded, d_bias, d_outputs,
+                param, out_ch_padded);
+            break;
+        case 3:
+            snn_conv2d_fp16acc_launch<3, 3, 3, 2, 2, 1, 1>(
+                d_inputs, d_weights_padded, d_bias, d_outputs,
+                param, out_ch_padded);
+            break;
+        case 4:
+            snn_conv2d_fp16acc_launch<4, 3, 3, 2, 2, 1, 1>(
+                d_inputs, d_weights_padded, d_bias, d_outputs,
+                param, out_ch_padded);
+            break;
+    }
+}
+
 
 template <int T, int Kh, int Kw, int Sh, int Sw, int Ph, int Pw>
 static void test_fp16acc(int C_in, int H, int W, int C_out, const char *label)
@@ -441,6 +543,7 @@ cleanup:
 }
 
 
+#ifndef CONV2D_K64_U8_FP16_BENCH_INC
 int main()
 {
     printf("\n=== conv2d_fp16acc (Opt1: __half2 SIMD vectorization) ===\n");
@@ -467,3 +570,4 @@ int main()
     printf("\n=== Done ===\n");
     return 0;
 }
+#endif

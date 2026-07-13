@@ -352,6 +352,22 @@ __device__ __forceinline__ void ldg_nc_0(T &reg, const void *ptr, bool guard = t
 }
 
 
+// Instruction: add.f32 with predicate guard
+// Source: NVIDIA PTX ISA, floating-point arithmetic instructions
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html
+// Purpose: conditionally accumulate one FP32 weight for a binary spike.
+__device__ __forceinline__ void add_f32(float &a, const float &b, int guard)
+{
+    asm volatile(
+        "{.reg .pred p;\n"
+        " setp.ne.b32 p, %2, 0;\n"
+        " @p add.f32 %0, %0, %1;\n"
+        "}"
+        : "+f"(a)
+        : "f"(b), "r"(guard)
+    );
+}
+
 // Predicated fp16x2 add: @p add.f16x2 acc, acc, w
 __device__ __forceinline__ void add_f16x2(__half2 &a, const __half2 &b, int guard)
 {
