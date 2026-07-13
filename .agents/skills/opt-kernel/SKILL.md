@@ -1,14 +1,33 @@
 ---
 name: opt-kernel
 description: >-
-  分析并迭代优化 CUDAOP 的 .cu 文件中用户指定的 CUDA kernel，完成目标定位、环境检查、基线冻结、瓶颈定位、
-  单变量实验、正确性与性能验证及报告交付。用于 $opt-kernel、CUDA kernel 性能分析、kernel 调优、
-  Nsight Compute 分析或要求优化 op/{name} 下 CUDA 算子的任务。
+  仅用于用户显式调用 $opt-kernel，或明确要求修改、迭代和优化 CUDAOP 的 .cu kernel 以提升性能的任务；
+  完成目标定位、基线冻结、瓶颈分析、单变量优化实验、验证和报告。不要用于仅构建 benchmark、比较已有 kernel、
+  验证 fusion 收益、性能回归或只采集 Nsight Compute profile 且不要求修改优化 kernel 的任务。
 ---
 
 # opt-kernel - CUDA Kernel 优化工作流
 
 按“检查、基线、分析、规划、实验、验证、交付”的顺序执行。不得跳过基线正确性验证，也不得用未经测量的经验判断代替性能数据。
+
+## 触发边界
+
+仅在满足以下任一条件时使用本 Skill：
+
+- 用户显式调用 `$opt-kernel`；
+- 用户明确要求优化、调优或迭代修改 kernel 实现，以获得性能提升。
+
+以下任务不触发本 Skill：
+
+- 构建 benchmark 或补充测试入口；
+- 比较两个已经存在的 kernel 实现；
+- 验证 kernel fusion 是否有收益；
+- 只做正确性、性能回归或 Nsight Compute profile；
+- 只要求解释、诊断或报告性能结果，没有要求修改 kernel。
+
+“性能”“提升”“分析”“fusion”等词单独出现时，不代表用户要求优化。
+如果用户说明只对比已有实现，应留在用户指定的当前分支，不创建
+`feat/opt_<op_name>` 分支，也不进入单变量优化实验循环。
 
 ## 用法
 
