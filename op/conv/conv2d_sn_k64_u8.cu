@@ -1,15 +1,16 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <iomanip>
+#include <iostream>
 
-#include "cuda_utils.cuh"
+#include "config.h"
 #include "ptx_utils.cuh"
 
 // =============================================================================
-// snn_conv2d_if_64x64_k16  —  Fused SNN Conv2D + IF HardReset Neuron
+// snn_conv2d_lif_64x64_k16  —  Fused SNN Conv2D + LIF HardReset Neuron
 //
 // Inputs : uint8_t inputs [C_in][H][W]         — T spike bits/pixel (bit t = step t)
 // Weights: float   weights [K_feat][C_out_pad]  — fp32, K_feat padded to 16-multiple,
@@ -19,7 +20,7 @@
 // Architecture:
 //   64×64 output tile (M=C_out, N=H_out*W_out), K_CHUNK=16 inner-product loop.
 //   Double-buffered cp.async pipeline for weights; synchronous sts32 for inputs.
-//   After accumulation, IF HardReset is applied entirely in registers across T
+//   After accumulation, LIF HardReset is applied entirely in registers across T
 //   time steps. The packed uint8 result is written via a single smem transpose
 //   epilogue (one __syncthreads vs 2T in v1 float output).
 //
@@ -46,7 +47,7 @@ static void pad_weights_sn(
 
 template <int T_STEPS, int Kh, int Kw, int Sh, int Sw, int Ph, int Pw>
 __global__
-void snn_conv2d_if_64x64_k16(
+void snn_conv2d_lif_64x64_k16(
     const uint8_t * __restrict__ inputs,
     const float   * __restrict__ weights,
     const float   * __restrict__ bias,
@@ -54,7 +55,8 @@ void snn_conv2d_if_64x64_k16(
     Conv2DParam param,
     int   out_ch_padded,
     float v_th,
-    float v_reset)
+    float v_reset,
+    float tau)
 {
     static_assert(T_STEPS >= 1 && T_STEPS <= 8,
                   "T_STEPS must be in [1,8] to fit in uint8 output");
@@ -246,7 +248,8 @@ void snn_conv2d_if_64x64_k16(
                         uint32_t word  = (j < 4) ? input_frag_lo : input_frag_hi;
                         int      shift = (j % 4) * 8 + t;
                         int      spike = (word >> shift) & 1;
-                        add_f32(output_frag[t][i][j], weight_frag[i], spike);
+                        ptx::add_f32(
+                            output_frag[t][i][j], weight_frag[i], spike);
                     }
                 }
             }
@@ -258,12 +261,10 @@ void snn_conv2d_if_64x64_k16(
     asm volatile("cp.async.wait_all;\n" :::);
 
     // =========================================================================
-    // IF HardReset neuron — entirely in registers, no memory traffic
+    // LIF neuron — leaky integrate-and-fire with HardReset
     //
-    // v_state[i][j] : membrane potential (persists across T steps)
-    // packed_out[i][j]: output byte, bit t = spike at time step t
-    //
-    // HardReset: v = v_reset if spike else v  (branchless: v -= spike*(v-v_reset))
+    // t=0: v = (output_frag[0] + v_reset) * tau
+    // t>0: v += (output_frag[t] - (v - v_reset)) * tau
     // =========================================================================
     float   v_state[2][8];
     uint8_t packed_out[2][8];
@@ -277,8 +278,23 @@ void snn_conv2d_if_64x64_k16(
             packed_out[i][j] = 0;
         }
 
+    // t = 0
 #pragma unroll
-    for (int t = 0; t < T_STEPS; t++)
+    for (int i = 0; i < 2; i++)
+    {
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+        {
+            v_state[i][j] = (output_frag[0][i][j] + v_reset) * tau;
+            int spike = (v_state[i][j] >= v_th) ? 1 : 0;
+            packed_out[i][j] |= (uint8_t)spike;
+            v_state[i][j] -= (float)spike * (v_state[i][j] - v_reset);
+        }
+    }
+
+    // t > 0
+#pragma unroll
+    for (int t = 1; t < T_STEPS; t++)
     {
 #pragma unroll
         for (int i = 0; i < 2; i++)
@@ -286,10 +302,10 @@ void snn_conv2d_if_64x64_k16(
 #pragma unroll
             for (int j = 0; j < 8; j++)
             {
-                v_state[i][j] += output_frag[t][i][j];
+                v_state[i][j] +=
+                    (output_frag[t][i][j] - (v_state[i][j] - v_reset)) * tau;
                 int spike = (v_state[i][j] >= v_th) ? 1 : 0;
                 packed_out[i][j] |= (uint8_t)(spike << t);
-                // HardReset: v = v_reset if spike else v
                 v_state[i][j] -= (float)spike * (v_state[i][j] - v_reset);
             }
         }
@@ -361,7 +377,7 @@ void snn_conv2d_sn_launch(
     const uint8_t *d_inputs, const float *d_weights_padded,
     const float *d_bias, uint8_t *d_outputs,
     Conv2DParam &param, int out_ch_padded,
-    float v_th, float v_reset)
+    float v_th, float v_reset, float tau)
 {
     dim3 block(256);
     dim3 grid(
@@ -369,60 +385,114 @@ void snn_conv2d_sn_launch(
         ((int)param.out_ch + 63) / 64,
         1
     );
-    snn_conv2d_if_64x64_k16<T, Kh, Kw, Sh, Sw, Ph, Pw>
+    snn_conv2d_lif_64x64_k16<T, Kh, Kw, Sh, Sw, Ph, Pw>
         <<<grid, block>>>(d_inputs, d_weights_padded, d_bias, d_outputs,
-                          param, out_ch_padded, v_th, v_reset);
+                          param, out_ch_padded, v_th, v_reset, tau);
 }
 
 void snn_conv2d_sn_1x1_s1_launch(
     const uint8_t *d_in, const float *d_w, const float *d_bias, uint8_t *d_out,
-    Conv2DParam &param, int T, int out_ch_padded, float v_th, float v_reset)
+    Conv2DParam &param, int T, int out_ch_padded,
+    float v_th, float v_reset, float tau)
 {
-    switch (T) {
-        case 1: snn_conv2d_sn_launch<1,1,1,1,1,0,0>(d_in,d_w,d_bias,d_out,param,out_ch_padded,v_th,v_reset); break;
-        case 2: snn_conv2d_sn_launch<2,1,1,1,1,0,0>(d_in,d_w,d_bias,d_out,param,out_ch_padded,v_th,v_reset); break;
-        case 3: snn_conv2d_sn_launch<3,1,1,1,1,0,0>(d_in,d_w,d_bias,d_out,param,out_ch_padded,v_th,v_reset); break;
-        case 4: snn_conv2d_sn_launch<4,1,1,1,1,0,0>(d_in,d_w,d_bias,d_out,param,out_ch_padded,v_th,v_reset); break;
+    switch (T)
+    {
+        case 1:
+            snn_conv2d_sn_launch<1, 1, 1, 1, 1, 0, 0>(
+                d_in, d_w, d_bias, d_out, param, out_ch_padded,
+                v_th, v_reset, tau);
+            break;
+        case 2:
+            snn_conv2d_sn_launch<2, 1, 1, 1, 1, 0, 0>(
+                d_in, d_w, d_bias, d_out, param, out_ch_padded,
+                v_th, v_reset, tau);
+            break;
+        case 3:
+            snn_conv2d_sn_launch<3, 1, 1, 1, 1, 0, 0>(
+                d_in, d_w, d_bias, d_out, param, out_ch_padded,
+                v_th, v_reset, tau);
+            break;
+        case 4:
+            snn_conv2d_sn_launch<4, 1, 1, 1, 1, 0, 0>(
+                d_in, d_w, d_bias, d_out, param, out_ch_padded,
+                v_th, v_reset, tau);
+            break;
     }
 }
 
 void snn_conv2d_sn_3x3_s1_launch(
     const uint8_t *d_in, const float *d_w, const float *d_bias, uint8_t *d_out,
-    Conv2DParam &param, int T, int out_ch_padded, float v_th, float v_reset)
+    Conv2DParam &param, int T, int out_ch_padded,
+    float v_th, float v_reset, float tau)
 {
-    switch (T) {
-        case 1: snn_conv2d_sn_launch<1,3,3,1,1,1,1>(d_in,d_w,d_bias,d_out,param,out_ch_padded,v_th,v_reset); break;
-        case 2: snn_conv2d_sn_launch<2,3,3,1,1,1,1>(d_in,d_w,d_bias,d_out,param,out_ch_padded,v_th,v_reset); break;
-        case 3: snn_conv2d_sn_launch<3,3,3,1,1,1,1>(d_in,d_w,d_bias,d_out,param,out_ch_padded,v_th,v_reset); break;
-        case 4: snn_conv2d_sn_launch<4,3,3,1,1,1,1>(d_in,d_w,d_bias,d_out,param,out_ch_padded,v_th,v_reset); break;
+    switch (T)
+    {
+        case 1:
+            snn_conv2d_sn_launch<1, 3, 3, 1, 1, 1, 1>(
+                d_in, d_w, d_bias, d_out, param, out_ch_padded,
+                v_th, v_reset, tau);
+            break;
+        case 2:
+            snn_conv2d_sn_launch<2, 3, 3, 1, 1, 1, 1>(
+                d_in, d_w, d_bias, d_out, param, out_ch_padded,
+                v_th, v_reset, tau);
+            break;
+        case 3:
+            snn_conv2d_sn_launch<3, 3, 3, 1, 1, 1, 1>(
+                d_in, d_w, d_bias, d_out, param, out_ch_padded,
+                v_th, v_reset, tau);
+            break;
+        case 4:
+            snn_conv2d_sn_launch<4, 3, 3, 1, 1, 1, 1>(
+                d_in, d_w, d_bias, d_out, param, out_ch_padded,
+                v_th, v_reset, tau);
+            break;
     }
 }
 
 void snn_conv2d_sn_3x3_s2_launch(
     const uint8_t *d_in, const float *d_w, const float *d_bias, uint8_t *d_out,
-    Conv2DParam &param, int T, int out_ch_padded, float v_th, float v_reset)
+    Conv2DParam &param, int T, int out_ch_padded,
+    float v_th, float v_reset, float tau)
 {
-    switch (T) {
-        case 1: snn_conv2d_sn_launch<1,3,3,2,2,1,1>(d_in,d_w,d_bias,d_out,param,out_ch_padded,v_th,v_reset); break;
-        case 2: snn_conv2d_sn_launch<2,3,3,2,2,1,1>(d_in,d_w,d_bias,d_out,param,out_ch_padded,v_th,v_reset); break;
-        case 3: snn_conv2d_sn_launch<3,3,3,2,2,1,1>(d_in,d_w,d_bias,d_out,param,out_ch_padded,v_th,v_reset); break;
-        case 4: snn_conv2d_sn_launch<4,3,3,2,2,1,1>(d_in,d_w,d_bias,d_out,param,out_ch_padded,v_th,v_reset); break;
+    switch (T)
+    {
+        case 1:
+            snn_conv2d_sn_launch<1, 3, 3, 2, 2, 1, 1>(
+                d_in, d_w, d_bias, d_out, param, out_ch_padded,
+                v_th, v_reset, tau);
+            break;
+        case 2:
+            snn_conv2d_sn_launch<2, 3, 3, 2, 2, 1, 1>(
+                d_in, d_w, d_bias, d_out, param, out_ch_padded,
+                v_th, v_reset, tau);
+            break;
+        case 3:
+            snn_conv2d_sn_launch<3, 3, 3, 2, 2, 1, 1>(
+                d_in, d_w, d_bias, d_out, param, out_ch_padded,
+                v_th, v_reset, tau);
+            break;
+        case 4:
+            snn_conv2d_sn_launch<4, 3, 3, 2, 2, 1, 1>(
+                d_in, d_w, d_bias, d_out, param, out_ch_padded,
+                v_th, v_reset, tau);
+            break;
     }
 }
 
 
 // =============================================================================
-// CPU reference: conv + IF HardReset → packed uint8 spikes
+// CPU reference: conv + LIF HardReset → packed uint8 spikes
 // =============================================================================
 
 template <int Kh, int Kw, int Sh, int Sw, int Ph, int Pw>
-static void snn_conv2d_if_cpu_ref(
+static void snn_conv2d_lif_cpu_ref(
     const uint8_t *inputs,    // [C_in][H][W]       packed T spike bits
     const float   *weights,   // [K_feat][C_out]     (unpadded)
     const float   *bias,
     uint8_t       *outputs,   // [C_out][H_out*W_out] packed T spike bits
     int T, int C_in, int H, int W, int C_out,
-    float v_th, float v_reset)
+    float v_th, float v_reset, float tau)
 {
     constexpr int KhKw = Kh * Kw;
     int H_out = (H + 2 * Ph - Kh) / Sh + 1;
@@ -454,15 +524,23 @@ static void snn_conv2d_if_cpu_ref(
                             }
                     conv_t[t] = sum;
                 }
-                // Apply IF HardReset
-                float v = 0.f;
-                for (int t = 0; t < T; t++)
+                // Apply LIF HardReset.
+                float v = (conv_t[0] + v_reset) * tau;
+                int spike = (v >= v_th) ? 1 : 0;
+                if (spike)
                 {
-                    v += conv_t[t];
-                    int spike = (v >= v_th) ? 1 : 0;
+                    outputs[m * H_out * W_out + oh * W_out + ow] |= 1u;
+                    v = v_reset;
+                }
+
+                for (int t = 1; t < T; t++)
+                {
+                    v += (conv_t[t] - (v - v_reset)) * tau;
+                    spike = (v >= v_th) ? 1 : 0;
                     if (spike)
                     {
-                        outputs[m * H_out * W_out + oh * W_out + ow] |= (uint8_t)(1 << t);
+                        outputs[m * H_out * W_out + oh * W_out + ow] |=
+                            (uint8_t)(1 << t);
                         v = v_reset;
                     }
                 }
@@ -478,7 +556,8 @@ static void snn_conv2d_if_cpu_ref(
 
 template <int T, int Kh, int Kw, int Sh, int Sw, int Ph, int Pw>
 void snn_conv2d_sn_test(int C_in, int H, int W, int C_out,
-                         float v_th, float v_reset, const char *label)
+                         float v_th, float v_reset, float tau,
+                         const char *label)
 {
     constexpr int KhKw    = Kh * Kw;
     constexpr int K_CHUNK = 16;
@@ -489,8 +568,16 @@ void snn_conv2d_sn_test(int C_in, int H, int W, int C_out,
     int in_feat_padded = (in_features + K_CHUNK - 1) / K_CHUNK * K_CHUNK;
     int C_out_padded   = (C_out + 63) / 64 * 64;
 
-    printf("  [%s] T=%d C_in=%d H=%d C_out=%d -> H_out=%d v_th=%.1f v_reset=%.1f  ",
-           label, T, C_in, H, C_out, H_out, (double)v_th, (double)v_reset);
+    std::cout << "  [" << label << "]"
+              << " T=" << T
+              << " C_in=" << C_in
+              << " H=" << H
+              << " C_out=" << C_out
+              << " -> H_out=" << H_out
+              << " v_th=" << std::fixed << std::setprecision(2) << v_th
+              << " v_reset=" << v_reset
+              << " tau=" << tau
+              << "  ";
 
     size_t input_sz   = (size_t)C_in * H * W;
     size_t weight_sz  = (size_t)in_features * C_out;
@@ -542,19 +629,22 @@ void snn_conv2d_sn_test(int C_in, int H, int W, int C_out,
     param.Sh = Sh; param.Sw = Sw; param.Ph = Ph; param.Pw = Pw;
 
     snn_conv2d_sn_launch<T, Kh, Kw, Sh, Sw, Ph, Pw>(
-        d_inputs, d_weightsP, d_bias, d_outputs, param, C_out_padded, v_th, v_reset);
+        d_inputs, d_weightsP, d_bias, d_outputs, param, C_out_padded,
+        v_th, v_reset, tau);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess)
     {
-        printf("  CUDA error: %s\n", cudaGetErrorString(err));
+        std::cout << "[FAILED] CUDA error: "
+                  << cudaGetErrorString(err) << '\n';
         goto cleanup;
     }
     cudaDeviceSynchronize();
     cudaMemcpy(h_outputs, d_outputs, output_sz * sizeof(uint8_t), cudaMemcpyDeviceToHost);
 
-    snn_conv2d_if_cpu_ref<Kh, Kw, Sh, Sw, Ph, Pw>(
-        h_inputs, h_weights, h_bias, h_ref, T, C_in, H, W, C_out, v_th, v_reset);
+    snn_conv2d_lif_cpu_ref<Kh, Kw, Sh, Sw, Ph, Pw>(
+        h_inputs, h_weights, h_bias, h_ref, T, C_in, H, W, C_out,
+        v_th, v_reset, tau);
 
     {
         int errors = 0;
@@ -563,12 +653,19 @@ void snn_conv2d_sn_test(int C_in, int H, int W, int C_out,
             if (h_outputs[i] != h_ref[i])
             {
                 if (errors < 5)
-                    printf("  Err[%zu]: gpu=0x%02x cpu=0x%02x\n",
-                           i, h_outputs[i], h_ref[i]);
+                {
+                    std::cout << "\n    Err[" << i << "]: gpu=0x"
+                              << std::hex << std::setw(2) << std::setfill('0')
+                              << static_cast<int>(h_outputs[i])
+                              << " cpu=0x" << std::setw(2)
+                              << static_cast<int>(h_ref[i])
+                              << std::dec << std::setfill(' ');
+                }
                 errors++;
             }
         }
-        printf("  %s (%d errors)\n", errors == 0 ? "PASSED!" : "FAILED", errors);
+        std::cout << (errors == 0 ? "[SUCCESS]" : "[FAILED]")
+                  << " (" << errors << " errors)\n";
     }
 
 cleanup:
@@ -591,7 +688,7 @@ static float cuda_elapsed_ms(cudaEvent_t start, cudaEvent_t stop)
 
 template <int T, int Kh, int Kw, int Sh, int Sw, int Ph, int Pw>
 void snn_conv2d_sn_bench(int C_in, int H, int W, int C_out,
-                          float v_th, float v_reset,
+                          float v_th, float v_reset, float tau,
                           const char *label, int warmup = 5, int iters = 50)
 {
     constexpr int KhKw    = Kh * Kw;
@@ -635,9 +732,11 @@ void snn_conv2d_sn_bench(int C_in, int H, int W, int C_out,
     param.Kh = Kh; param.Kw = Kw; param.KhKw = KhKw;
     param.Sh = Sh; param.Sw = Sw; param.Ph = Ph; param.Pw = Pw;
 
-    auto run = [&]() {
+    auto run = [&]()
+    {
         snn_conv2d_sn_launch<T, Kh, Kw, Sh, Sw, Ph, Pw>(
-            d_inputs, d_weightsP, d_bias, d_outputs, param, C_out_padded, v_th, v_reset);
+            d_inputs, d_weightsP, d_bias, d_outputs, param, C_out_padded,
+            v_th, v_reset, tau);
     };
 
     for (int i = 0; i < warmup; i++) run();
@@ -661,12 +760,20 @@ void snn_conv2d_sn_bench(int C_in, int H, int W, int C_out,
                       + (double)output_sz * sizeof(uint8_t);  // 1B per output, not 4B*T
     double bw = gmem_bytes / (t_fused * 1e-3) / 1e9;
 
-    printf("  %-30s T=%d K=%dx%d s=%d  in=%d->%-4d C_out=%-4d"
-           "  fused: %6.3f ms  %7.1f GFLOPS  %5.1f GB/s"
-           "  (output: %zu B vs %.0f B float[T])\n",
-           label, T, Kh, Kw, Sh, in_features, in_feat_padded, C_out,
-           t_fused, gflops, bw,
-           output_sz, (double)output_sz * T * sizeof(float));
+    std::cout << "  " << std::left << std::setw(30) << label
+              << std::right
+              << " T=" << T
+              << " K=" << Kh << 'x' << Kw
+              << " s=" << Sh
+              << " in=" << in_features << "->" << in_feat_padded
+              << " C_out=" << C_out
+              << " fused: " << std::fixed << std::setprecision(3)
+              << t_fused << " ms"
+              << "  " << std::setprecision(1) << gflops << " GFLOPS"
+              << "  " << bw << " GB/s"
+              << "  (output: " << output_sz << " B vs "
+              << static_cast<double>(output_sz) * T * sizeof(float)
+              << " B float[T])\n";
 
     cudaFree(d_inputs); cudaFree(d_weightsP); cudaFree(d_bias); cudaFree(d_outputs);
     cudaEventDestroy(ev_start); cudaEventDestroy(ev_stop);
@@ -676,54 +783,56 @@ int main()
 {
     const float V_TH    = 1.0f;
     const float V_RESET = 0.0f;
+    const float TAU     = 0.5f;
 
-    printf("\n=== snn_conv2d_if_64x64_k16 correctness tests ===\n");
+    std::cout << "\n=== snn_conv2d_lif_64x64_k16 correctness tests ===\n";
 
-    printf("\n--- 1x1, s=1, p=0 ---\n");
-    snn_conv2d_sn_test<4, 1,1,1,1,0,0>( 64,  80, 80,  64, V_TH, V_RESET, "base");
-    snn_conv2d_sn_test<4, 1,1,1,1,0,0>(128,  40, 40, 128, V_TH, V_RESET, "C128");
-    snn_conv2d_sn_test<2, 1,1,1,1,0,0>( 64,  80, 80,  48, V_TH, V_RESET, "C_out boundary");
-    snn_conv2d_sn_test<1, 1,1,1,1,0,0>( 64,  80, 80,  64, V_TH, V_RESET, "T=1");
-    snn_conv2d_sn_test<4, 1,1,1,1,0,0>( 64,  40, 40, 128, V_TH, V_RESET, "expand x2");
-    snn_conv2d_sn_test<4, 1,1,1,1,0,0>(128,  40, 40,  64, V_TH, V_RESET, "squeeze x0.5");
+    std::cout << "\n--- 1x1, s=1, p=0 ---\n";
+    snn_conv2d_sn_test<4, 1,1,1,1,0,0>( 64,  80, 80,  64, V_TH, V_RESET, TAU, "base");
+    snn_conv2d_sn_test<4, 1,1,1,1,0,0>(128,  40, 40, 128, V_TH, V_RESET, TAU, "C128");
+    snn_conv2d_sn_test<2, 1,1,1,1,0,0>( 64,  80, 80,  48, V_TH, V_RESET, TAU, "C_out boundary");
+    snn_conv2d_sn_test<1, 1,1,1,1,0,0>( 64,  80, 80,  64, V_TH, V_RESET, TAU, "T=1");
+    snn_conv2d_sn_test<4, 1,1,1,1,0,0>( 64,  40, 40, 128, V_TH, V_RESET, TAU, "expand x2");
+    snn_conv2d_sn_test<4, 1,1,1,1,0,0>(128,  40, 40,  64, V_TH, V_RESET, TAU, "squeeze x0.5");
 
-    printf("\n--- 3x3, s=1, p=1 ---\n");
-    snn_conv2d_sn_test<4, 3,3,1,1,1,1>( 64,  80, 80,  64, V_TH, V_RESET, "base");
-    snn_conv2d_sn_test<4, 3,3,1,1,1,1>( 32,  40, 40,  32, V_TH, V_RESET, "small");
-    snn_conv2d_sn_test<2, 3,3,1,1,1,1>( 32,  43, 43,  48, V_TH, V_RESET, "boundary");
-    snn_conv2d_sn_test<1, 3,3,1,1,1,1>( 64,  80, 80,  64, V_TH, V_RESET, "T=1");
-    snn_conv2d_sn_test<3, 3,3,1,1,1,1>( 64,  80, 80,  64, V_TH, V_RESET, "T=3");
+    std::cout << "\n--- 3x3, s=1, p=1 ---\n";
+    snn_conv2d_sn_test<4, 3,3,1,1,1,1>( 64,  80, 80,  64, V_TH, V_RESET, TAU, "base");
+    snn_conv2d_sn_test<4, 3,3,1,1,1,1>( 32,  40, 40,  32, V_TH, V_RESET, TAU, "small");
+    snn_conv2d_sn_test<2, 3,3,1,1,1,1>( 32,  43, 43,  48, V_TH, V_RESET, TAU, "boundary");
+    snn_conv2d_sn_test<1, 3,3,1,1,1,1>( 64,  80, 80,  64, V_TH, V_RESET, TAU, "T=1");
+    snn_conv2d_sn_test<3, 3,3,1,1,1,1>( 64,  80, 80,  64, V_TH, V_RESET, TAU, "T=3");
 
-    printf("\n--- 3x3, s=2, p=1 ---\n");
-    snn_conv2d_sn_test<4, 3,3,2,2,1,1>( 64,  80, 80,  64, V_TH, V_RESET, "H_out=40");
-    snn_conv2d_sn_test<4, 3,3,2,2,1,1>( 32,  80, 80,  64, V_TH, V_RESET, "C expand");
-    snn_conv2d_sn_test<4, 3,3,2,2,1,1>( 16,  40, 40,  32, V_TH, V_RESET, "small H=40");
-    snn_conv2d_sn_test<2, 3,3,2,2,1,1>( 32,  43, 43, 128, V_TH, V_RESET, "boundary");
+    std::cout << "\n--- 3x3, s=2, p=1 ---\n";
+    snn_conv2d_sn_test<4, 3,3,2,2,1,1>( 64,  80, 80,  64, V_TH, V_RESET, TAU, "H_out=40");
+    snn_conv2d_sn_test<4, 3,3,2,2,1,1>( 32,  80, 80,  64, V_TH, V_RESET, TAU, "C expand");
+    snn_conv2d_sn_test<4, 3,3,2,2,1,1>( 16,  40, 40,  32, V_TH, V_RESET, TAU, "small H=40");
+    snn_conv2d_sn_test<2, 3,3,2,2,1,1>( 32,  43, 43, 128, V_TH, V_RESET, TAU, "boundary");
 
     // Test non-zero v_reset
-    printf("\n--- v_reset != 0 ---\n");
-    snn_conv2d_sn_test<4, 3,3,1,1,1,1>( 64,  40, 40,  64, 1.0f, -0.1f, "v_reset=-0.1");
-    snn_conv2d_sn_test<4, 1,1,1,1,0,0>( 64,  40, 40,  64, 0.5f,  0.0f, "v_th=0.5");
+    std::cout << "\n--- v_reset != 0 ---\n";
+    snn_conv2d_sn_test<4, 3,3,1,1,1,1>( 64,  40, 40,  64, 1.0f, -0.1f, TAU, "v_reset=-0.1");
+    snn_conv2d_sn_test<4, 1,1,1,1,0,0>( 64,  40, 40,  64, 0.5f,  0.0f, 0.25f, "tau=0.25");
 
-    printf("\n=== snn_conv2d_if_64x64_k16 benchmark ===\n");
-    printf("  (fused conv+IF; output is uint8[C_out][H*W] packed T-bit spikes)\n\n");
+    std::cout << "\n=== snn_conv2d_lif_64x64_k16 benchmark ===\n"
+              << "  (fused conv+LIF; output is uint8[C_out][H*W] "
+              << "packed T-bit spikes)\n\n";
 
     // 1x1
-    snn_conv2d_sn_bench< 4, 1,1,1,1,0,0>( 64,  80, 80,  64, V_TH, V_RESET, "1x1 C64 H80");
-    snn_conv2d_sn_bench< 4, 1,1,1,1,0,0>(128,  40, 40, 128, V_TH, V_RESET, "1x1 C128 H40");
-    snn_conv2d_sn_bench< 4, 1,1,1,1,0,0>(256,  20, 20, 128, V_TH, V_RESET, "1x1 C256->128 H20");
+    snn_conv2d_sn_bench< 4, 1,1,1,1,0,0>( 64,  80, 80,  64, V_TH, V_RESET, TAU, "1x1 C64 H80");
+    snn_conv2d_sn_bench< 4, 1,1,1,1,0,0>(128,  40, 40, 128, V_TH, V_RESET, TAU, "1x1 C128 H40");
+    snn_conv2d_sn_bench< 4, 1,1,1,1,0,0>(256,  20, 20, 128, V_TH, V_RESET, TAU, "1x1 C256->128 H20");
     // 3x3 s=1
-    snn_conv2d_sn_bench< 4, 3,3,1,1,1,1>( 64,  80, 80,  64, V_TH, V_RESET, "3x3s1 C64 H80");
-    snn_conv2d_sn_bench< 4, 3,3,1,1,1,1>( 64,  40, 40,  64, V_TH, V_RESET, "3x3s1 C64 H40");
-    snn_conv2d_sn_bench< 4, 3,3,1,1,1,1>(128,  20, 20, 128, V_TH, V_RESET, "3x3s1 C128 H20");
+    snn_conv2d_sn_bench< 4, 3,3,1,1,1,1>( 64,  80, 80,  64, V_TH, V_RESET, TAU, "3x3s1 C64 H80");
+    snn_conv2d_sn_bench< 4, 3,3,1,1,1,1>( 64,  40, 40,  64, V_TH, V_RESET, TAU, "3x3s1 C64 H40");
+    snn_conv2d_sn_bench< 4, 3,3,1,1,1,1>(128,  20, 20, 128, V_TH, V_RESET, TAU, "3x3s1 C128 H20");
     // 3x3 s=2
-    snn_conv2d_sn_bench< 4, 3,3,2,2,1,1>( 64,  80, 80,  64, V_TH, V_RESET, "3x3s2 C64 H80->40");
-    snn_conv2d_sn_bench< 4, 3,3,2,2,1,1>( 32,  80, 80,  64, V_TH, V_RESET, "3x3s2 C32->64 H80");
+    snn_conv2d_sn_bench< 4, 3,3,2,2,1,1>( 64,  80, 80,  64, V_TH, V_RESET, TAU, "3x3s2 C64 H80->40");
+    snn_conv2d_sn_bench< 4, 3,3,2,2,1,1>( 32,  80, 80,  64, V_TH, V_RESET, TAU, "3x3s2 C32->64 H80");
     // T=1,2
-    snn_conv2d_sn_bench< 1, 3,3,1,1,1,1>( 64,  80, 80,  64, V_TH, V_RESET, "T=1 3x3s1 C64 H80");
-    snn_conv2d_sn_bench< 2, 3,3,1,1,1,1>( 64,  80, 80,  64, V_TH, V_RESET, "T=2 3x3s1 C64 H80");
-    snn_conv2d_sn_bench< 2, 1,1,1,1,0,0>(128,  40, 40, 128, V_TH, V_RESET, "T=2 1x1 C128 H40");
+    snn_conv2d_sn_bench< 1, 3,3,1,1,1,1>( 64,  80, 80,  64, V_TH, V_RESET, TAU, "T=1 3x3s1 C64 H80");
+    snn_conv2d_sn_bench< 2, 3,3,1,1,1,1>( 64,  80, 80,  64, V_TH, V_RESET, TAU, "T=2 3x3s1 C64 H80");
+    snn_conv2d_sn_bench< 2, 1,1,1,1,0,0>(128,  40, 40, 128, V_TH, V_RESET, TAU, "T=2 1x1 C128 H40");
 
-    printf("\n=== Done ===\n");
+    std::cout << "\n=== Done ===\n";
     return 0;
 }
