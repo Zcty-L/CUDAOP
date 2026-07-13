@@ -779,6 +779,7 @@ void snn_conv2d_sn_bench(int C_in, int H, int W, int C_out,
     cudaEventDestroy(ev_start); cudaEventDestroy(ev_stop);
 }
 
+#ifndef CONV2D_SN_K64_U8_BENCH_INC
 int main()
 {
     const float V_TH    = 1.0f;
@@ -836,3 +837,4 @@ int main()
     std::cout << "\n=== Done ===\n";
     return 0;
 }
+#endif
