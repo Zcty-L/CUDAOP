@@ -1,19 +1,19 @@
 ---
-name: opt_kernel
+name: opt-kernel
 description: >-
   分析并迭代优化 CUDAOP 的 .cu 文件中用户指定的 CUDA kernel，完成目标定位、环境检查、基线冻结、瓶颈定位、
-  单变量实验、正确性与性能验证及报告交付。用于 /opt_kernel、CUDA kernel 性能分析、kernel 调优、
+  单变量实验、正确性与性能验证及报告交付。用于 $opt-kernel、CUDA kernel 性能分析、kernel 调优、
   Nsight Compute 分析或要求优化 op/{name} 下 CUDA 算子的任务。
 ---
 
-# /opt_kernel - CUDA Kernel 优化工作流
+# opt-kernel - CUDA Kernel 优化工作流
 
 按“检查、基线、分析、规划、实验、验证、交付”的顺序执行。不得跳过基线正确性验证，也不得用未经测量的经验判断代替性能数据。
 
 ## 用法
 
 ```text
-/opt_kernel <kernel文件路径> --kernel=<kernel名称> [--line=<定义行号>] [--arch=sm_xx] [--target=<cmake目标>]
+$opt-kernel <kernel文件路径> --kernel=<kernel名称> [--line=<定义行号>] [--arch=sm_xx] [--target=<cmake目标>]
 ```
 - `kernel文件路径`：必填，包含目标 kernel 的 `.cu` 文件。
 - `--kernel=<kernel名称>`：必填，待优化的 kernel 名称。
