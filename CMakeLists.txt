@@ -116,6 +116,7 @@ set(OP_SOURCES
     "op/dwconv/dwconv_spike_k128.cu"
     "op/dwconv/dwconv_spike_k128_fp16.cu"
     "op/dwconv/opt_conv2d_groups_fp32.cu"
+    "op/dwconv/opt_conv2d_groups_fp16.cu"
     "op/resize/resize_u8.cu"
     "op/mul/mul_u8.cu"
     "op/linear/linear_k128.cu"
