@@ -6,6 +6,10 @@ __pycache__/
 *.jpg
 *.csv
 
+# Versioned DWConv optimization summary data and figures.
+!docs/opt_kernel/opt_dwconv/summary/*.png
+!docs/opt_kernel/opt_dwconv/summary/*.csv
+
 *.so
 *.egg-info/
 
