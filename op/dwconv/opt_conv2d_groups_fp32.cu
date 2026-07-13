@@ -3,9 +3,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <random>
+#include <string>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -1094,8 +1096,121 @@ static int run_profile(
     return 0;
 }
 
+static int run_sweep(const char *csv_path)
+{
+    constexpr int warmup = 20;
+    constexpr int iterations = 100;
+    const int kernel_sizes[] = {3, 5, 7, 9, 11};
+    const int batches[] = {1, 2, 4, 8, 16, 32};
+    const int channels[] = {32, 64, 128, 256};
+    const int heights[] = {40, 80, 160};
+
+    std::ofstream csv(csv_path);
+    if (!csv.is_open())
+    {
+        std::cout << "[ERROR] failed to open csv: "
+                  << csv_path << std::endl;
+        return EXIT_FAILURE;
+    }
+    csv << "k_size,n,c,h,kernel,time_ms,gflops,arith_intensity"
+        << std::endl;
+
+    std::cout << "[CONFIG] sweep target=skill_final_fp32"
+              << " csv=" << csv_path
+              << " warmup=" << warmup
+              << " iterations=" << iterations
+              << std::endl;
+    int result_count = 0;
+    for (int r : kernel_sizes)
+    {
+        for (int n : batches)
+        {
+            for (int c : channels)
+            {
+                for (int h : heights)
+                {
+                    CaseConfig config {
+                        "sweep", r, n, c, h, h, 2, 1
+                    };
+                    Conv2DParam param = make_param(config);
+                    size_t input_count = static_cast<size_t>(n)
+                        * param.inBatchNumel;
+                    size_t weight_count = static_cast<size_t>(c)
+                        * param.KhKw;
+                    size_t output_count = static_cast<size_t>(n)
+                        * param.outBatchNumel;
+
+                    float *input = nullptr;
+                    float *weight = nullptr;
+                    float *bias = nullptr;
+                    float *output = nullptr;
+                    CUDA_CHECK(cudaMalloc(
+                        &input, input_count * sizeof(float)));
+                    CUDA_CHECK(cudaMalloc(
+                        &weight, weight_count * sizeof(float)));
+                    CUDA_CHECK(cudaMalloc(&bias, c * sizeof(float)));
+                    CUDA_CHECK(cudaMalloc(
+                        &output, output_count * sizeof(float)));
+                    CUDA_CHECK(cudaMemset(
+                        input, 0, input_count * sizeof(float)));
+                    CUDA_CHECK(cudaMemset(
+                        weight, 0, weight_count * sizeof(float)));
+                    CUDA_CHECK(cudaMemset(bias, 0, c * sizeof(float)));
+
+                    auto launch = [&]()
+                    {
+                        launch_target(
+                            input,
+                            weight,
+                            bias,
+                            output,
+                            param,
+                            n);
+                    };
+                    for (int index = 0; index < warmup; ++index)
+                    {
+                        launch();
+                    }
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                    float time_ms = measure_elapsed_ms(
+                        launch, iterations) / iterations;
+
+                    double flops = static_cast<double>(output_count)
+                        * r * r * 2.0 / 1.0e9;
+                    double total_bytes = static_cast<double>(
+                        input_count + output_count + weight_count + c)
+                        * sizeof(float);
+                    double arithmetic_intensity =
+                        flops * 1.0e9 / total_bytes;
+                    double gflops = flops / (time_ms / 1000.0);
+                    csv << r << "," << n << "," << c << "," << h
+                        << ",skill_final," << std::fixed
+                        << std::setprecision(6) << time_ms
+                        << "," << gflops
+                        << "," << arithmetic_intensity
+                        << std::endl;
+
+                    CUDA_CHECK(cudaFree(output));
+                    CUDA_CHECK(cudaFree(bias));
+                    CUDA_CHECK(cudaFree(weight));
+                    CUDA_CHECK(cudaFree(input));
+                    ++result_count;
+                }
+            }
+        }
+    }
+    csv.close();
+    std::cout << "[SUCCESS] sweep results=" << result_count
+              << std::endl;
+    return EXIT_SUCCESS;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 3 && std::strcmp(argv[1], "--sweep-csv") == 0)
+    {
+        return run_sweep(argv[2]);
+    }
     bool profile = argc > 1
         && std::strcmp(argv[1], "--profile") == 0;
     bool profile_target = argc > 1
