@@ -30,12 +30,9 @@
 # 规则
 
 ## 代码编写规定
-- 禁止使用 **printf**, **print**, 统一使用 **std::cout**, 输出要考虑对齐
+- 禁止使用 **printf**, **print**, 统一使用 **std::cout** (C++ 要求)。输出要考虑对齐
 - **{ }** 的使用需要换行
 - 较长的代码行需要换行，**禁止**编写很长的代码行
-- 不引用已弃用的 `op/cuda_utils.cuh`。
-- 参数结构体放在 `op/config.h`。
-- PTX 指令统一放在 `op/ptx_utils.cuh`，并注明指令名称、来源链接和用途。
 
 
 ## 编译代码规则
@@ -58,6 +55,8 @@
 
 
 ## Git 规范
+- 修改代码前必须执行 `git status --short --branch` 检查当前分支
+- 禁止在 `main` 分支修改文件；如果当前分支是 `main`，立即停止并提醒用户先切换或创建分支
 - Commit 前缀: `feat:`, `fix:`, `perf:`, `refactor:`, `docs:`, `chore:`
 - 分支命名: `feat/{op_name}`, `fix/{描述}`
 
