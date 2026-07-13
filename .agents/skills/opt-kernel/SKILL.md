@@ -12,18 +12,10 @@ description: >-
 
 ## 用法
 
-```text
-$opt-kernel <kernel文件路径> --kernel=<kernel名称> [--line=<定义行号>] [--arch=sm_xx] [--target=<cmake目标>]
-```
-- `kernel文件路径`：必填，包含目标 kernel 的 `.cu` 文件。
-- `--kernel=<kernel名称>`：必填，待优化的 kernel 名称。
-- `--line=<定义行号>`：推荐，用于区分重载、模板、宏生成或同名定义。
-- `--arch=sm_xx`：可选，显式指定目标计算能力。
-- `--target=<cmake目标>`：可选，显式指定 CMake target；默认使用文件名去掉 `.cu`。
+直接使用自然语言描述优化目标，例如：
 
-也接受自然语言目标描述，例如：
 ```text
-需要优化的 kernel 位于 op/dwconv/example.cu:128，kernel name 为 dwconv_forward_kernel。
+$opt-kernel 优化 op/dwconv/example.cu:128 的 dwconv_forward_kernel。
 ```
 能够根据输入定位唯一目标 kernel 的 launch site、launch wrapper 和模板实例化，包括输入、输出、数据类型、布局、形状范围和数值语义，
 如果用户没有提供足够的定位信息，先列出文件中的候选 kernel 名称与定义行号，请用户指定目标，不得自行选择。找不到唯一匹配时输出 `[BLOCKED]`。

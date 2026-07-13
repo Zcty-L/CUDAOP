@@ -67,7 +67,7 @@
 ## `$opt-kernel` — CUDA Kernel 优化工作流
 
 > 用于分析和优化 CUDA kernel 性能的标准化流程。
-> 调用方式：`$opt-kernel <kernel文件路径> [可选参数]`
+> 调用方式：`$opt-kernel 优化 op/dwconv/example.cu:128 的 dwconv_forward_kernel。`
 
 ### 各阶段说明
 
