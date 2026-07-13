@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -1249,8 +1250,141 @@ static bool run_case(
     return correct;
 }
 
+static int run_sweep(const char *csv_path)
+{
+    constexpr int warmup = 20;
+    constexpr int iterations = 100;
+    const int kernel_sizes[] = {3, 5, 7, 9, 11};
+    const int batches[] = {1, 2, 4, 8, 16, 32};
+    const int channels[] = {32, 64, 128, 256};
+    const int heights[] = {40, 80, 160};
+
+    std::ofstream csv(csv_path);
+    if (!csv.is_open())
+    {
+        std::cout << "[ERROR] failed to open csv: "
+                  << csv_path << std::endl;
+        return EXIT_FAILURE;
+    }
+    csv << "k_size,n,c,h,kernel,time_ms,gflops,arith_intensity"
+        << std::endl;
+
+    std::cout << "[CONFIG] sweep target=skill_final_fp16"
+              << " csv=" << csv_path
+              << " warmup=" << warmup
+              << " iterations=" << iterations
+              << std::endl;
+    int result_count = 0;
+    for (int r : kernel_sizes)
+    {
+        for (int n : batches)
+        {
+            for (int c : channels)
+            {
+                for (int h : heights)
+                {
+                    Conv2DParam param = make_param(
+                        c, h, h, r, 2, r / 2);
+                    size_t input_count = static_cast<size_t>(n)
+                        * param.inBatchNumel;
+                    size_t packed_weight_count =
+                        static_cast<size_t>(c / 2) * param.KhKw;
+                    size_t output_count = static_cast<size_t>(n)
+                        * param.outBatchNumel;
+
+                    __half *input = nullptr;
+                    __half2 *packed_weight = nullptr;
+                    __half *bias = nullptr;
+                    __half *output = nullptr;
+                    CUDA_CHECK(cudaMalloc(
+                        &input, input_count * sizeof(__half)));
+                    CUDA_CHECK(cudaMalloc(
+                        &packed_weight,
+                        packed_weight_count * sizeof(__half2)));
+                    CUDA_CHECK(cudaMalloc(&bias, c * sizeof(__half)));
+                    CUDA_CHECK(cudaMalloc(
+                        &output, output_count * sizeof(__half)));
+                    CUDA_CHECK(cudaMemset(
+                        input, 0, input_count * sizeof(__half)));
+                    CUDA_CHECK(cudaMemset(
+                        packed_weight,
+                        0,
+                        packed_weight_count * sizeof(__half2)));
+                    CUDA_CHECK(cudaMemset(bias, 0, c * sizeof(__half)));
+
+                    auto launch = [&]()
+                    {
+                        launch_baseline(
+                            input,
+                            packed_weight,
+                            bias,
+                            output,
+                            param,
+                            n);
+                    };
+                    for (int index = 0; index < warmup; ++index)
+                    {
+                        launch();
+                    }
+                    CUDA_CHECK(cudaDeviceSynchronize());
+
+                    cudaEvent_t start;
+                    cudaEvent_t stop;
+                    CUDA_CHECK(cudaEventCreate(&start));
+                    CUDA_CHECK(cudaEventCreate(&stop));
+                    CUDA_CHECK(cudaEventRecord(start));
+                    for (int index = 0; index < iterations; ++index)
+                    {
+                        launch();
+                    }
+                    CUDA_CHECK(cudaGetLastError());
+                    CUDA_CHECK(cudaEventRecord(stop));
+                    CUDA_CHECK(cudaEventSynchronize(stop));
+                    float elapsed_ms = 0.0f;
+                    CUDA_CHECK(cudaEventElapsedTime(
+                        &elapsed_ms, start, stop));
+                    CUDA_CHECK(cudaEventDestroy(start));
+                    CUDA_CHECK(cudaEventDestroy(stop));
+                    float time_ms = elapsed_ms / iterations;
+
+                    double flops = static_cast<double>(output_count)
+                        * r * r * 2.0 / 1.0e9;
+                    size_t weight_count = static_cast<size_t>(c)
+                        * param.KhKw;
+                    double total_bytes = static_cast<double>(
+                        input_count + output_count + weight_count + c)
+                        * sizeof(__half);
+                    double arithmetic_intensity =
+                        flops * 1.0e9 / total_bytes;
+                    double gflops = flops / (time_ms / 1000.0);
+                    csv << r << "," << n << "," << c << "," << h
+                        << ",skill_final," << std::fixed
+                        << std::setprecision(6) << time_ms
+                        << "," << gflops
+                        << "," << arithmetic_intensity
+                        << std::endl;
+
+                    CUDA_CHECK(cudaFree(output));
+                    CUDA_CHECK(cudaFree(bias));
+                    CUDA_CHECK(cudaFree(packed_weight));
+                    CUDA_CHECK(cudaFree(input));
+                    ++result_count;
+                }
+            }
+        }
+    }
+    csv.close();
+    std::cout << "[SUCCESS] sweep results=" << result_count
+              << std::endl;
+    return EXIT_SUCCESS;
+}
+
 int main(int argc, char *argv[])
 {
+    if (argc == 3 && std::strcmp(argv[1], "--sweep-csv") == 0)
+    {
+        return run_sweep(argv[2]);
+    }
     const CaseConfig cases[] = {
         {"throughput", 7, 64, 128, 80, 80, 2, 4},
         {"main", 7, 4, 128, 80, 80, 2, 64},
