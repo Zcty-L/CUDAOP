@@ -27,7 +27,14 @@
 
 ### 检查环境和 GPU
 
-先查询 GPU 名称、compute capability、利用率和显存占用。使用 benchmark 实际运行的 device；多 GPU 或多架构环境不得默认选择。记录：
+先查询 GPU 名称、compute capability、利用率和显存占用，再用实际 device 的原生 SM 构建并运行 `device_query`：
+```bash
+nvidia-smi --query-gpu=index,name,compute_cap,utilization.gpu,utilization.memory --format=csv
+cmake -S . -B build -DCUDAOP_CUDA_ARCHITECTURES=<目标SM>
+cmake --build build --target device_query -j
+./build/device_query
+```
+使用 benchmark 实际运行的 device；多 GPU 或多架构环境不得默认选择。记录：
 - GPU、SM、驱动、CUDA Toolkit/runtime 和后端版本；
 - Shared Memory/SM、寄存器/SM、occupancy 上限和适用 dtype 的 ridge point；
 - GPU 是否为 Laptop、Max-Q 或其他动态频率明显的设备；

@@ -9,7 +9,6 @@
 rg -n "__global__|<kernel名称>" <kernel文件>
 rg -n "cuda_utils\\.cuh|printf\\s*\\(" <kernel文件>
 rg -n "<源文件名>|<cmake目标>" CMakeLists.txt
-nvidia-smi --query-gpu=index,name,compute_cap,utilization.gpu,utilization.memory --format=csv
 ```
 新代码禁止引用已弃用的 `op/cuda_utils.cuh`。新增或读取 PTX 指令统一通过 `op/ptx_utils.cuh`，新增指令需注明名称、来源和用途。
 
@@ -17,9 +16,6 @@ nvidia-smi --query-gpu=index,name,compute_cap,utilization.gpu,utilization.memory
 
 使用实际 device 的原生 SM 通过 CMake 构建：
 ```bash
-cmake -S . -B build -DCUDAOP_CUDA_ARCHITECTURES=<目标SM>
-cmake --build build --target device_query -j
-./build/device_query
 cmake --build build --target <cmake目标> -j
 ```
 最终验证必须通过 CMake 目标。保留 `--ptxas-options=-v`，记录每条 kernel 路径的 registers/thread、static/dynamic shared memory 和 spill stores/loads。构建失败时不得进入实验。
