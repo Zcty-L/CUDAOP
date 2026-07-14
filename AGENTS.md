@@ -63,10 +63,11 @@
 
 # 可用 Skill
 
-## `$opt-kernel` — CUDA Kernel 优化工作流
+## `$opt-kernel` — GPU Kernel 优化工作流
 
-> 用于分析和优化 CUDA kernel 性能的标准化流程。
+> 用于分析和优化 CUDA C++、Triton 或 cuTile kernel 性能的标准化流程。
 > 调用方式：`$opt-kernel 优化 op/dwconv/example.cu:128 的 dwconv_forward_kernel。`
+> Python 后端示例：`$opt-kernel 优化 op/grouped_gemm/grouped_gemm.py 中的 Triton fused kernel。`
 
 ### 各阶段说明
 

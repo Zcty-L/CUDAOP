@@ -1,66 +1,67 @@
-# CUDA Kernel 优化报告模板
+# GPU Kernel 优化报告模板
 
 ```markdown
 # <kernel_name> 优化报告
 
 ## 结论
 - 状态：
+- 后端与最终实现：
 - 主要结果：
 - 适用范围：
 - 关联历史报告：
 
 ## 最终实现与 Dispatch
-| 条件 | 实现 | 关键改动 | Fallback |
-|------|------|----------|----------|
+| 条件 | 后端/实现 | 关键改动 | Fallback |
+|------|-----------|----------|----------|
 
 ## 最终性能
-| 配置 | Baseline group medians | Final group medians | Speedup | Final spread | Reference |
-|------|------------------------|---------------------|--------:|-------------:|----------:|
+| 配置/计时范围 | Baseline group medians | Final group medians | Speedup | Final spread | Reference |
+|---------------|------------------------|---------------------|--------:|-------------:|----------:|
 
 ## 正确性与安全检查
-- 正确性：
-- compute-sanitizer：
+- 输出正确性：
+- 梯度正确性：
 - 边界路径：
+- sanitizer/后端安全工具：
 
 ## 环境与测试
 - 日期 / GPU / SM：
+- 后端 / Python / 编译器：
 - CUDA / Driver / NCU：
-- 源文件 / kernel / CMake target：
-- 数据类型 / 输入范围 / 容差：
+- Conda 环境 / CMake target / 测试入口：
+- 源文件 / kernel：
+- dtype / 输入范围 / 容差：
 - warmup / samples / groups：
+- JIT / cache / Autotune 策略：
+- 计时边界：
 
-## 资源与关键性能证据
-| 路径 | Registers | Shared memory | Spill | Baseline / Final NCU | 关键指标 |
-|------|----------:|--------------:|------:|----------------------|----------|
+## 构建、JIT 与资源
+| 路径 | 构建/JIT 参数 | Registers | Shared memory | Spill | 生成代码证据 |
+|------|--------------|----------:|--------------:|------:|--------------|
 
-## NCU Baseline / KEEP 概览
-只保留 Baseline 和实际接受的 KEEP；不记录 REVERT 或 CRASH。每个 KEEP 增加一行，最后一个 KEEP 标记为 Final。所有行必须使用相同 GPU、输入、NCU section、时钟策略和 kernel launch 位置重新采集。
+## Profiler Baseline / Final 概览
+只保留 Baseline 和实际接受的 KEEP。所有行使用相同 GPU、输入、section、时钟策略、cache/JIT 状态和 launch 位置。
 
-| 版本 | Commit | NCU Duration ms | SM Frequency GHz | DRAM Frequency GHz | Compute (SM) % | Memory Throughput % (composite) | DRAM % | L2 % | L1/TEX % | Achieved Occupancy % | Active Warps/SM |
-|------|:------:|----------------:|-----------------:|-------------------:|---------------:|---------:|-------:|-----:|---------:|---------------------:|----------------:|
+| 版本 | Commit | Duration | SM GHz | DRAM GHz | Compute % | Memory composite % | DRAM % | L2 % | L1/TEX % | Occupancy % | Active Warps/SM |
+|------|:------:|---------:|-------:|---------:|----------:|-------------------:|-------:|-----:|---------:|------------:|----------------:|
 | Baseline |  |  |  |  |  |  |  |  |  |  |  |
 | KEEP / Final |  |  |  |  |  |  |  |  |  |  |  |
 
-表中百分比统一使用 NCU 相对 `peak_sustained` 的结果。`Memory Throughput` 是 NCU 复合吞吐指标，不得解释为 DRAM 带宽利用率；DRAM、L2 和 L1/TEX 必须分别记录。
-NCU Duration 只用于同条件 profile 对比，最终 latency 仍以 CUDA Event 为准。若存在多条 KEEP dispatch 路径，为每条路径分别建表。
+百分比统一使用 profiler 对应性能模型的定义。NCU `Memory Throughput` 是复合指标，不得解释为 DRAM 带宽利用率。Profiler duration 只用于同条件分析，最终 latency 使用 benchmark 结果。
 
-## NCU 定向证据（按需）
-只添加支撑关键假设和 KEEP 决策的指标，并为 Baseline 与 KEEP 使用完全相同的 metric 集重新采集。删除不相关的示例行，不用大量 `N/A` 填充。
+## 定向证据（按需）
+| 指标 | 单位 | Baseline | Final | 变化 | 判断 |
+|------|------|---------:|------:|-----:|------|
 
-| 指标 | 单位 | Baseline | KEEP / Final | 变化 | 支撑的判断 |
-|------|------|---------:|-------------:|-----:|------------|
-| Eligible Warps Per Scheduler | warp |  |  |  | 延迟隐藏能力 |
-| One or More Eligible | % |  |  |  | 调度器可发射程度 |
-| 主要 Warp Stall Reason | % |  |  |  | 主要等待来源 |
-| 关键执行 pipe 利用率 | % peak_sustained |  |  |  | 计算管线变化 |
-| L2 Hit Rate | % |  |  |  | cache 复用变化 |
-| DRAM Read / Write Bytes | byte |  |  |  | 实测显存流量变化 |
-| Shared Bank Conflicts | count |  |  |  | shared memory 冲突变化 |
-| Branch Efficiency | % |  |  |  | 分支发散变化 |
+可按后端加入 TTIR/TTGIR/PTX/SASS、load/store 流量、Tensor Core、eligible warps、stall、bank conflict、launch 数或 fusion 中间张量等指标。删除无关示例，不使用大量 `N/A`。
 
 ## 实验记录
-| 轮次 | 改动 | 关键结果 | 决策 | Commit |
-|-----:|------|----------|:----:|:------:|
+| 轮次 | 假设/改动 | 正确性 | 关键性能 | 决策 | Commit |
+|-----:|-----------|:------:|----------|:----:|:------:|
+
+## 候选方向闭环
+| 方向 | 状态 | 证据 |
+|------|:----:|------|
 
 ## 剩余限制
 - 剩余瓶颈：
