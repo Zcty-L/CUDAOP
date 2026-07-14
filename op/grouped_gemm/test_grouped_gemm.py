@@ -1,4 +1,4 @@
-"""CUTLASS 与 Triton LoRA Grouped GEMM 训练吞吐对比。"""
+"""CUTLASS、Triton 与 cuTile LoRA Grouped GEMM 训练吞吐对比。"""
 
 import logging
 import statistics
@@ -8,6 +8,11 @@ from typing import Any
 import torch
 
 from cudaop_grouped_gemm import (
+    CuTileLoraBgradGrouped,
+    CuTileLoraDownGrouped,
+    CuTileLoraFusedAgradGrouped,
+    CuTileLoraFusedDownUpGrouped,
+    CuTileLoraUpGrouped,
     LoraBgradGrouped,
     LoraDownGrouped,
     LoraFusedAgradGrouped,
@@ -134,6 +139,98 @@ class _TritonFusedLora(torch.autograd.Function):
         )
 
 
+class _CuTileSeparateLora(torch.autograd.Function):
+    """两 kernel 前向、四 kernel 反向的 cuTile 训练路径。"""
+
+    @staticmethod
+    def forward(
+        context: Any,
+        a: torch.Tensor,
+        down_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+        sizes: torch.Tensor,
+        down: CuTileLoraDownGrouped,
+        up: CuTileLoraUpGrouped,
+        backward_down: CuTileLoraDownGrouped,
+        backward_up: CuTileLoraUpGrouped,
+        bgrad: CuTileLoraBgradGrouped,
+    ) -> torch.Tensor:
+        hidden = down(a, sizes)
+        output = up(hidden, sizes)
+        context.save_for_backward(a, hidden, sizes)
+        context.backward_down = backward_down
+        context.backward_up = backward_up
+        context.bgrad = bgrad
+        return output
+
+    @staticmethod
+    def backward(
+        context: Any,
+        grad_output: torch.Tensor,
+    ) -> tuple:
+        a, hidden, sizes = context.saved_tensors
+        grad_output = grad_output.contiguous()
+        grad_hidden = context.backward_down(grad_output, sizes)
+        grad_input = context.backward_up(grad_hidden, sizes)
+        grad_down_weight = context.bgrad(grad_hidden, a, sizes)
+        grad_up_weight = context.bgrad(hidden, grad_output, sizes)
+        return (
+            grad_input,
+            grad_down_weight,
+            grad_up_weight,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+class _CuTileFusedLora(torch.autograd.Function):
+    """单 kernel 前向、三 kernel 反向的 cuTile 训练路径。"""
+
+    @staticmethod
+    def forward(
+        context: Any,
+        a: torch.Tensor,
+        down_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+        sizes: torch.Tensor,
+        fused: CuTileLoraFusedDownUpGrouped,
+        agrad: CuTileLoraFusedAgradGrouped,
+        bgrad: CuTileLoraBgradGrouped,
+    ) -> torch.Tensor:
+        hidden, output = fused(a, sizes)
+        context.save_for_backward(a, hidden, sizes)
+        context.agrad = agrad
+        context.bgrad = bgrad
+        return output
+
+    @staticmethod
+    def backward(
+        context: Any,
+        grad_output: torch.Tensor,
+    ) -> tuple:
+        a, hidden, sizes = context.saved_tensors
+        grad_output = grad_output.contiguous()
+        grad_hidden, grad_input = context.agrad(
+            grad_output,
+            sizes,
+        )
+        grad_down_weight = context.bgrad(grad_hidden, a, sizes)
+        grad_up_weight = context.bgrad(hidden, grad_output, sizes)
+        return (
+            grad_input,
+            grad_down_weight,
+            grad_up_weight,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 def create_triton_separate_operations(
     down_weight: torch.Tensor,
     up_weight: torch.Tensor,
@@ -159,6 +256,34 @@ def create_triton_fused_operations(
         LoraFusedDownUpGrouped(down_weight, up_weight),
         LoraFusedAgradGrouped(up_weight, down_weight),
         LoraBgradGrouped(experts, hidden_size),
+    )
+
+
+def create_cutile_separate_operations(
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+) -> tuple:
+    hidden_size = down_weight.shape[2]
+    experts = down_weight.shape[0]
+    return (
+        CuTileLoraDownGrouped(down_weight),
+        CuTileLoraUpGrouped(up_weight),
+        CuTileLoraDownGrouped(up_weight),
+        CuTileLoraUpGrouped(down_weight),
+        CuTileLoraBgradGrouped(experts, hidden_size),
+    )
+
+
+def create_cutile_fused_operations(
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+) -> tuple:
+    hidden_size = down_weight.shape[2]
+    experts = down_weight.shape[0]
+    return (
+        CuTileLoraFusedDownUpGrouped(down_weight, up_weight),
+        CuTileLoraFusedAgradGrouped(up_weight, down_weight),
+        CuTileLoraBgradGrouped(experts, hidden_size),
     )
 
 
@@ -192,6 +317,44 @@ def triton_fused_lora(
         up_weight,
     )
     return _TritonFusedLora.apply(
+        a,
+        down_weight,
+        up_weight,
+        sizes,
+        *operations,
+    )
+
+
+def cutile_separate_lora(
+    a: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    sizes: torch.Tensor,
+) -> torch.Tensor:
+    operations = create_cutile_separate_operations(
+        down_weight,
+        up_weight,
+    )
+    return _CuTileSeparateLora.apply(
+        a,
+        down_weight,
+        up_weight,
+        sizes,
+        *operations,
+    )
+
+
+def cutile_fused_lora(
+    a: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    sizes: torch.Tensor,
+) -> torch.Tensor:
+    operations = create_cutile_fused_operations(
+        down_weight,
+        up_weight,
+    )
+    return _CuTileFusedLora.apply(
         a,
         down_weight,
         up_weight,
@@ -244,6 +407,12 @@ def run_accuracy() -> None:
     down = LoraDownGrouped(down_weight)
     up = LoraUpGrouped(up_weight)
     fused = LoraFusedDownUpGrouped(down_weight, up_weight)
+    cutile_down = CuTileLoraDownGrouped(down_weight)
+    cutile_up = CuTileLoraUpGrouped(up_weight)
+    cutile_fused = CuTileLoraFusedDownUpGrouped(
+        down_weight,
+        up_weight,
+    )
 
     expected_hidden = reference_down(
         a.float(),
@@ -252,9 +421,11 @@ def run_accuracy() -> None:
     )
     cutlass_hidden = gmm(a, down_weight, sizes, True)
     triton_hidden = down(a, sizes)
+    cutile_hidden = cutile_down(a, sizes)
     for actual in (
         cutlass_hidden,
         triton_hidden,
+        cutile_hidden,
     ):
         torch.testing.assert_close(
             actual.float(),
@@ -270,10 +441,18 @@ def run_accuracy() -> None:
     )
     cutlass_output = gmm(triton_hidden, up_weight, sizes, False)
     triton_output = up(triton_hidden, sizes)
+    cutile_output = cutile_up(cutile_hidden, sizes)
     fused_hidden, fused_output = fused(a, sizes)
+    cutile_fused_hidden, cutile_fused_output = cutile_fused(
+        a,
+        sizes,
+    )
     for actual in (
         cutlass_output,
         triton_output,
+        cutile_output,
+        fused_output,
+        cutile_fused_output,
     ):
         torch.testing.assert_close(
             actual.float(),
@@ -292,6 +471,12 @@ def run_accuracy() -> None:
         triton_output,
         rtol=0.0,
         atol=0.0,
+    )
+    torch.testing.assert_close(
+        cutile_fused_hidden.float(),
+        expected_hidden,
+        rtol=BF16_RTOL,
+        atol=BF16_ATOL,
     )
 
     LOGGER.info(
@@ -336,6 +521,35 @@ def run_accuracy() -> None:
 
     LOGGER.info("")
     LOGGER.info(
+        "%-8s | %14s | %14s",
+        "stage",
+        "cuTile error",
+        "cuTile/Triton",
+    )
+    LOGGER.info("-" * 44)
+    for stage, cutile_value, expected, triton_value in (
+        (
+            "down",
+            cutile_hidden,
+            expected_hidden,
+            triton_hidden,
+        ),
+        (
+            "up",
+            cutile_output,
+            expected_output,
+            triton_output,
+        ),
+    ):
+        LOGGER.info(
+            "%-8s | %14.6f | %14.6f",
+            stage,
+            max_error(cutile_value, expected),
+            max_error(cutile_value, triton_value),
+        )
+
+    LOGGER.info("")
+    LOGGER.info(
         "%-14s | %-14s | %18s",
         "fused output",
         "shape",
@@ -353,6 +567,18 @@ def run_accuracy() -> None:
         "final output",
         str(tuple(fused_output.shape)),
         max_error(fused_output, triton_output),
+    )
+    LOGGER.info(
+        "%-14s | %-14s | %18.6f",
+        "cuTile hidden",
+        str(tuple(cutile_fused_hidden.shape)),
+        max_error(cutile_fused_hidden, triton_hidden),
+    )
+    LOGGER.info(
+        "%-14s | %-14s | %18.6f",
+        "cuTile output",
+        str(tuple(cutile_fused_output.shape)),
+        max_error(cutile_fused_output, triton_output),
     )
 
 
@@ -402,13 +628,20 @@ def run_backward_accuracy() -> None:
     cutlass_results = execute(lora_gmm)
     separate_results = execute(triton_separate_lora)
     fused_results = execute(triton_fused_lora)
+    cutile_separate_results = execute(cutile_separate_lora)
+    cutile_fused_results = execute(cutile_fused_lora)
     names = (
         "output",
         "grad input",
         "grad down",
         "grad up",
     )
-    for implementation in (separate_results, fused_results):
+    for implementation in (
+        separate_results,
+        fused_results,
+        cutile_separate_results,
+        cutile_fused_results,
+    ):
         for actual, expected in zip(
             implementation,
             cutlass_results,
@@ -421,30 +654,44 @@ def run_backward_accuracy() -> None:
             )
 
     LOGGER.info(
-        "%-12s | %-18s | %24s | %24s",
+        (
+            "%-12s | %-18s | %16s | %16s | "
+            "%16s | %16s"
+        ),
         "tensor",
         "shape",
-        "Triton separate diff",
-        "Triton fused diff",
+        "Triton separate",
+        "Triton fused",
+        "cuTile separate",
+        "cuTile fused",
     )
-    LOGGER.info("-" * 86)
+    LOGGER.info("-" * 108)
     for (
         name,
         separate_value,
         fused_value,
+        cutile_separate_value,
+        cutile_fused_value,
         cutlass_value,
     ) in zip(
         names,
         separate_results,
         fused_results,
+        cutile_separate_results,
+        cutile_fused_results,
         cutlass_results,
     ):
         LOGGER.info(
-            "%-12s | %-18s | %24.6f | %24.6f",
+            (
+                "%-12s | %-18s | %16.6f | %16.6f | "
+                "%16.6f | %16.6f"
+            ),
             name,
             str(tuple(separate_value.shape)),
             max_error(separate_value, cutlass_value),
             max_error(fused_value, cutlass_value),
+            max_error(cutile_separate_value, cutlass_value),
+            max_error(cutile_fused_value, cutlass_value),
         )
 
 
@@ -497,6 +744,14 @@ def run_performance(hidden_size: int) -> None:
         down_weight,
         up_weight,
     )
+    cutile_separate_operations = create_cutile_separate_operations(
+        down_weight,
+        up_weight,
+    )
+    cutile_fused_operations = create_cutile_fused_operations(
+        down_weight,
+        up_weight,
+    )
 
     def clear_gradients() -> None:
         a.grad = None
@@ -529,10 +784,30 @@ def run_performance(hidden_size: int) -> None:
             *fused_operations,
         )
 
+    def cutile_separate_forward() -> torch.Tensor:
+        return _CuTileSeparateLora.apply(
+            a,
+            down_weight,
+            up_weight,
+            sizes,
+            *cutile_separate_operations,
+        )
+
+    def cutile_fused_forward() -> torch.Tensor:
+        return _CuTileFusedLora.apply(
+            a,
+            down_weight,
+            up_weight,
+            sizes,
+            *cutile_fused_operations,
+        )
+
     implementations = (
         ("CUTLASS grouped_gemm", cutlass_forward),
         ("Triton separate", triton_forward),
         ("Triton fused", triton_fused_forward),
+        ("cuTile separate", cutile_separate_forward),
+        ("cuTile fused", cutile_fused_forward),
     )
     timings = []
     for name, forward in implementations:

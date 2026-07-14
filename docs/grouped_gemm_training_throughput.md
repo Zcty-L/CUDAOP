@@ -16,6 +16,21 @@
 cuTile 编译器不支持当前 GPU 的 `sm_89` 目标，因此按测试要求不纳入
 本报告。
 
+在 RTX 5070 Ti Laptop GPU（SM120）上补测后，cuTile 分离实现和
+cuTile 融合实现均高于本机 CUTLASS Grouped GEMM 基线：
+
+- `hidden_size=2048`：cuTile 分离实现加速 `1.654x`，融合实现加速
+  `1.584x`。
+- `hidden_size=8192`：cuTile 分离实现加速 `1.281x`，融合实现加速
+  `1.189x`。
+- cuTile 分离实现是本机两个配置中最快的实现，三次独立运行波动分别为
+  `1.246%` 和 `1.479%`。
+- cuTile 融合实现的波动分别为 `1.085%` 和 `3.188%`；后一个配置超过
+  `2%` 稳定性阈值，因此其精确 latency 需结合三次原始结果解读。
+
+两台机器的 GPU、软件栈和动态时钟行为不同，平台间只比较各自相对
+CUTLASS 基线的结果，不直接比较绝对 latency。
+
 ## 测试环境
 
 | 项目 | 配置 |
@@ -127,4 +142,100 @@ CUDA_VISIBLE_DEVICES=0 \
 ```text
 [SUCCESS] cudaop_grouped_gemm 对比测试通过
 [100%] Built target cudaop_grouped_gemm_test
+```
+
+## 本平台补测：RTX 5070 Ti Laptop GPU（SM120）
+
+### 测试环境
+
+| 项目 | 配置 |
+|---|---|
+| 测试日期 | 2026-07-14 |
+| GPU | NVIDIA GeForce RTX 5070 Ti Laptop GPU，SM120，GPU 0 |
+| SM 数量 | 46 |
+| NVIDIA Driver | 596.21 |
+| Python | 3.11.15，Conda 环境 `py311` |
+| PyTorch | 2.12.0+cu132 |
+| PyTorch CUDA | 13.2 |
+| CUDA Toolkit | 13.2（nvcc 13.2.78） |
+| Triton | 3.7.0 |
+| cuda-tile | 1.4.0 |
+| 数据类型 | BF16 |
+
+设备查询得到显存带宽估算值约为 `672.05 GB/s`。该 GPU 为 Laptop
+型号，空闲时处于 P8，测试前后 SM 时钟会降至约 217–262 MHz，运行时
+由动态频率提升；未锁定 GPU 时钟。测试前后 GPU 计算利用率均为 0%，
+但显存占用约 1.25 GiB。
+
+测试参数、计时范围、随机种子和精度容差与平台一相同。每个脚本内每项
+实现预热 20 次，每个采样执行 100 次，共取 5 个采样的中位数；完整
+脚本独立运行 3 次。下表 latency 使用 3 次完整运行结果的中位数。
+
+运行间波动统一按以下公式计算：
+
+```text
+group_median_spread =
+    (max(group_median) - min(group_median))
+    / median(group_median)
+```
+
+### hidden_size=2048
+
+| 实现 | 三次前向+反向（us） | 中位数（us） | 吞吐（Mtoken/s） | 加速比 | 波动 |
+|---|---:|---:|---:|---:|---:|
+| CUTLASS Grouped GEMM | 2527.382 / 2536.219 / 2899.726 | 2536.219 | 11.367 | 1.000x | 14.681% |
+| Triton separate | 1549.330 / 1624.277 / 1959.266 | 1624.277 | 17.750 | 1.561x | 25.238% |
+| Triton fused | 1754.487 / 1770.865 / 1628.459 | 1754.487 | 16.432 | 1.446x | 8.117% |
+| cuTile separate | 1525.732 / 1544.833 / 1533.127 | 1533.127 | 18.805 | 1.654x | 1.246% |
+| cuTile fused | 1596.159 / 1613.524 / 1601.139 | 1601.139 | 18.006 | 1.584x | 1.085% |
+
+该配置的 CUTLASS 与 Triton 运行间波动明显，cuTile 两条路径自身的波动
+低于 2%。因此 cuTile 的绝对 latency 较稳定，但相对 CUTLASS 的精确
+加速比仍受基线波动影响。
+
+### hidden_size=8192
+
+| 实现 | 三次前向+反向（us） | 中位数（us） | 吞吐（Mtoken/s） | 加速比 | 波动 |
+|---|---:|---:|---:|---:|---:|
+| CUTLASS Grouped GEMM | 7693.706 / 7571.088 / 7580.677 | 7580.677 | 3.803 | 1.000x | 1.618% |
+| Triton separate | 7423.511 / 6228.884 / 6511.338 | 6511.338 | 4.428 | 1.164x | 18.347% |
+| Triton fused | 7516.813 / 6887.728 / 6748.214 | 6887.728 | 4.186 | 1.101x | 11.159% |
+| cuTile separate | 5918.940 / 6003.600 / 5916.077 | 5918.940 | 4.871 | 1.281x | 1.479% |
+| cuTile fused | 6378.010 / 6403.998 / 6200.660 | 6378.010 | 4.520 | 1.189x | 3.188% |
+
+该配置的 CUTLASS 基线和 cuTile 分离实现波动低于 2%，`1.281x` 加速结果
+较稳定。cuTile 融合实现波动为 3.188%，但三次结果均明显快于 CUTLASS；
+其性能方向可信，精确加速比建议在固定功耗和时钟条件下复测。
+
+### 精度验证
+
+性能测试前使用 `hidden_size=256` 验证完整前向和反向。cuTile separate
+和 cuTile fused 均通过 `rtol=2e-2`、`atol=5e-1` 的 BF16 反向精度
+检查。
+
+| Tensor | cuTile separate/CUTLASS 最大绝对差 | cuTile fused/CUTLASS 最大绝对差 |
+|---|---:|---:|
+| output | 0.0 | 0.0 |
+| grad input | 0.0 | 0.0 |
+| grad down weight | 16.0 | 16.0 |
+| grad up weight | 0.5 | 0.5 |
+
+权重梯度包含 28830 个 token 的累加，最大绝对差需与相对误差共同判断；
+上述四项均通过断言。cuTile 分阶段前向、融合前向与 Triton 输出逐元素
+一致，本次测试的最大绝对差为 0。
+
+### 复现方式
+
+```bash
+conda activate py311
+cmake -S . -B build \
+  -DCUDAOP_CUDA_ARCHITECTURES=120 \
+  -DPython3_EXECUTABLE=/home/if/miniforge3/envs/py311/bin/python
+cmake --build build --target cudaop_grouped_gemm_test -j
+```
+
+本平台 CMake 测试目标和另外两次脚本独立运行均输出：
+
+```text
+[SUCCESS] cudaop_grouped_gemm 对比测试通过
 ```
