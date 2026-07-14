@@ -13,19 +13,16 @@ description: >-
 ## 使用方式
 
 直接描述目标实现、源码位置、业务配置和目标设备，例如：
-
 ```text
 $opt-kernel 优化 op/dwconv/example.cu:128 的 dwconv_forward_kernel。
-$opt-kernel 优化 op/grouped_gemm/grouped_gemm.py 中的 Triton fused kernel。
-$opt-kernel 优化 op/example/cutile_impl.py 中的 cuTile kernel。
+$opt-kernel 优化 op/grouped_gemm/grouped_gemm.py:123 中的 Triton fused kernel。
+$opt-kernel 优化 op/example/cutile_impl.py:123 中的 cuTile kernel。
 ```
-
 若输入不能唯一定位实现，列出候选 kernel、定义位置和后端，请用户指定，不得自行选择。找不到唯一匹配时输出 `[BLOCKED]`。
 
 ## 必读文件与后端路由
 
 开始任务后：
-
 1. 完整读取 [公共优化工作流](references/workflow-common.md)。
 2. 根据目标实现完整读取下列一个或多个后端文件。
 3. 进入交付阶段时完整读取 [优化报告模板](references/report-template.md)。
@@ -43,7 +40,6 @@ $opt-kernel 优化 op/example/cutile_impl.py 中的 cuTile kernel。
 ## 规则优先级
 
 依次遵守：
-
 1. 用户明确给出的目标、环境、shape、精度、测试范围和停止条件。
 2. 仓库根目录及目标目录中的 `AGENTS.md`。
 3. 本文件的公共路由规则。
@@ -55,18 +51,15 @@ $opt-kernel 优化 op/example/cutile_impl.py 中的 cuTile kernel。
 ## 混合后端比较
 
 比较多个后端时必须统一：
-
 - 输入、输出、布局、dtype、数值语义与随机种子；
 - device、stream、warmup、正式样本、批量大小和同步边界；
 - 是否包含权重预处理、JIT、Autograd、前向、反向和中间张量分配；
 - reference、baseline 与优化目标的计时范围。
-
 首次 JIT/编译时间单独记录，不计入稳定态 kernel latency，除非用户明确要求冷启动性能。端到端测试必须额外保留直接测得的端到端 latency，不得用各阶段独立计时结果相加替代。
 
 ## 执行摘要
 
 每个阶段结束时向用户报告：
-
 ```text
 [阶段 N] <名称>
 - 已完成：
