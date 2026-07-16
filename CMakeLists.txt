@@ -242,6 +242,52 @@ add_custom_target(lora_moe_ops
     VERBATIM
 )
 
+# Build the neuron PyTorch CUDA extension on demand. Custom targets are not
+# part of the default build unless they are explicitly marked with ALL.
+add_custom_target(neuron_ops
+    COMMAND
+        ${Python3_EXECUTABLE} build.py
+    WORKING_DIRECTORY
+        "${PROJECT_SOURCE_DIR}/op/neuron"
+    COMMENT
+        "Building the neuron_ops Python CUDA extension"
+    VERBATIM
+)
+
+add_custom_target(neuron_ops_test
+    COMMAND
+        ${Python3_EXECUTABLE} test_ops.py
+    WORKING_DIRECTORY
+        "${PROJECT_SOURCE_DIR}/op/neuron"
+    DEPENDS
+        neuron_ops
+    COMMENT
+        "Testing the neuron_ops Python CUDA extension"
+    VERBATIM
+)
+
+add_custom_target(neuron_ops_benchmark
+    COMMAND
+        ${Python3_EXECUTABLE} benchmark_ops.py
+    WORKING_DIRECTORY
+        "${PROJECT_SOURCE_DIR}/op/neuron"
+    DEPENDS
+        neuron_ops
+    COMMENT
+        "Benchmarking neuron_ops against the CuPy implementations"
+    VERBATIM
+)
+
+add_custom_target(neuron_cupy_spikingjelly_benchmark
+    COMMAND
+        ${Python3_EXECUTABLE} benchmark_spikingjelly.py
+    WORKING_DIRECTORY
+        "${PROJECT_SOURCE_DIR}/op/neuron"
+    COMMENT
+        "Benchmarking custom CuPy neurons against SpikingJelly"
+    VERBATIM
+)
+
 add_custom_target(lora_moe_standard_test
     COMMAND
         ${CMAKE_COMMAND} -E env
