@@ -72,6 +72,41 @@ CuPy 前向与反向总延迟 / C++ 前向与反向总延迟
 - FP32、FP16 下，full 实现的 spike、voltage，以及 lite 实现的 spike 和
   输入梯度均已通过精度验证。
 
+## 自研 CuPy 与 SpikingJelly 对比
+
+该对比参考 `SNN-Neuron-CUDA/main.py` 的训练路径，统一使用多步模式、
+ATan 替代梯度、`detach_reset=True` 和 spike-only 输出。SpikingJelly 使用
+CuPy 后端，每轮前重置状态；状态重置发生在 GPU 计时区间外。输入形状、
+预热配置与上文相同；每种实现测量 5 组，每组采样 30 次，最终取组中位数
+的中位数，并记录组间噪声。
+
+`自研加速比` 的计算方式为：
+
+```text
+SpikingJelly 前向与反向总延迟 / 自研 CuPy 前向与反向总延迟
+```
+
+| 神经元 | 精度 | 自研总延迟/ms | SpikingJelly 总延迟/ms | 自研 GElem/s | 自研加速比 | 最大组间噪声 |
+|---|---|---:|---:|---:|---:|---:|
+| IF | FP32 | 1.4561 | 2.8886 | 46.089 | 1.984× | 0.57% |
+| IF | FP16 | 0.8744 | 1.9343 | 76.747 | 2.212× | 2.34% |
+| LIF | FP32 | 1.4565 | 2.9255 | 46.075 | 2.009× | 1.87% |
+| LIF | FP16 | 0.8837 | 2.0026 | 75.940 | 2.266× | 2.97% |
+| PLIF | FP32 | 1.8313 | 3.2040 | 36.645 | 1.750× | 3.07% |
+| PLIF | FP16 | 1.1161 | 2.9864 | 60.129 | 2.676× | 24.37% |
+
+IF、LIF 和 PLIF FP32 的前向与反向总吞吐相对 SpikingJelly CuPy 提升
+`1.750×–2.266×`。PLIF FP16 的中位数加速比为 `2.676×`，但
+SpikingJelly 组间噪声达到 `24.37%`；扩大到 9 组、每组 50 次后，加速比为
+`2.941×`，组间噪声仍为 `16.82%`，因此该项只能判断自研实现明显更快，
+不应把单个加速比作为稳定值。六组 spike、输入梯度和 PLIF 参数梯度均通过
+精度验证。
+
+本次测试使用 `py311` 环境：PyTorch 2.9.1+cu130、CuPy 13.6.0、
+SpikingJelly 0.0.0.0.15。当前 CuPy 实际加载 CUDA 12.9 runtime，与
+PyTorch CUDA 13.0 的主版本不同；两组实现共用该 CuPy runtime，但复测前
+仍建议清理重复安装的 `cupy-cuda12x` 和 `cupy-cuda13x`。
+
 ## 构建与复现
 
 CuPy 的 CUDA 主版本必须与 PyTorch 一致。例如 PyTorch 使用 CUDA 13 时，
@@ -86,3 +121,16 @@ cmake --build build --target neuron_ops_benchmark --parallel 4
 基准默认将原始结果保存到 `build/neuron_benchmark.csv`。也可以直接运行
 `op/neuron/benchmark_ops.py`，通过命令行参数修改输入形状、预热次数、
 采样次数和输出路径。
+
+自研 CuPy 与 SpikingJelly 的结果默认保存到
+`build/neuron_spikingjelly_benchmark.csv`，在 `py311` 环境中运行：
+
+```bash
+conda run -n py311 python op/neuron/benchmark_spikingjelly.py
+```
+
+若 CMake 配置时使用的是 `py311` 的 Python，也可以运行：
+
+```bash
+cmake --build build --target neuron_cupy_spikingjelly_benchmark
+```

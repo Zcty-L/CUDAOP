@@ -278,6 +278,16 @@ add_custom_target(neuron_ops_benchmark
     VERBATIM
 )
 
+add_custom_target(neuron_cupy_spikingjelly_benchmark
+    COMMAND
+        ${Python3_EXECUTABLE} benchmark_spikingjelly.py
+    WORKING_DIRECTORY
+        "${PROJECT_SOURCE_DIR}/op/neuron"
+    COMMENT
+        "Benchmarking custom CuPy neurons against SpikingJelly"
+    VERBATIM
+)
+
 add_custom_target(lora_moe_standard_test
     COMMAND
         ${CMAKE_COMMAND} -E env
