@@ -115,19 +115,13 @@ y = Wd*h + Σ_e p_e*ΔWd_e*h
 | 合计 | `P_base + P_lora` |
 
 模型参数显存均为 `b(P_base + P_lora)`，所以结构本身不会改变参数显存。
-当前代码的训练行为存在一个重要差异：
-
-- `LoRAMoEStandard` 没有冻结 `original_mlp`，默认会为基础 MLP 和 LoRA
-  同时计算参数梯度，梯度显存为 `b(P_base + P_lora)`；
-- `LoRAMoENonstandard` 在构造函数中冻结了 `original_mlp`，只保存 LoRA
-  参数梯度，梯度显存为 `bP_lora`；
-- 如果手动冻结标准实现的基础 MLP，两者的参数量、可训练参数量和梯度显存相同。
+两种实现都会在构造函数中冻结 `original_mlp`，只训练 LoRA 参数，因此
+参数梯度显存均为 `bP_lora`。
 
 优化器显存取决于训练配置。若每个可训练参数保存两个、每个宽度为 `q`
 字节的 Adam moment，则 moment 显存为 `2qP_train`；若另存 FP32 master
-weight，还需增加 `4P_train` 字节。因此，当前标准实现未冻结基础 MLP
-会同时增加反向计算、梯度和优化器状态，不能把这部分差异归因于标准
-MoE 结构本身。
+weight，还需增加 `4P_train` 字节。当前两种实现的 `P_train` 均为
+`P_lora`。
 
 ### 前向计算量
 
@@ -157,7 +151,7 @@ MoE 结构本身。
 前向 MAC 的两倍；若权重冻结但仍需向前一层传播梯度，反向约等于一次
 前向 MAC。LoRA 权重始终可训练。
 
-在基础 MLP 冻结的公平 LoRA 训练口径下，前向与反向合计为：
+在当前基础 MLP 冻结的 LoRA 训练口径下，前向与反向合计为：
 
 | 实现与路径 | 前向 + 反向 MAC |
 |------------|----------------:|
@@ -168,9 +162,7 @@ MoE 结构本身。
 | 非标准 `pad` | `6NDI + 9NER(D + I)` |
 | 非标准 `group` | `6NDI + 9NKR(D + I)` |
 
-当前标准实现的基础 MLP 默认可训练，因此其表中基础项应由 `6` 改为
-`9`；非标准实现保持不变。反向单独的 MAC 可用表中总量减去对应的
-前向 MAC。
+反向单独的 MAC 可用表中总量减去对应的前向 MAC。
 
 ### 激活与训练峰值显存
 
@@ -180,7 +172,7 @@ allocator 状态共同决定。以下列出源码中决定显存规模的主要�
 | 路径 | 标准实现 | 非标准实现 |
 |------|----------|------------|
 | `loop` | 只处理被路由 token，但反向需保留各 expert 的 gate/up、中间激活及 LoRA hidden；规模随 `NK` 增长 | 同样是稀疏计算；激活在路由聚合后计算，但三个子层分别建立 autograd 图 |
-| `pad` | 产生多个 `[N, E, I]` expert 张量以及 `[N, E, R]` hidden，训练显存通常最高 | B 投影在 einsum 内直接跨 expert 聚合，主要 expert 张量为 `[N, E, R]`，另保留 `[N, I]`/`[N, D]` dense 激活 |
+| `pad` | 产生多个 `[N, E, I]` gate/up 和中间激活；down B 投影从加权后的 `[N, E, R]` 直接约简为 `[N, D]`，不物化 `[N, E, D]` | B 投影在 einsum 内直接跨 expert 聚合，主要 expert 张量为 `[N, E, R]`，另保留 `[N, I]`/`[N, D]` dense 激活 |
 | `group` | 保存 `[NK, D]` gathered input、多个 `[NK, I]` gate/up 和 expert 中间状态 | 仍有 `[NK, D/I]` 路由临时量，但非线性 MLP 状态聚合为 `[N, I]`；gate/up/down 分别执行 gather/scatter |
 
 结论是：
@@ -202,20 +194,18 @@ N=2*1507=3014, D=2048, I=2048, E=8, K=2, R=16, dtype=BF16
 ```
 
 该配置下，基础 MLP 参数为 24 MiB，LoRA 参数为 3 MiB，总参数为
-27 MiB。当前实现的参数梯度为：标准 27 MiB，非标准 3 MiB；若冻结
-标准实现的基础 MLP，则也为 3 MiB。
+27 MiB。两种实现都只训练 LoRA，参数梯度均为 3 MiB。
 
 忽略低阶算子的理论计算量如下：
 
 | 路径 | 标准前向 | 非标准前向 | 标准前向+反向 | 非标准前向+反向 |
 |------|---------:|-----------:|----------------:|------------------:|
-| `loop` | 154.070 GFLOPs | 78.220 GFLOPs | 462.210 GFLOPs | 158.811 GFLOPs |
-| `pad` | 85.331 GFLOPs | 85.331 GFLOPs | 255.993 GFLOPs | 180.143 GFLOPs |
-| `group` | 78.220 GFLOPs | 78.220 GFLOPs | 234.660 GFLOPs | 158.811 GFLOPs |
+| `loop` | 154.070 GFLOPs | 78.220 GFLOPs | 310.510 GFLOPs | 158.811 GFLOPs |
+| `pad` | 85.331 GFLOPs | 85.331 GFLOPs | 180.143 GFLOPs | 180.143 GFLOPs |
+| `group` | 78.220 GFLOPs | 78.220 GFLOPs | 158.811 GFLOPs | 158.811 GFLOPs |
 
-表中的训练计算量按当前代码计算，即标准基础 MLP 可训练、非标准基础 MLP
-冻结。若同样冻结标准基础 MLP，标准与非标准 `group` 的主导训练计算量均为
-158.811 GFLOPs；两者的实际性能和峰值显存仍会因计算图不同而存在差异。
+两种实现的 `group` 主导训练计算量均为 158.811 GFLOPs；实际性能和
+峰值显存仍会因计算图不同而存在差异。
 
 作为激活规模参考，单个 BF16 `[N, I]` 张量为 11.773 MiB，`[NK, I]`
 为 23.547 MiB，`[N, E, I]` 为 94.188 MiB，而 `[N, E, R]` 仅为
