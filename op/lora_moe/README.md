@@ -85,5 +85,5 @@ module = LoRAMoEStandard(
 ```
 
 `gmm_backend` 支持 `cutlass`、`triton` 和 `cutile`，默认值为
-`cutlass`。Triton 与 cuTile 使用融合 LoRA down/up kernel，目前仅支持
-rank=16；CUTLASS 仍支持通用 rank。
+`cutlass`。Triton 与 cuTile 使用融合 LoRA down/up kernel，目前支持
+rank=16/32；CUTLASS 仍支持通用 rank。

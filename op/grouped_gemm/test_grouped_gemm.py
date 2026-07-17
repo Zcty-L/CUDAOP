@@ -18,6 +18,7 @@ from cudaop_grouped_gemm import (
     LoraFusedAgradGrouped,
     LoraFusedDownUpGrouped,
     LoraUpGrouped,
+    cutile_fused_lora as cutile_autograd_lora,
     gmm,
     lora_gmm,
     triton_fused_lora as triton_autograd_lora,
@@ -696,8 +697,8 @@ def run_backward_accuracy() -> None:
         )
 
 
-def run_triton_rank_accuracy(rank: int) -> None:
-    """验证指定 rank 的五个 Triton kernel 和 Autograd 路径。"""
+def run_rank_accuracy(rank: int) -> None:
+    """验证指定 rank 的 Triton/cuTile 前向和反向路径。"""
     torch.manual_seed(17 + rank)
     sizes = torch.tensor((17, 11, 23, 5, 19, 7, 13, 29))
     tokens = int(sizes.sum())
@@ -746,6 +747,9 @@ def run_triton_rank_accuracy(rank: int) -> None:
         ("Triton separate", triton_separate_lora),
         ("Triton fused", triton_fused_lora),
         ("Triton Autograd", triton_autograd_lora),
+        ("cuTile separate", cutile_separate_lora),
+        ("cuTile fused", cutile_fused_lora),
+        ("cuTile Autograd", cutile_autograd_lora),
     )
     names = ("output", "grad input", "grad down", "grad up")
     LOGGER.info(
@@ -963,7 +967,7 @@ def main() -> None:
     LOGGER.info(
         (
             "配置：device=%s dtype=bfloat16 arch=sm_%d%d torch=%s "
-            "experts=%d triton_ranks=16/32 performance_rank=16 "
+            "experts=%d lora_ranks=16/32 performance_rank=16 "
             "tokens=%d sizes=%s"
         ),
         torch.cuda.get_device_name(),
@@ -974,9 +978,11 @@ def main() -> None:
         SIZES,
     )
     LOGGER.info("")
-    LOGGER.info("阶段：LoRA rank=16/32 Triton 前向+反向精度验证")
+    LOGGER.info(
+        "阶段：LoRA rank=16/32 Triton/cuTile 前向+反向精度验证"
+    )
     for rank in (16, 32):
-        run_triton_rank_accuracy(rank)
+        run_rank_accuracy(rank)
     LOGGER.info("")
     LOGGER.info("阶段：LoRA down/up 分阶段前向精度验证")
     torch.manual_seed(11)
