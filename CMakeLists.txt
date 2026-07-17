@@ -120,6 +120,7 @@ set(OP_SOURCES
     "op/resize/resize_u8.cu"
     "op/mul/mul_u8.cu"
     "op/linear/linear_k128.cu"
+    "op/linear/gemm_int8_basic.cu"
     "op/linear/linear_sn_k64_u8.cu"
     "op/linear/linear_sn_k64_u8_fp16.cu"
 )
