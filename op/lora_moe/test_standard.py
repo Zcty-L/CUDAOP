@@ -141,6 +141,28 @@ def benchmark_backward(
     ) / BACKWARD_BENCHMARK_ITERATIONS
 
 
+def assert_parameter_gradients(
+    module: LoRAMoEStandard,
+    method: str,
+) -> None:
+    for name, parameter in module.named_parameters():
+        if name.startswith("original_mlp."):
+            if parameter.requires_grad:
+                raise AssertionError(
+                    f"{method} 基础 MLP 参数未冻结: {name}"
+                )
+            if parameter.grad is not None:
+                raise AssertionError(
+                    f"{method} 基础 MLP 参数生成了梯度: {name}"
+                )
+            continue
+
+        if parameter.grad is None:
+            raise AssertionError(
+                f"{method} LoRA 参数梯度未生成: {name}"
+            )
+
+
 def main() -> None:
     torch.manual_seed(7)
     device = torch.device(
@@ -229,9 +251,7 @@ def main() -> None:
     actual.sum().backward()
     if x.grad is None:
         raise AssertionError("输入梯度未生成")
-    for name, parameter in module.named_parameters():
-        if parameter.grad is None:
-            raise AssertionError(f"参数梯度未生成: {name}")
+    assert_parameter_gradients(module, "loop")
     LOGGER.debug("[DEBUG] loop 前向及反向传播通过")
 
     log_section("运行 pad 前向精度测试")
@@ -325,11 +345,10 @@ def main() -> None:
                 raise AssertionError(
                     f"group/{backend} 未生成路由权重梯度"
                 )
-            for name, parameter in group_module.named_parameters():
-                if parameter.grad is None:
-                    raise AssertionError(
-                        f"group/{backend} 参数梯度未生成: {name}"
-                    )
+            assert_parameter_gradients(
+                group_module,
+                f"group/{backend}",
+            )
             LOGGER.debug(
                 "[DEBUG] group/%s 前向及反向传播通过",
                 backend,
