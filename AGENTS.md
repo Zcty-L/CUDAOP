@@ -58,7 +58,7 @@
 - 修改代码前必须执行 `git status --short --branch` 检查当前分支
 - 禁止在 `main` 分支修改文件；如果当前分支是 `main`，立即停止并提醒用户先切换或创建分支
 - Commit 前缀: `feat:`, `fix:`, `perf:`, `refactor:`, `docs:`, `chore:`
-- 分支命名: `feat/{op_name}`, `fix/{描述}`
+- 分支命名: `feature/{op_name}`
 
 
 # 可用 Skill
