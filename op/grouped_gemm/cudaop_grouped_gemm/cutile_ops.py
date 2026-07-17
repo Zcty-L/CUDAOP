@@ -1,4 +1,4 @@
-"""针对 LoRA rank=16 优化的 cuTile Grouped GEMM。"""
+"""针对 LoRA rank=16/32 优化的 cuTile Grouped GEMM。"""
 
 from typing import Any
 
@@ -6,7 +6,13 @@ import cuda.tile as ct
 import torch
 
 
-LORA_RANK = 16
+LORA_RANKS = (16, 32)
+
+
+def _check_lora_rank(rank: int) -> int:
+    if rank not in LORA_RANKS:
+        raise ValueError("LoRA rank 必须是 16 或 32")
+    return rank
 
 
 @ct.kernel
@@ -16,10 +22,11 @@ def grouped_down_kernel(
     output,
     token_offsets,
     token_counts,
+    rank: ct.Constant[int],
     block_m: ct.Constant[int],
     block_k: ct.Constant[int],
 ):
-    """C[M, 16] = A[M, K] @ B[E, K, 16]。"""
+    """C[M, R] = A[M, K] @ B[E, K, R]。"""
     row_tile = ct.bid(0)
     expert = ct.bid(1)
     token_offset = ct.gather(token_offsets, expert)
@@ -29,11 +36,11 @@ def grouped_down_kernel(
         + row_tile * block_m
         + ct.arange(block_m, dtype=ct.int32)
     )
-    ranks = ct.arange(LORA_RANK, dtype=ct.int32)
+    ranks = ct.arange(rank, dtype=ct.int32)
     row_indices = rows.reshape((block_m, 1))
-    rank_indices = ranks.reshape((1, LORA_RANK))
+    rank_indices = ranks.reshape((1, rank))
     row_mask = row_indices < token_offset + token_count
-    accumulator = ct.zeros((block_m, LORA_RANK), ct.float32)
+    accumulator = ct.zeros((block_m, rank), ct.float32)
 
     for k_tile in range(ct.cdiv(a.shape[1], block_k)):
         columns = (
@@ -50,9 +57,9 @@ def grouped_down_kernel(
         weight_tile = ct.load(
             weight_transposed,
             (expert, k_tile, 0),
-            shape=(1, block_k, LORA_RANK),
+            shape=(1, block_k, rank),
             padding_mode=ct.PaddingMode.ZERO,
-        ).reshape((block_k, LORA_RANK))
+        ).reshape((block_k, rank))
         accumulator = ct.mma(a_tile, weight_tile, accumulator)
 
     ct.scatter(
@@ -70,10 +77,11 @@ def grouped_up_kernel(
     output,
     token_offsets,
     token_counts,
+    rank: ct.Constant[int],
     block_m: ct.Constant[int],
     block_n: ct.Constant[int],
 ):
-    """D[M, N] = C[M, 16] @ W[E, 16, N]。"""
+    """D[M, N] = C[M, R] @ W[E, R, N]。"""
     row_tile = ct.bid(0)
     output_tile = ct.bid(1)
     expert = ct.bid(2)
@@ -88,10 +96,10 @@ def grouped_up_kernel(
         output_tile * block_n
         + ct.arange(block_n, dtype=ct.int32)
     )
-    ranks = ct.arange(LORA_RANK, dtype=ct.int32)
+    ranks = ct.arange(rank, dtype=ct.int32)
     row_indices = rows.reshape((block_m, 1))
     column_indices = columns.reshape((1, block_n))
-    rank_indices = ranks.reshape((1, LORA_RANK))
+    rank_indices = ranks.reshape((1, rank))
     row_mask = row_indices < token_offset + token_count
 
     hidden_tile = ct.gather(
@@ -103,9 +111,9 @@ def grouped_up_kernel(
     weight_tile = ct.load(
         weight,
         (expert, 0, output_tile),
-        shape=(1, LORA_RANK, block_n),
+        shape=(1, rank, block_n),
         padding_mode=ct.PaddingMode.ZERO,
-    ).reshape((LORA_RANK, block_n))
+    ).reshape((rank, block_n))
     accumulator = ct.matmul(hidden_tile, weight_tile)
     ct.scatter(
         output,
@@ -124,11 +132,12 @@ def grouped_fused_downup_kernel(
     output,
     token_offsets,
     token_counts,
+    rank: ct.Constant[int],
     block_m: ct.Constant[int],
     block_k: ct.Constant[int],
     block_n: ct.Constant[int],
 ):
-    """融合 LoRA down/up，并保存 rank=16 中间矩阵。"""
+    """融合 LoRA down/up，并保存 rank=16/32 中间矩阵。"""
     row_tile = ct.bid(0)
     expert = ct.bid(1)
     token_offset = ct.gather(token_offsets, expert)
@@ -138,12 +147,12 @@ def grouped_fused_downup_kernel(
         + row_tile * block_m
         + ct.arange(block_m, dtype=ct.int32)
     )
-    ranks = ct.arange(LORA_RANK, dtype=ct.int32)
+    ranks = ct.arange(rank, dtype=ct.int32)
     row_indices = rows.reshape((block_m, 1))
-    rank_indices = ranks.reshape((1, LORA_RANK))
+    rank_indices = ranks.reshape((1, rank))
     row_mask = row_indices < token_offset + token_count
     down_accumulator = ct.zeros(
-        (block_m, LORA_RANK),
+        (block_m, rank),
         ct.float32,
     )
 
@@ -162,9 +171,9 @@ def grouped_fused_downup_kernel(
         down_tile = ct.load(
             down_weight_transposed,
             (expert, k_tile, 0),
-            shape=(1, block_k, LORA_RANK),
+            shape=(1, block_k, rank),
             padding_mode=ct.PaddingMode.ZERO,
-        ).reshape((block_k, LORA_RANK))
+        ).reshape((block_k, rank))
         down_accumulator = ct.mma(
             a_tile,
             down_tile,
@@ -188,9 +197,9 @@ def grouped_fused_downup_kernel(
         up_tile = ct.load(
             up_weight,
             (expert, 0, output_tile),
-            shape=(1, LORA_RANK, block_n),
+            shape=(1, rank, block_n),
             padding_mode=ct.PaddingMode.ZERO,
-        ).reshape((LORA_RANK, block_n))
+        ).reshape((rank, block_n))
         output_tile_value = ct.matmul(hidden_tile, up_tile)
         ct.scatter(
             output,
@@ -209,6 +218,7 @@ def grouped_fused_agrad_kernel(
     grad_input,
     token_offsets,
     token_counts,
+    rank: ct.Constant[int],
     block_m: ct.Constant[int],
     block_k: ct.Constant[int],
 ):
@@ -222,12 +232,12 @@ def grouped_fused_agrad_kernel(
         + row_tile * block_m
         + ct.arange(block_m, dtype=ct.int32)
     )
-    ranks = ct.arange(LORA_RANK, dtype=ct.int32)
+    ranks = ct.arange(rank, dtype=ct.int32)
     row_indices = rows.reshape((block_m, 1))
-    rank_indices = ranks.reshape((1, LORA_RANK))
+    rank_indices = ranks.reshape((1, rank))
     row_mask = row_indices < token_offset + token_count
     hidden_accumulator = ct.zeros(
-        (block_m, LORA_RANK),
+        (block_m, rank),
         ct.float32,
     )
 
@@ -246,9 +256,9 @@ def grouped_fused_agrad_kernel(
         up_tile = ct.load(
             up_weight,
             (expert, 0, k_tile),
-            shape=(1, LORA_RANK, block_k),
+            shape=(1, rank, block_k),
             padding_mode=ct.PaddingMode.ZERO,
-        ).reshape((LORA_RANK, block_k)).transpose()
+        ).reshape((rank, block_k)).transpose()
         hidden_accumulator = ct.mma(
             grad_output_tile,
             up_tile,
@@ -272,9 +282,9 @@ def grouped_fused_agrad_kernel(
         down_tile = ct.load(
             down_weight,
             (expert, 0, output_tile),
-            shape=(1, LORA_RANK, block_k),
+            shape=(1, rank, block_k),
             padding_mode=ct.PaddingMode.ZERO,
-        ).reshape((LORA_RANK, block_k))
+        ).reshape((rank, block_k))
         input_tile = ct.matmul(grad_hidden_tile, down_tile)
         ct.scatter(
             grad_input,
@@ -291,6 +301,7 @@ def grouped_bgrad_kernel(
     output,
     token_offsets,
     token_counts,
+    rank: ct.Constant[int],
     block_tokens: ct.Constant[int],
     block_n: ct.Constant[int],
 ):
@@ -299,14 +310,14 @@ def grouped_bgrad_kernel(
     output_tile = ct.bid(1)
     token_offset = ct.gather(token_offsets, expert)
     token_count = ct.gather(token_counts, expert)
-    ranks = ct.arange(LORA_RANK, dtype=ct.int32)
+    ranks = ct.arange(rank, dtype=ct.int32)
     columns = (
         output_tile * block_n
         + ct.arange(block_n, dtype=ct.int32)
     )
-    rank_indices = ranks.reshape((LORA_RANK, 1))
+    rank_indices = ranks.reshape((rank, 1))
     column_indices = columns.reshape((1, block_n))
-    accumulator = ct.zeros((LORA_RANK, block_n), ct.float32)
+    accumulator = ct.zeros((rank, block_n), ct.float32)
 
     for token_tile in range(ct.cdiv(token_count, block_tokens)):
         tokens = (
@@ -334,7 +345,7 @@ def grouped_bgrad_kernel(
         output,
         (expert, 0, output_tile),
         accumulator.astype(output.dtype).reshape(
-            (1, LORA_RANK, block_n)
+            (1, rank, block_n)
         ),
     )
 
@@ -451,8 +462,9 @@ class CuTileLoraDownGrouped:
         block_m: int = 128,
         block_k: int = 64,
     ):
-        if weight.ndim != 3 or weight.shape[1] != LORA_RANK:
-            raise ValueError("down 权重形状必须是 [E, 16, K]")
+        if weight.ndim != 3:
+            raise ValueError("down 权重形状必须是 [E, R, K]")
+        self.rank = _check_lora_rank(weight.shape[1])
         if not weight.is_cuda or not weight.is_contiguous():
             raise ValueError("down 权重必须是连续的 CUDA Tensor")
         if weight.dtype != torch.bfloat16:
@@ -481,7 +493,7 @@ class CuTileLoraDownGrouped:
         if a.shape[1] != self.contraction_size:
             raise ValueError("输入和 down 权重的收缩维度不匹配")
         output = torch.empty(
-            (a.shape[0], LORA_RANK),
+            (a.shape[0], self.rank),
             device=a.device,
             dtype=a.dtype,
         )
@@ -502,6 +514,7 @@ class CuTileLoraDownGrouped:
                     output,
                     token_offsets,
                     token_counts,
+                    self.rank,
                     self.block_m,
                     self.block_k,
                 ),
@@ -518,8 +531,9 @@ class CuTileLoraUpGrouped:
         block_m: int = 128,
         block_n: int = 256,
     ):
-        if weight.ndim != 3 or weight.shape[1] != LORA_RANK:
-            raise ValueError("up 权重形状必须是 [E, 16, N]")
+        if weight.ndim != 3:
+            raise ValueError("up 权重形状必须是 [E, R, N]")
+        self.rank = _check_lora_rank(weight.shape[1])
         if not weight.is_cuda or not weight.is_contiguous():
             raise ValueError("up 权重必须是连续的 CUDA Tensor")
         if weight.dtype != torch.bfloat16:
@@ -543,8 +557,8 @@ class CuTileLoraUpGrouped:
         batch_sizes: torch.Tensor,
     ) -> torch.Tensor:
         _check_common(hidden, self.weight, batch_sizes)
-        if hidden.shape[1] != LORA_RANK:
-            raise ValueError("up 输入的最后一维必须是 16")
+        if hidden.shape[1] != self.rank:
+            raise ValueError("up 输入的 rank 与权重不匹配")
         output = torch.empty(
             (hidden.shape[0], self.output_size),
             device=hidden.device,
@@ -571,6 +585,7 @@ class CuTileLoraUpGrouped:
                     output,
                     token_offsets,
                     token_counts,
+                    self.rank,
                     self.block_m,
                     self.block_n,
                 ),
@@ -591,11 +606,9 @@ class CuTileLoraFusedDownUpGrouped:
     ):
         if down_weight.shape != up_weight.shape:
             raise ValueError("down 和 up 权重形状必须相同")
-        if (
-            down_weight.ndim != 3
-            or down_weight.shape[1] != LORA_RANK
-        ):
-            raise ValueError("权重形状必须是 [E, 16, K]")
+        if down_weight.ndim != 3:
+            raise ValueError("权重形状必须是 [E, R, K]")
+        self.rank = _check_lora_rank(down_weight.shape[1])
         if (
             not up_weight.is_cuda
             or not up_weight.is_contiguous()
@@ -632,7 +645,7 @@ class CuTileLoraFusedDownUpGrouped:
         if a.shape[1] != self.hidden_size:
             raise ValueError("输入和 down 权重的收缩维度不匹配")
         hidden = torch.empty(
-            (a.shape[0], LORA_RANK),
+            (a.shape[0], self.rank),
             device=a.device,
             dtype=a.dtype,
         )
@@ -656,6 +669,7 @@ class CuTileLoraFusedDownUpGrouped:
                     output,
                     token_offsets,
                     token_counts,
+                    self.rank,
                     self.block_m,
                     self.block_k,
                     self.block_n,
@@ -676,11 +690,9 @@ class CuTileLoraFusedAgradGrouped:
     ):
         if up_weight.shape != down_weight.shape:
             raise ValueError("down 和 up 权重形状必须相同")
-        if (
-            up_weight.ndim != 3
-            or up_weight.shape[1] != LORA_RANK
-        ):
-            raise ValueError("权重形状必须是 [E, 16, K]")
+        if up_weight.ndim != 3:
+            raise ValueError("权重形状必须是 [E, R, K]")
+        self.rank = _check_lora_rank(up_weight.shape[1])
         if (
             not up_weight.is_cuda
             or not down_weight.is_cuda
@@ -718,7 +730,7 @@ class CuTileLoraFusedAgradGrouped:
         if grad_output.shape[1] != self.hidden_size:
             raise ValueError("输出梯度维度与权重不匹配")
         grad_hidden = torch.empty(
-            (grad_output.shape[0], LORA_RANK),
+            (grad_output.shape[0], self.rank),
             device=grad_output.device,
             dtype=grad_output.dtype,
         )
@@ -742,6 +754,7 @@ class CuTileLoraFusedAgradGrouped:
                     grad_input,
                     token_offsets,
                     token_counts,
+                    self.rank,
                     self.block_m,
                     self.block_k,
                 ),
@@ -750,7 +763,7 @@ class CuTileLoraFusedAgradGrouped:
 
 
 class CuTileLoraBgradGrouped:
-    """计算 rank=16 cuTile LoRA grouped GEMM 的权重梯度。"""
+    """计算 rank=16/32 cuTile LoRA grouped GEMM 的权重梯度。"""
 
     def __init__(
         self,
@@ -777,13 +790,11 @@ class CuTileLoraBgradGrouped:
         rhs: torch.Tensor,
         batch_sizes: torch.Tensor,
     ) -> torch.Tensor:
-        if (
-            lhs.ndim != 2
-            or lhs.shape[1] != LORA_RANK
-            or rhs.ndim != 2
-            or rhs.shape[1] != self.hidden_size
-        ):
-            raise ValueError("lhs/rhs 形状必须是 [N,16] 和 [N,K]")
+        if lhs.ndim != 2 or rhs.ndim != 2:
+            raise ValueError("lhs/rhs 必须是二维 Tensor")
+        rank = _check_lora_rank(lhs.shape[1])
+        if rhs.shape[1] != self.hidden_size:
+            raise ValueError("rhs 最后一维与 hidden_size 不匹配")
         if lhs.shape[0] != rhs.shape[0]:
             raise ValueError("lhs 和 rhs 行数必须相同")
         if (
@@ -802,7 +813,7 @@ class CuTileLoraBgradGrouped:
         ):
             raise ValueError("batch_sizes 长度必须等于 expert 数")
         output = torch.empty(
-            (self.num_experts, LORA_RANK, self.hidden_size),
+            (self.num_experts, rank, self.hidden_size),
             device=lhs.device,
             dtype=lhs.dtype,
         )
@@ -825,6 +836,7 @@ class CuTileLoraBgradGrouped:
                 output,
                 token_offsets,
                 token_counts,
+                rank,
                 self.block_tokens,
                 self.block_n,
             ),
@@ -844,16 +856,15 @@ class _CuTileLoraFusedDownUp(torch.autograd.Function):
         batch_sizes: torch.Tensor,
     ) -> torch.Tensor:
         _check_common(a, down_weight, batch_sizes)
-        if down_weight.shape[1] != LORA_RANK:
-            raise ValueError("权重形状必须是 [E, 16, K]")
+        rank = _check_lora_rank(down_weight.shape[1])
         if a.shape[1] != down_weight.shape[2]:
             raise ValueError("输入和权重的隐藏维度不匹配")
         if (
             up_weight.ndim != 3
             or up_weight.shape[0] != down_weight.shape[0]
-            or up_weight.shape[1] != LORA_RANK
+            or up_weight.shape[1] != rank
         ):
-            raise ValueError("up 权重形状必须是 [E, 16, N]")
+            raise ValueError("up 权重形状必须是 [E, R, N]")
         if (
             not up_weight.is_cuda
             or not up_weight.is_contiguous()
@@ -874,7 +885,7 @@ class _CuTileLoraFusedDownUp(torch.autograd.Function):
             down_weight.permute(0, 2, 1).contiguous()
         )
         hidden = torch.empty(
-            (a.shape[0], LORA_RANK),
+            (a.shape[0], rank),
             device=a.device,
             dtype=a.dtype,
         )
@@ -895,6 +906,7 @@ class _CuTileLoraFusedDownUp(torch.autograd.Function):
                     output,
                     token_offsets,
                     token_counts,
+                    rank,
                     block_m,
                     block_k,
                     block_n,
@@ -929,6 +941,7 @@ class _CuTileLoraFusedDownUp(torch.autograd.Function):
         grad_output = grad_output.contiguous()
         grad_hidden = torch.empty_like(hidden)
         grad_input = torch.empty_like(a)
+        rank = down_weight.shape[1]
         if context.max_tiles > 0:
             _launch(
                 (context.max_tiles, down_weight.shape[0]),
@@ -941,6 +954,7 @@ class _CuTileLoraFusedDownUp(torch.autograd.Function):
                     grad_input,
                     token_offsets,
                     token_counts,
+                    rank,
                     context.block_m,
                     context.block_k,
                 ),
@@ -961,6 +975,7 @@ class _CuTileLoraFusedDownUp(torch.autograd.Function):
                 grad_down_weight,
                 token_offsets,
                 token_counts,
+                rank,
                 128,
                 256,
             ),
@@ -978,6 +993,7 @@ class _CuTileLoraFusedDownUp(torch.autograd.Function):
                 grad_up_weight,
                 token_offsets,
                 token_counts,
+                rank,
                 128,
                 256,
             ),

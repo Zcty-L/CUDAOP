@@ -1,4 +1,8 @@
-# conv2d_4x128x256_groups_kernel 阶段 0-4 报告
+# conv2d_4x128x256_groups_kernel 优化报告
+
+[RTX 4090 后续报告](opt_kernel_conv2d_groups_rtx4090_20260711.md)
+
+## 2026-07-10 RTX 5070 Ti Laptop（阶段 0-4）
 
 ## 执行范围
 

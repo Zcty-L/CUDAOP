@@ -58,16 +58,17 @@
 - 修改代码前必须执行 `git status --short --branch` 检查当前分支
 - 禁止在 `main` 分支修改文件；如果当前分支是 `main`，立即停止并提醒用户先切换或创建分支
 - Commit 前缀: `feat:`, `fix:`, `perf:`, `refactor:`, `docs:`, `chore:`
-- 分支命名: `feat/{op_name}`, `fix/{描述}`
+- 分支命名: `feature/{op_name}`
 
 
 # 可用 Skill
 
 ## `$opt-kernel` — GPU Kernel 优化工作流
 
-> 用于分析和优化 CUDA C++、Triton 或 cuTile kernel 性能的标准化流程。
+> 仅用于需要修改、迭代和优化 CUDA kernel 实现的性能优化任务。
 > 调用方式：`$opt-kernel 优化 op/dwconv/example.cu:128 的 dwconv_forward_kernel。`
-> Python 后端示例：`$opt-kernel 优化 op/grouped_gemm/grouped_gemm.py 中的 Triton fused kernel。`
+>
+> 触发条件：用户显式调用 `$opt-kernel`，或明确要求优化、调优、迭代修改 kernel 以提升性能。仅出现“性能”“提升”“分析”等词不足以触发。
 
 ### 各阶段说明
 
