@@ -34,9 +34,9 @@ class LoRAMoEStandard(nn.Module):
                 f"不支持的 GMM 后端: {gmm_backend}，"
                 f"可选值为 {self._GMM_BACKENDS}"
             )
-        if gmm_backend != "cutlass" and rank != 16:
+        if gmm_backend != "cutlass" and rank not in (16, 32):
             raise ValueError(
-                f"{gmm_backend} GMM 后端仅支持 rank=16"
+                f"{gmm_backend} GMM 后端仅支持 rank=16/32"
             )
 
         self._validate_original_mlp(original_mlp)

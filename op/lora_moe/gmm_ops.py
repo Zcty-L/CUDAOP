@@ -240,9 +240,9 @@ def lora_gmm(
             trans_b=True,
         )
 
-    if down_weight.shape[1] != 16:
+    if down_weight.shape[1] not in (16, 32):
         raise ValueError(
-            f"{backend} LoRA GMM 仅支持 rank=16，"
+            f"{backend} LoRA GMM 仅支持 rank=16/32，"
             f"当前 rank={down_weight.shape[1]}"
         )
     down_weight = down_weight.contiguous()

@@ -7,27 +7,27 @@
 - `LoraDownGrouped`：Triton LoRA down 前向算子。
 - `LoraUpGrouped`：Triton LoRA up 前向算子。
 - `LoraFusedDownUpGrouped`：融合 down/up，并额外返回供反向使用的
-  `[M, 16]` 中间矩阵。
+  `[M, R]` 中间矩阵。
 - `triton_fused_lora`：支持自动求导的融合接口。
 - `CuTileLoraDownGrouped`、`CuTileLoraUpGrouped`：cuTile 分阶段前向。
 - `CuTileLoraFusedDownUpGrouped`：cuTile 融合前向。
 - `cutile_fused_lora`：支持三 kernel 反向的 cuTile 融合接口。
 
-Triton LoRA 实现固定 rank=16，并拆分为两个 kernel：
+Triton 与 cuTile LoRA 实现支持 rank=16/32，并拆分为两个 kernel：
 
 ```text
-down: [M, K]  @ [E, 16, K].T -> [M, 16]
-up:   [M, 16] @ [E, 16, N]   -> [M, N]
+down: [M, K] @ [E, R, K].T -> [M, R]
+up:   [M, R] @ [E, R, N]   -> [M, N]
 ```
 
-down 构造时会将权重预打包为连续的 `[E, K, 16]`。up 权重本身必须
-采用连续的 `[E, 16, N]` 布局，从而让一次 `tl.dot` 完成完整的
-rank=16 收缩。两个算子会按 `batch_sizes` Tensor 对象及版本号缓存
+down 构造时会将权重预打包为连续的 `[E, K, R]`。up 权重本身必须
+采用连续的 `[E, R, N]` 布局，从而让一次矩阵乘完成完整的
+rank=16/32 收缩。两个算子会按 `batch_sizes` Tensor 对象及版本号缓存
 路由元数据；路由变化时自动重新构建，也可以调用
 `clear_metadata_cache()` 主动清除。
 
-状态化 Triton 类只提供前向。训练路径可以使用 `gmm`、
-`torch_gmm` 或 `triton_fused_lora`；融合 Triton 反向包含：
+状态化 Triton/cuTile 类只提供前向。训练路径可以使用 `gmm`、
+`torch_gmm`、`triton_fused_lora` 或 `cutile_fused_lora`；融合反向包含：
 
 ```text
 fused agrad:
