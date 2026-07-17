@@ -169,11 +169,11 @@ def main() -> None:
         "cuda" if torch.cuda.is_available() else "cpu"
     )
     dtype = torch.bfloat16
-    batch_size = 2
-    seq_len = 1507
+    batch_size = 1
+    seq_len = 3507
     top_k = 2
     hidden_size = 2048
-    intermediate_size = 2048
+    intermediate_size = 8192
     log_test_start(
         "LoRAMoEStandard",
         f"device={device}，dtype={dtype}，experts=8，rank=16，"

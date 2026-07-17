@@ -204,13 +204,15 @@ def gmm(
     b: torch.Tensor,
     batch_sizes: torch.Tensor,
     trans_b: bool = False,
+    backend: GmmBackend = "cutlass",
 ) -> torch.Tensor:
-    """默认调用 ``cudaop_grouped_gemm`` 的 CUTLASS 实现。"""
+    """按后端调用 ``cudaop_grouped_gemm`` 的统一 GMM 接口。"""
     return cudaop_grouped_gemm.gmm(
         a,
         b,
         batch_sizes,
         trans_b,
+        backend,
     )
 
 
@@ -245,22 +247,15 @@ def lora_gmm(
             f"{backend} LoRA GMM 仅支持 rank=16/32，"
             f"当前 rank={down_weight.shape[1]}"
         )
-    down_weight = down_weight.contiguous()
     up_weight_transposed = (
         up_weight.transpose(1, 2).contiguous()
     )
-    if backend == "triton":
-        return triton_lora_autograd(
-            a,
-            down_weight,
-            up_weight_transposed,
-            batch_sizes,
-        )
-    return cutile_lora_autograd(
+    return cudaop_grouped_gemm.lora_gmm(
         a,
-        down_weight,
+        down_weight.contiguous(),
         up_weight_transposed,
         batch_sizes,
+        backend,
     )
 
 

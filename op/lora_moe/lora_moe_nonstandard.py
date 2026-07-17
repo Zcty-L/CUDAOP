@@ -1,6 +1,7 @@
 """非标准 LoRA-MoE：gate、up、down 三个子层分别执行 MoE 路由。"""
 
 import math
+from functools import partial
 from typing import Callable
 
 import torch
@@ -336,6 +337,8 @@ class LoRAMoENonstandard(nn.Module):
         lora_A: torch.Tensor,
         lora_B: torch.Tensor,
         dropout: nn.Module,
+        *,
+        backend: str,
     ) -> torch.Tensor:
         import gmm_ops
 
@@ -357,7 +360,7 @@ class LoRAMoENonstandard(nn.Module):
             lora_A,
             lora_B,
             batch_sizes,
-            self.gmm_backend,
+            backend,
         )
         delta = gmm_ops.scatter(
             delta_per_slot,
@@ -459,14 +462,18 @@ class LoRAMoENonstandard(nn.Module):
         top_k_indices: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        """使用本地路由算子和 CUTLASS Grouped GEMM 执行非标准 MoE。"""
+        """按所选 GMM 后端执行非标准 LoRA-MoE。"""
 
         self._validate_inputs(x, top_k_indices, top_k_weights)
         route = self.indices_and_bins(
             top_k_indices.reshape(-1)
         )
-        return self._forward_impl(
+        project = partial(
             self._project_group,
+            backend=self.gmm_backend,
+        )
+        return self._forward_impl(
+            project,
             x,
             top_k_indices,
             top_k_weights,

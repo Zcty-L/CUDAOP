@@ -418,6 +418,7 @@ class LoRAMoEStandard(nn.Module):
                 self.gate_up_lora_A,
                 batch_sizes,
                 trans_b=True,
+                backend="cutlass",
             )
             gate_hidden, up_hidden = gate_up_hidden.chunk(2, dim=-1)
             gate_delta = gmm_ops.gmm(
@@ -425,27 +426,49 @@ class LoRAMoEStandard(nn.Module):
                 self.gate_lora_B,
                 batch_sizes,
                 trans_b=True,
+                backend="cutlass",
             )
             up_delta = gmm_ops.gmm(
                 up_hidden.contiguous(),
                 self.up_lora_B,
                 batch_sizes,
                 trans_b=True,
+                backend="cutlass",
             )
-        else:
+        elif self.gmm_backend == "triton":
             gate_delta = gmm_ops.lora_gmm(
                 x_dropped,
                 self.gate_up_lora_A[:, :self.rank],
                 self.gate_lora_B,
                 batch_sizes,
-                self.gmm_backend,
+                "triton",
             )
             up_delta = gmm_ops.lora_gmm(
                 x_dropped,
                 self.gate_up_lora_A[:, self.rank:],
                 self.up_lora_B,
                 batch_sizes,
-                self.gmm_backend,
+                "triton",
+            )
+        elif self.gmm_backend == "cutile":
+            gate_delta = gmm_ops.lora_gmm(
+                x_dropped,
+                self.gate_up_lora_A[:, :self.rank],
+                self.gate_lora_B,
+                batch_sizes,
+                "cutile",
+            )
+            up_delta = gmm_ops.lora_gmm(
+                x_dropped,
+                self.gate_up_lora_A[:, self.rank:],
+                self.up_lora_B,
+                batch_sizes,
+                "cutile",
+            )
+        else:
+            raise ValueError(
+                f"不支持的 GMM 后端: {self.gmm_backend}，"
+                f"可选值为 {self._GMM_BACKENDS}"
             )
         gate_delta = gate_delta * self.scaling
         up_delta = up_delta * self.scaling
