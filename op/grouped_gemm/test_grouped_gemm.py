@@ -20,6 +20,7 @@ from cudaop_grouped_gemm import (
     LoraUpGrouped,
     gmm,
     lora_gmm,
+    triton_fused_lora as triton_autograd_lora,
 )
 
 
@@ -695,6 +696,88 @@ def run_backward_accuracy() -> None:
         )
 
 
+def run_triton_rank_accuracy(rank: int) -> None:
+    """验证指定 rank 的五个 Triton kernel 和 Autograd 路径。"""
+    torch.manual_seed(17 + rank)
+    sizes = torch.tensor((17, 11, 23, 5, 19, 7, 13, 29))
+    tokens = int(sizes.sum())
+    experts = sizes.numel()
+    hidden_size = 256
+    source_a = torch.randn(
+        tokens,
+        hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    source_down = torch.randn(
+        experts,
+        rank,
+        hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    source_up = torch.randn_like(source_down)
+    grad_output = torch.randn_like(source_a)
+
+    def execute(operation: Callable) -> tuple:
+        a = source_a.detach().clone().requires_grad_(True)
+        down_weight = (
+            source_down.detach().clone().requires_grad_(True)
+        )
+        up_weight = (
+            source_up.detach().clone().requires_grad_(True)
+        )
+        output = operation(
+            a,
+            down_weight,
+            up_weight,
+            sizes,
+        )
+        output.backward(grad_output)
+        return (
+            output.detach(),
+            a.grad.detach(),
+            down_weight.grad.detach(),
+            up_weight.grad.detach(),
+        )
+
+    expected = execute(lora_gmm)
+    implementations = (
+        ("Triton separate", triton_separate_lora),
+        ("Triton fused", triton_fused_lora),
+        ("Triton Autograd", triton_autograd_lora),
+    )
+    names = ("output", "grad input", "grad down", "grad up")
+    LOGGER.info(
+        "%-4s | %-16s | %-12s | %14s",
+        "rank",
+        "implementation",
+        "tensor",
+        "CUTLASS error",
+    )
+    LOGGER.info("-" * 56)
+    for implementation_name, operation in implementations:
+        actual = execute(operation)
+        for tensor_name, actual_value, expected_value in zip(
+            names,
+            actual,
+            expected,
+        ):
+            torch.testing.assert_close(
+                actual_value,
+                expected_value,
+                rtol=BF16_RTOL,
+                atol=BF16_GRAD_ATOL,
+            )
+            LOGGER.info(
+                "%-4d | %-16s | %-12s | %14.6f",
+                rank,
+                implementation_name,
+                tensor_name,
+                max_error(actual_value, expected_value),
+            )
+
+
 def benchmark_once(operation: Callable[[], None]) -> float:
     for _ in range(WARMUP_ITERATIONS):
         operation()
@@ -880,7 +963,8 @@ def main() -> None:
     LOGGER.info(
         (
             "配置：device=%s dtype=bfloat16 arch=sm_%d%d torch=%s "
-            "experts=%d rank=16 tokens=%d sizes=%s"
+            "experts=%d triton_ranks=16/32 performance_rank=16 "
+            "tokens=%d sizes=%s"
         ),
         torch.cuda.get_device_name(),
         *torch.cuda.get_device_capability(),
@@ -889,6 +973,10 @@ def main() -> None:
         sum(SIZES),
         SIZES,
     )
+    LOGGER.info("")
+    LOGGER.info("阶段：LoRA rank=16/32 Triton 前向+反向精度验证")
+    for rank in (16, 32):
+        run_triton_rank_accuracy(rank)
     LOGGER.info("")
     LOGGER.info("阶段：LoRA down/up 分阶段前向精度验证")
     torch.manual_seed(11)

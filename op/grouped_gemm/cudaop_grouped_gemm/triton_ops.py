@@ -1,4 +1,4 @@
-"""针对 LoRA rank=16 分别优化的 Triton Grouped GEMM。"""
+"""针对 LoRA rank=16/32 分别优化的 Triton Grouped GEMM。"""
 
 from typing import Any
 
@@ -7,7 +7,13 @@ import triton
 import triton.language as tl
 
 
-LORA_RANK = 16
+LORA_RANKS = (16, 32)
+
+
+def _check_lora_rank(rank: int) -> int:
+    if rank not in LORA_RANKS:
+        raise ValueError("LoRA rank 必须是 16 或 32")
+    return rank
 
 
 @triton.jit
@@ -41,12 +47,12 @@ def grouped_down_kernel(
     stride_om,
     stride_or,
     num_experts,
+    rank: tl.constexpr,
     block_m: tl.constexpr,
     block_k: tl.constexpr,
     num_stages: tl.constexpr,
 ):
-    """C[M, 16] = A[M, K] @ B[E, 16, K].T。"""
-    rank: tl.constexpr = 16
+    """C[M, R] = A[M, K] @ B[E, R, K].T。"""
     tile_index = tl.program_id(0)
     expert = _find_expert(
         tile_index,
@@ -134,11 +140,11 @@ def grouped_up_kernel(
     stride_om,
     stride_on,
     num_experts,
+    rank: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
 ):
-    """D[M, N] = C[M, 16] @ W[E, 16, N]。"""
-    rank: tl.constexpr = 16
+    """D[M, N] = C[M, R] @ W[E, R, N]。"""
     tile_index = tl.program_id(0)
     output_tile = tl.program_id(1)
     expert = _find_expert(
@@ -225,14 +231,14 @@ def grouped_fused_downup_kernel(
     stride_om,
     stride_on,
     num_experts,
+    rank: tl.constexpr,
     block_m: tl.constexpr,
     block_k: tl.constexpr,
     block_n: tl.constexpr,
     num_stages: tl.constexpr,
     num_stages_up: tl.constexpr,
 ):
-    """融合 LoRA down/up，并保存 rank=16 中间矩阵。"""
-    rank: tl.constexpr = 16
+    """融合 LoRA down/up，并保存 rank=16/32 中间矩阵。"""
     tile_index = tl.program_id(0)
     expert = _find_expert(
         tile_index,
@@ -363,12 +369,12 @@ def grouped_fused_agrad_kernel(
     stride_gim,
     stride_gik,
     num_experts,
+    rank: tl.constexpr,
     block_m: tl.constexpr,
     block_k: tl.constexpr,
     num_stages: tl.constexpr,
 ):
     """融合计算 grad_hidden 和 grad_input。"""
-    rank: tl.constexpr = 16
     tile_index = tl.program_id(0)
     expert = _find_expert(
         tile_index,
@@ -488,11 +494,11 @@ def grouped_bgrad_kernel(
     stride_oe,
     stride_or,
     stride_ok,
+    rank: tl.constexpr,
     block_tokens: tl.constexpr,
     block_n: tl.constexpr,
 ):
     """计算每个 expert 的 ``lhs.T @ rhs`` 权重梯度。"""
-    rank: tl.constexpr = 16
     expert = tl.program_id(0)
     output_tile = tl.program_id(1)
     token_offset = tl.load(token_offsets + expert)
@@ -641,7 +647,7 @@ def _build_metadata(
 
 
 class LoraDownGrouped:
-    """LoRA down：将权重预打包为连续的 ``[E, K, 16]``。"""
+    """LoRA down：将权重预打包为连续的 ``[E, K, R]``。"""
 
     def __init__(
         self,
@@ -651,8 +657,9 @@ class LoraDownGrouped:
         num_warps: int = 8,
         num_stages: int = 3,
     ):
-        if weight.ndim != 3 or weight.shape[1] != LORA_RANK:
-            raise ValueError("down 权重形状必须是 [E, 16, K]")
+        if weight.ndim != 3:
+            raise ValueError("down 权重形状必须是 [E, R, K]")
+        self.rank = _check_lora_rank(weight.shape[1])
         if not weight.is_cuda or not weight.is_contiguous():
             raise ValueError("down 权重必须是连续的 CUDA Tensor")
         if weight.dtype != torch.bfloat16:
@@ -688,7 +695,7 @@ class LoraDownGrouped:
             raise ValueError("输入和 down 权重的收缩维度不匹配")
 
         output = torch.empty(
-            (a.shape[0], LORA_RANK),
+            (a.shape[0], self.rank),
             device=a.device,
             dtype=a.dtype,
         )
@@ -721,6 +728,7 @@ class LoraDownGrouped:
             output.stride(0),
             output.stride(1),
             self.num_experts,
+            rank=self.rank,
             block_m=self.block_m,
             block_k=self.block_k,
             num_warps=self.num_warps,
@@ -730,7 +738,7 @@ class LoraDownGrouped:
 
 
 class LoraUpGrouped:
-    """LoRA up：权重使用连续的 ``[E, 16, N]`` 布局。"""
+    """LoRA up：权重使用连续的 ``[E, R, N]`` 布局。"""
 
     def __init__(
         self,
@@ -739,8 +747,9 @@ class LoraUpGrouped:
         block_n: int = 256,
         num_warps: int = 8,
     ):
-        if weight.ndim != 3 or weight.shape[1] != LORA_RANK:
-            raise ValueError("up 权重形状必须是 [E, 16, N]")
+        if weight.ndim != 3:
+            raise ValueError("up 权重形状必须是 [E, R, N]")
+        self.rank = _check_lora_rank(weight.shape[1])
         if not weight.is_cuda or not weight.is_contiguous():
             raise ValueError("up 权重必须是连续的 CUDA Tensor")
         if weight.dtype != torch.bfloat16:
@@ -771,8 +780,8 @@ class LoraUpGrouped:
             self.weight,
             batch_sizes,
         )
-        if hidden.shape[1] != LORA_RANK:
-            raise ValueError("up 输入的最后一维必须是 16")
+        if hidden.shape[1] != self.rank:
+            raise ValueError("up 输入的 rank 与权重不匹配")
 
         output = torch.empty(
             (hidden.shape[0], self.output_size),
@@ -812,6 +821,7 @@ class LoraUpGrouped:
             output.stride(0),
             output.stride(1),
             self.num_experts,
+            rank=self.rank,
             block_m=self.block_m,
             block_n=self.block_n,
             num_warps=self.num_warps,
@@ -835,11 +845,9 @@ class LoraFusedDownUpGrouped:
     ):
         if down_weight.shape != up_weight.shape:
             raise ValueError("down 和 up 权重形状必须相同")
-        if (
-            down_weight.ndim != 3
-            or down_weight.shape[1] != LORA_RANK
-        ):
-            raise ValueError("权重形状必须是 [E, 16, K]")
+        if down_weight.ndim != 3:
+            raise ValueError("权重形状必须是 [E, R, K]")
+        self.rank = _check_lora_rank(down_weight.shape[1])
         if (
             not down_weight.is_cuda
             or not up_weight.is_cuda
@@ -890,7 +898,7 @@ class LoraFusedDownUpGrouped:
             raise ValueError("输入和 down 权重的收缩维度不匹配")
 
         hidden = torch.empty(
-            (a.shape[0], LORA_RANK),
+            (a.shape[0], self.rank),
             device=a.device,
             dtype=a.dtype,
         )
@@ -936,6 +944,7 @@ class LoraFusedDownUpGrouped:
             output.stride(0),
             output.stride(1),
             self.num_experts,
+            rank=self.rank,
             block_m=self.block_m,
             block_k=self.block_k,
             block_n=self.block_n,
@@ -960,11 +969,9 @@ class LoraFusedAgradGrouped:
     ):
         if up_weight.shape != down_weight.shape:
             raise ValueError("down 和 up 权重形状必须相同")
-        if (
-            up_weight.ndim != 3
-            or up_weight.shape[1] != LORA_RANK
-        ):
-            raise ValueError("权重形状必须是 [E, 16, K]")
+        if up_weight.ndim != 3:
+            raise ValueError("权重形状必须是 [E, R, K]")
+        self.rank = _check_lora_rank(up_weight.shape[1])
         if (
             not up_weight.is_cuda
             or not down_weight.is_cuda
@@ -1009,7 +1016,7 @@ class LoraFusedAgradGrouped:
             raise ValueError("输出梯度维度与权重不匹配")
 
         grad_hidden = torch.empty(
-            (grad_output.shape[0], LORA_RANK),
+            (grad_output.shape[0], self.rank),
             device=grad_output.device,
             dtype=grad_output.dtype,
         )
@@ -1051,6 +1058,7 @@ class LoraFusedAgradGrouped:
             grad_input.stride(0),
             grad_input.stride(1),
             self.num_experts,
+            rank=self.rank,
             block_m=self.block_m,
             block_k=self.block_k,
             num_warps=self.num_warps,
@@ -1060,7 +1068,7 @@ class LoraFusedAgradGrouped:
 
 
 class LoraBgradGrouped:
-    """计算 rank=16 LoRA grouped GEMM 的权重梯度。"""
+    """计算 rank=16/32 LoRA grouped GEMM 的权重梯度。"""
 
     def __init__(
         self,
@@ -1092,11 +1100,11 @@ class LoraBgradGrouped:
     ) -> torch.Tensor:
         if (
             lhs.ndim != 2
-            or lhs.shape[1] != LORA_RANK
             or rhs.ndim != 2
             or rhs.shape[1] != self.hidden_size
         ):
-            raise ValueError("lhs/rhs 形状必须是 [N,16] 和 [N,K]")
+            raise ValueError("lhs/rhs 形状必须是 [N,R] 和 [N,K]")
+        rank = _check_lora_rank(lhs.shape[1])
         if lhs.shape[0] != rhs.shape[0]:
             raise ValueError("lhs 和 rhs 行数必须相同")
         if (
@@ -1112,7 +1120,7 @@ class LoraBgradGrouped:
             raise ValueError("batch_sizes 的长度必须等于 expert 数")
 
         output = torch.empty(
-            (self.num_experts, LORA_RANK, self.hidden_size),
+            (self.num_experts, rank, self.hidden_size),
             device=lhs.device,
             dtype=lhs.dtype,
         )
@@ -1142,6 +1150,7 @@ class LoraBgradGrouped:
             output.stride(0),
             output.stride(1),
             output.stride(2),
+            rank=rank,
             block_tokens=self.block_tokens,
             block_n=self.block_n,
             num_warps=self.num_warps,
@@ -1161,16 +1170,15 @@ class _LoraFusedDownUp(torch.autograd.Function):
         batch_sizes: torch.Tensor,
     ) -> torch.Tensor:
         _check_common(a, down_weight, batch_sizes)
-        if down_weight.shape[1] != LORA_RANK:
-            raise ValueError("权重形状必须是 [E, 16, K]")
+        rank = _check_lora_rank(down_weight.shape[1])
         if a.shape[1] != down_weight.shape[2]:
             raise ValueError("输入和权重的隐藏维度不匹配")
         if (
             up_weight.ndim != 3
             or up_weight.shape[0] != down_weight.shape[0]
-            or up_weight.shape[1] != LORA_RANK
+            or up_weight.shape[1] != rank
         ):
-            raise ValueError("up 权重形状必须是 [E, 16, N]")
+            raise ValueError("up 权重形状必须是 [E, R, N]")
         if (
             not up_weight.is_cuda
             or not up_weight.is_contiguous()
@@ -1205,7 +1213,7 @@ class _LoraFusedDownUp(torch.autograd.Function):
             down_weight.permute(0, 2, 1).contiguous()
         )
         hidden = torch.empty(
-            (a.shape[0], LORA_RANK),
+            (a.shape[0], rank),
             device=a.device,
             dtype=a.dtype,
         )
@@ -1239,6 +1247,7 @@ class _LoraFusedDownUp(torch.autograd.Function):
                 output.stride(0),
                 output.stride(1),
                 down_weight.shape[0],
+                rank=rank,
                 block_m=block_m,
                 block_k=block_k,
                 block_n=block_n,
@@ -1281,6 +1290,7 @@ class _LoraFusedDownUp(torch.autograd.Function):
         grad_hidden = torch.empty_like(hidden)
         grad_input = torch.empty_like(a)
         num_experts = down_weight.shape[0]
+        rank = down_weight.shape[1]
         input_size = a.shape[1]
         output_size = grad_output.shape[1]
 
@@ -1309,6 +1319,7 @@ class _LoraFusedDownUp(torch.autograd.Function):
                 grad_input.stride(0),
                 grad_input.stride(1),
                 num_experts,
+                rank=rank,
                 block_m=context.block_m,
                 block_k=context.block_k,
                 num_warps=context.num_warps,
@@ -1335,6 +1346,7 @@ class _LoraFusedDownUp(torch.autograd.Function):
             grad_down_weight.stride(0),
             grad_down_weight.stride(1),
             grad_down_weight.stride(2),
+            rank=rank,
             block_tokens=128,
             block_n=256,
             num_warps=4,
@@ -1357,6 +1369,7 @@ class _LoraFusedDownUp(torch.autograd.Function):
             grad_up_weight.stride(0),
             grad_up_weight.stride(1),
             grad_up_weight.stride(2),
+            rank=rank,
             block_tokens=128,
             block_n=256,
             num_warps=4,
