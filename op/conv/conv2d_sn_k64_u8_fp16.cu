@@ -1,19 +1,20 @@
-#include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <iomanip>
+#include <iostream>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include "cuda_utils.cuh"
+#include "config.h"
 #include "ptx_utils.cuh"
 
 // =============================================================================
-// snn_conv2d_if_64x64_k16_fp16 — Fused SNN Conv2D + IF HardReset (fp16)
+// snn_conv2d_lif_64x64_k16_fp16 — Fused SNN Conv2D + LIF HardReset (fp16)
 //
-// Based on conv2d_k64_specialized_fp16acc_v2, with IF neuron fused in-register.
+// Based on conv2d_k64_specialized_fp16acc_v2, with LIF neuron fused in-register.
 //
 // Key differences vs fp16acc_v2:
-//   output_frag[T][8]  __half2  →  consumed by IF loop, freed before epilogue
+//   output_frag[T][8]  __half2  →  consumed by LIF loop, freed before epilogue
 //   v_state[8]         __half2  →  membrane potential, .x=row0  .y=row1
 //   packed_row0/1[8]   uint8    →  T-bit packed spike output per output position
 //   epilogue           stg8     →  uint8[C_out][H_out*W_out]  (vs stg16 half[T]...)
@@ -26,7 +27,7 @@
 
 template <int T_STEPS, int Kh, int Kw, int Sh, int Sw, int Ph, int Pw>
 __global__ __launch_bounds__(256, 3)
-void snn_conv2d_if_64x64_k16_fp16(
+void snn_conv2d_lif_64x64_k16_fp16(
     const uint8_t * __restrict__ inputs,
     const __half  * __restrict__ weights,
     const __half2 * __restrict__ bias,
@@ -34,7 +35,7 @@ void snn_conv2d_if_64x64_k16_fp16(
     Conv2DParam param,
     int   out_ch_padded,
     float v_th_f,
-    float v_reset_f)
+    float tau_f)
 {
     static_assert(T_STEPS >= 1 && T_STEPS <= 8);
 
@@ -198,42 +199,82 @@ void snn_conv2d_if_64x64_k16_fp16(
     asm volatile("cp.async.wait_all;\n" :::);
 
     // =========================================================================
-    // IF HardReset — entirely in __half2 registers
+    // LIF neuron — in __half2 registers, v_reset fixed to 0
     //
-    // v_state[j].x  membrane potential, M-row 0, N-position (mma_tid_x*8 + j)
-    // v_state[j].y  membrane potential, M-row 1, N-position (mma_tid_x*8 + j)
-    //
-    // After the loop, output_frag is fully consumed → its 4T registers are freed.
+    // t=0: v = output_frag[0] * tau
+    // t>0: v += (output_frag[t] - v) * tau
     // =========================================================================
-    const __half v_th_h    = __float2half(v_th_f);
-    const __half v_reset_h = __float2half(v_reset_f);
+    const __half2 v_th2 = __float2half2_rn(v_th_f);
+    const __half2 tau2  = __float2half2_rn(tau_f);
 
-    __half2  v_state[8];
-    uint8_t  packed_row0[8], packed_row1[8];
+    __half2 v_state[8];
 #pragma unroll
-    for (int j = 0; j < 8; j++) {
-        v_state[j]    = __float2half2_rn(0.f);
-        packed_row0[j] = 0;
-        packed_row1[j] = 0;
+    for (int j = 0; j < 8; j++)
+    {
+        v_state[j] = __float2half2_rn(0.f);
     }
 
+    uint32_t lo0 = 0;
+    uint32_t hi0 = 0;
+    uint32_t lo1 = 0;
+    uint32_t hi1 = 0;
+
+    // t = 0
 #pragma unroll
-    for (int t = 0; t < T_STEPS; t++)
+    for (int j = 0; j < 8; j++)
+    {
+        v_state[j] = __hmul2(output_frag[0][j], tau2);
+
+        uint32_t spike_mask = __hge2_mask(v_state[j], v_th2);
+        int s0 = spike_mask & 1;
+        int s1 = (spike_mask >> 16) & 1;
+
+        if (j < 4)
+        {
+            lo0 |= (uint32_t)s0 << (j * 8);
+            lo1 |= (uint32_t)s1 << (j * 8);
+        }
+        else
+        {
+            hi0 |= (uint32_t)s0 << ((j - 4) * 8);
+            hi1 |= (uint32_t)s1 << ((j - 4) * 8);
+        }
+
+        uint32_t state_bits = *reinterpret_cast<uint32_t *>(&v_state[j]);
+        state_bits &= ~spike_mask;
+        v_state[j] = *reinterpret_cast<__half2 *>(&state_bits);
+    }
+
+    // t > 0
+#pragma unroll
+    for (int t = 1; t < T_STEPS; t++)
     {
 #pragma unroll
         for (int j = 0; j < 8; j++)
         {
-            v_state[j] = __hadd2(v_state[j], output_frag[t][j]);
+            v_state[j] = __hadd2(
+                v_state[j],
+                __hmul2(__hsub2(output_frag[t][j], v_state[j]), tau2));
 
-            int s0 = __hge(v_state[j].x, v_th_h) ? 1 : 0;
-            int s1 = __hge(v_state[j].y, v_th_h) ? 1 : 0;
+            uint32_t spike_mask = __hge2_mask(v_state[j], v_th2);
+            int s0 = spike_mask & 1;
+            int s1 = (spike_mask >> 16) & 1;
 
-            packed_row0[j] |= (uint8_t)(s0 << t);
-            packed_row1[j] |= (uint8_t)(s1 << t);
+            int shift = (j % 4) * 8 + t;
+            if (j < 4)
+            {
+                lo0 |= (uint32_t)s0 << shift;
+                lo1 |= (uint32_t)s1 << shift;
+            }
+            else
+            {
+                hi0 |= (uint32_t)s0 << shift;
+                hi1 |= (uint32_t)s1 << shift;
+            }
 
-            // HardReset (branchless via conditional assignment → setp + selp.b16)
-            v_state[j].x = s0 ? v_reset_h : v_state[j].x;
-            v_state[j].y = s1 ? v_reset_h : v_state[j].y;
+            uint32_t state_bits = *reinterpret_cast<uint32_t *>(&v_state[j]);
+            state_bits &= ~spike_mask;
+            v_state[j] = *reinterpret_cast<__half2 *>(&state_bits);
         }
     }
 
@@ -255,15 +296,6 @@ void snn_conv2d_if_64x64_k16_fp16(
     const int smem_m1 = mma_tid_y * 2 + 1;
     const int smem_n  = mma_tid_x * 8;
 
-    uint32_t lo0 = (uint32_t)packed_row0[0] | ((uint32_t)packed_row0[1] << 8)
-                 | ((uint32_t)packed_row0[2] << 16) | ((uint32_t)packed_row0[3] << 24);
-    uint32_t hi0 = (uint32_t)packed_row0[4] | ((uint32_t)packed_row0[5] << 8)
-                 | ((uint32_t)packed_row0[6] << 16) | ((uint32_t)packed_row0[7] << 24);
-    uint32_t lo1 = (uint32_t)packed_row1[0] | ((uint32_t)packed_row1[1] << 8)
-                 | ((uint32_t)packed_row1[2] << 16) | ((uint32_t)packed_row1[3] << 24);
-    uint32_t hi1 = (uint32_t)packed_row1[4] | ((uint32_t)packed_row1[5] << 8)
-                 | ((uint32_t)packed_row1[6] << 16) | ((uint32_t)packed_row1[7] << 24);
-
     uint32_t a0 = ptx::smem_u32addr(&warp_smem8[smem_m0 * 32 + smem_n]);
     uint32_t a1 = ptx::smem_u32addr(&warp_smem8[smem_m1 * 32 + smem_n]);
     ptx::sts32(lo0, a0);  ptx::sts32(hi0, a0 + 4);
@@ -272,7 +304,8 @@ void snn_conv2d_if_64x64_k16_fp16(
     __syncthreads();
 
 #pragma unroll
-    for (int m_row = 0; m_row < 16; m_row++) {
+    for (int m_row = 0; m_row < 16; m_row++)
+    {
         const int  m_global = warp_m_global + m_row;
         const bool m_valid  = (m_global < (int)param.out_ch);
         const uint8_t val   = warp_smem8[lane_id + m_row * 32];
@@ -293,7 +326,8 @@ static void pad_weights_sn_fp16(
     int in_features_padded, int C_out_padded)
 {
     for (int k = 0; k < in_features_padded; k++)
-        for (int m = 0; m < C_out_padded; m++) {
+        for (int m = 0; m < C_out_padded; m++)
+        {
             float v = (k < in_features && m < C_out) ? src[k * C_out + m] : 0.f;
             dst[k * C_out_padded + m] = __float2half(v);
         }
@@ -309,48 +343,87 @@ void snn_conv2d_sn_fp16_launch(
     const uint8_t *d_inputs, const __half *d_weights_padded,
     const __half2 *d_bias,
     uint8_t *d_outputs, Conv2DParam &param, int out_ch_padded,
-    float v_th, float v_reset)
+    float v_th, float tau)
 {
     dim3 block(256);
     dim3 grid(((int)param.outHW + 63) / 64, ((int)param.out_ch + 63) / 64, 1);
-    snn_conv2d_if_64x64_k16_fp16<T, Kh, Kw, Sh, Sw, Ph, Pw>
+    snn_conv2d_lif_64x64_k16_fp16<T, Kh, Kw, Sh, Sw, Ph, Pw>
         <<<grid, block>>>(d_inputs, d_weights_padded, d_bias, d_outputs,
-                          param, out_ch_padded, v_th, v_reset);
+                          param, out_ch_padded, v_th, tau);
 }
 
 void snn_conv2d_sn_fp16_1x1_s1_launch(
     const uint8_t *d_in, const __half *d_w, const __half2 *d_bias, uint8_t *d_out,
-    Conv2DParam &param, int T, int Co_p, float v_th, float v_reset)
+    Conv2DParam &param, int T, int Co_p, float v_th, float tau)
 {
-    switch (T) {
-        case 1: snn_conv2d_sn_fp16_launch<1,1,1,1,1,0,0>(d_in,d_w,d_bias,d_out,param,Co_p,v_th,v_reset); break;
-        case 2: snn_conv2d_sn_fp16_launch<2,1,1,1,1,0,0>(d_in,d_w,d_bias,d_out,param,Co_p,v_th,v_reset); break;
-        case 3: snn_conv2d_sn_fp16_launch<3,1,1,1,1,0,0>(d_in,d_w,d_bias,d_out,param,Co_p,v_th,v_reset); break;
-        case 4: snn_conv2d_sn_fp16_launch<4,1,1,1,1,0,0>(d_in,d_w,d_bias,d_out,param,Co_p,v_th,v_reset); break;
+    switch (T)
+    {
+        case 1:
+            snn_conv2d_sn_fp16_launch<1, 1, 1, 1, 1, 0, 0>(
+                d_in, d_w, d_bias, d_out, param, Co_p, v_th, tau);
+            break;
+        case 2:
+            snn_conv2d_sn_fp16_launch<2, 1, 1, 1, 1, 0, 0>(
+                d_in, d_w, d_bias, d_out, param, Co_p, v_th, tau);
+            break;
+        case 3:
+            snn_conv2d_sn_fp16_launch<3, 1, 1, 1, 1, 0, 0>(
+                d_in, d_w, d_bias, d_out, param, Co_p, v_th, tau);
+            break;
+        case 4:
+            snn_conv2d_sn_fp16_launch<4, 1, 1, 1, 1, 0, 0>(
+                d_in, d_w, d_bias, d_out, param, Co_p, v_th, tau);
+            break;
     }
 }
 
 void snn_conv2d_sn_fp16_3x3_s1_launch(
     const uint8_t *d_in, const __half *d_w, const __half2 *d_bias, uint8_t *d_out,
-    Conv2DParam &param, int T, int Co_p, float v_th, float v_reset)
+    Conv2DParam &param, int T, int Co_p, float v_th, float tau)
 {
-    switch (T) {
-        case 1: snn_conv2d_sn_fp16_launch<1,3,3,1,1,1,1>(d_in,d_w,d_bias,d_out,param,Co_p,v_th,v_reset); break;
-        case 2: snn_conv2d_sn_fp16_launch<2,3,3,1,1,1,1>(d_in,d_w,d_bias,d_out,param,Co_p,v_th,v_reset); break;
-        case 3: snn_conv2d_sn_fp16_launch<3,3,3,1,1,1,1>(d_in,d_w,d_bias,d_out,param,Co_p,v_th,v_reset); break;
-        case 4: snn_conv2d_sn_fp16_launch<4,3,3,1,1,1,1>(d_in,d_w,d_bias,d_out,param,Co_p,v_th,v_reset); break;
+    switch (T)
+    {
+        case 1:
+            snn_conv2d_sn_fp16_launch<1, 3, 3, 1, 1, 1, 1>(
+                d_in, d_w, d_bias, d_out, param, Co_p, v_th, tau);
+            break;
+        case 2:
+            snn_conv2d_sn_fp16_launch<2, 3, 3, 1, 1, 1, 1>(
+                d_in, d_w, d_bias, d_out, param, Co_p, v_th, tau);
+            break;
+        case 3:
+            snn_conv2d_sn_fp16_launch<3, 3, 3, 1, 1, 1, 1>(
+                d_in, d_w, d_bias, d_out, param, Co_p, v_th, tau);
+            break;
+        case 4:
+            snn_conv2d_sn_fp16_launch<4, 3, 3, 1, 1, 1, 1>(
+                d_in, d_w, d_bias, d_out, param, Co_p, v_th, tau);
+            break;
     }
 }
 
 void snn_conv2d_sn_fp16_3x3_s2_launch(
     const uint8_t *d_in, const __half *d_w, const __half2 *d_bias, uint8_t *d_out,
-    Conv2DParam &param, int T, int Co_p, float v_th, float v_reset)
+    Conv2DParam &param, int T, int Co_p, float v_th, float tau)
 {
-    switch (T) {
-        case 1: snn_conv2d_sn_fp16_launch<1,3,3,2,2,1,1>(d_in,d_w,d_bias,d_out,param,Co_p,v_th,v_reset); break;
-        case 2: snn_conv2d_sn_fp16_launch<2,3,3,2,2,1,1>(d_in,d_w,d_bias,d_out,param,Co_p,v_th,v_reset); break;
-        case 3: snn_conv2d_sn_fp16_launch<3,3,3,2,2,1,1>(d_in,d_w,d_bias,d_out,param,Co_p,v_th,v_reset); break;
-        case 4: snn_conv2d_sn_fp16_launch<4,3,3,2,2,1,1>(d_in,d_w,d_bias,d_out,param,Co_p,v_th,v_reset); break;
+    switch (T)
+    {
+        case 1:
+            snn_conv2d_sn_fp16_launch<1, 3, 3, 2, 2, 1, 1>(
+                d_in, d_w, d_bias, d_out, param, Co_p, v_th, tau);
+            break;
+        case 2:
+            snn_conv2d_sn_fp16_launch<2, 3, 3, 2, 2, 1, 1>(
+                d_in, d_w, d_bias, d_out, param, Co_p, v_th, tau);
+            break;
+        case 3:
+            snn_conv2d_sn_fp16_launch<3, 3, 3, 2, 2, 1, 1>(
+                d_in, d_w, d_bias, d_out, param, Co_p, v_th, tau);
+            break;
+        case 4:
+            snn_conv2d_sn_fp16_launch<4, 3, 3, 2, 2, 1, 1>(
+                d_in, d_w, d_bias, d_out, param, Co_p, v_th, tau);
+            break;
     }
 }
 
@@ -366,14 +439,14 @@ void snn_conv2d_sn_fp16_3x3_s2_launch(
 // =============================================================================
 
 template <int Kh, int Kw, int Sh, int Sw, int Ph, int Pw>
-static void snn_conv2d_if_fp16_cpu_ref(
+static void snn_conv2d_lif_fp16_cpu_ref(
     const uint8_t *inputs,        // [C_in][H][W]
     const __half  *h_weightsP,    // [in_feat_padded][C_out_padded]  (padded fp16)
     uint8_t       *outputs,       // [C_out][H_out*W_out]
     int T, int C_in, int H, int W, int C_out,
     int in_feat_padded, int C_out_padded,
     const float *bias,
-    float v_th, float v_reset)
+    float v_th, float tau)
 {
     constexpr int KhKw = Kh * Kw;
     int in_features = C_in * KhKw;
@@ -388,11 +461,11 @@ static void snn_conv2d_if_fp16_cpu_ref(
             for (int ow = 0; ow < W_out; ow++)
             {
                 // Accumulate conv in fp16, same K-major order as GPU
-                float conv_t[8] = {};   // fp32 scratch (will be rounded to fp16 per step)
+                __half conv_t[8] = {};
                 for (int t = 0; t < T; t++)
                 {
                     // Track in fp16 to match GPU accumulation precision
-                    __half acc_h = __float2half(0.f);
+                    __half acc_h = __float2half(bias[m]);
                     for (int k = 0; k < in_feat_padded; k++)
                     {
                         int spike = 0;
@@ -406,26 +479,45 @@ static void snn_conv2d_if_fp16_cpu_ref(
                             if (ih >= 0 && ih < H && iw >= 0 && iw < W)
                                 spike = (inputs[c_idx*H*W + ih*W + iw] >> t) & 1;
                         }
-                        if (spike) {
+                        if (spike)
+                        {
                             // fp16 add: same rounding as GPU add.f16x2
                             float new_acc = __half2float(acc_h)
                                           + __half2float(h_weightsP[k * C_out_padded + m]);
                             acc_h = __float2half(new_acc);
                         }
                     }
-                    conv_t[t] = __half2float(acc_h);
+                    conv_t[t] = acc_h;
                 }
 
-                // IF HardReset in fp16 (matches GPU v_state in __half)
-                __half v_h = __float2half(bias[m]);
-                for (int t = 0; t < T; t++)
+                // LIF HardReset in fp16 (matches GPU v_state in __half).
+                const __half tau_h  = __float2half(tau);
+                const __half v_th_h = __float2half(v_th);
+
+                __half v_h = __float2half(
+                    __half2float(conv_t[0]) * __half2float(tau_h));
+                int spike = (__half2float(v_h) >= __half2float(v_th_h)) ? 1 : 0;
+                if (spike)
                 {
-                    float new_v = __half2float(v_h) + conv_t[t];
-                    v_h = __float2half(new_v);   // fp16 state add
-                    int spike = (__half2float(v_h) >= v_th) ? 1 : 0;
-                    if (spike) {
-                        outputs[m * H_out * W_out + oh * W_out + ow] |= (uint8_t)(1 << t);
-                        v_h = __float2half(v_reset);
+                    outputs[m * H_out * W_out + oh * W_out + ow] |= 1u;
+                    v_h = __float2half(0.f);
+                }
+
+                for (int t = 1; t < T; t++)
+                {
+                    __half diff_h = __float2half(
+                        __half2float(conv_t[t]) - __half2float(v_h));
+                    __half update_h = __float2half(
+                        __half2float(diff_h) * __half2float(tau_h));
+                    v_h = __float2half(
+                        __half2float(v_h) + __half2float(update_h));
+                    spike =
+                        (__half2float(v_h) >= __half2float(v_th_h)) ? 1 : 0;
+                    if (spike)
+                    {
+                        outputs[m * H_out * W_out + oh * W_out + ow] |=
+                            (uint8_t)(1 << t);
+                        v_h = __float2half(0.f);
                     }
                 }
             }
@@ -440,7 +532,7 @@ static void snn_conv2d_if_fp16_cpu_ref(
 
 template <int T, int Kh, int Kw, int Sh, int Sw, int Ph, int Pw>
 void snn_conv2d_sn_fp16_test(int C_in, int H, int W, int C_out,
-                              float v_th, float v_reset, const char *label)
+                              float v_th, float tau, const char *label)
 {
     constexpr int KhKw = Kh * Kw, K_CHUNK = 16;
     int H_out = (H+2*Ph-Kh)/Sh+1, W_out = (W+2*Pw-Kw)/Sw+1;
@@ -448,8 +540,15 @@ void snn_conv2d_sn_fp16_test(int C_in, int H, int W, int C_out,
     int in_feat_p = (in_feat + K_CHUNK - 1) / K_CHUNK * K_CHUNK;
     int Co_p = (C_out + 63) / 64 * 64;
 
-    printf("  [%s] T=%d C_in=%d H=%d C_out=%d -> H_out=%d  ",
-           label, T, C_in, H, C_out, H_out);
+    std::cout << "  [" << label << "]"
+              << " T=" << T
+              << " C_in=" << C_in
+              << " H=" << H
+              << " C_out=" << C_out
+              << " -> H_out=" << H_out
+              << " v_th=" << std::fixed << std::setprecision(2) << v_th
+              << " tau=" << tau
+              << "  ";
 
     size_t isz = (size_t)C_in*H*W;
     size_t wsz = (size_t)in_feat*C_out;
@@ -465,7 +564,8 @@ void snn_conv2d_sn_fp16_test(int C_in, int H, int W, int C_out,
     uint8_t *h_ref  = new uint8_t[osz];
 
     srand(42);
-    for (size_t i = 0; i < isz; i++) {
+    for (size_t i = 0; i < isz; i++)
+    {
         uint8_t p = 0;
         for (int t = 0; t < T; t++) if (rand()&1) p |= (1u<<t);
         h_in[i] = p;
@@ -496,30 +596,42 @@ void snn_conv2d_sn_fp16_test(int C_in, int H, int W, int C_out,
     p.Kh=Kh; p.Kw=Kw; p.KhKw=KhKw; p.Sh=Sh; p.Sw=Sw; p.Ph=Ph; p.Pw=Pw;
 
     snn_conv2d_sn_fp16_launch<T,Kh,Kw,Sh,Sw,Ph,Pw>(
-        d_in, d_wp, d_bias, d_out, p, Co_p, v_th, v_reset);
+        d_in, d_wp, d_bias, d_out, p, Co_p, v_th, tau);
 
     cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        printf("CUDA error: %s\n", cudaGetErrorString(err));
+    if (err != cudaSuccess)
+    {
+        std::cout << "[FAILED] CUDA error: "
+                  << cudaGetErrorString(err) << '\n';
         goto cleanup;
     }
     cudaDeviceSynchronize();
     cudaMemcpy(h_out, d_out, osz*sizeof(uint8_t), cudaMemcpyDeviceToHost);
 
-    snn_conv2d_if_fp16_cpu_ref<Kh,Kw,Sh,Sw,Ph,Pw>(
+    snn_conv2d_lif_fp16_cpu_ref<Kh,Kw,Sh,Sw,Ph,Pw>(
         h_in, h_wp, h_ref, T, C_in, H, W, C_out,
-        in_feat_p, Co_p, h_bias, v_th, v_reset);
+        in_feat_p, Co_p, h_bias, v_th, tau);
 
     {
         int errors = 0;
-        for (size_t i = 0; i < osz; i++) {
-            if (h_out[i] != h_ref[i]) {
+        for (size_t i = 0; i < osz; i++)
+        {
+            if (h_out[i] != h_ref[i])
+            {
                 if (errors < 5)
-                    printf("\n    Err[%zu] gpu=0x%02x ref=0x%02x", i, h_out[i], h_ref[i]);
+                {
+                    std::cout << "\n    Err[" << i << "] gpu=0x"
+                              << std::hex << std::setw(2) << std::setfill('0')
+                              << static_cast<int>(h_out[i])
+                              << " ref=0x" << std::setw(2)
+                              << static_cast<int>(h_ref[i])
+                              << std::dec << std::setfill(' ');
+                }
                 errors++;
             }
         }
-        printf("  %s (%d errors)\n", errors == 0 ? "PASSED!" : "FAILED", errors);
+        std::cout << (errors == 0 ? "[SUCCESS]" : "[FAILED]")
+                  << " (" << errors << " errors)\n";
     }
 
 cleanup:
@@ -532,32 +644,33 @@ cleanup:
 int main()
 {
     const float V_TH    = 1.0f;
-    const float V_RESET = 0.0f;
+    const float TAU     = 0.5f;
 
-    printf("\n=== snn_conv2d_if_64x64_k16_fp16 correctness tests ===\n");
+    std::cout
+        << "\n=== snn_conv2d_lif_64x64_k16_fp16 correctness tests ===\n";
 
-    printf("\n--- 1x1, s=1, p=0 ---\n");
-    snn_conv2d_sn_fp16_test<4,1,1,1,1,0,0>( 64, 80, 80,  64, V_TH, V_RESET, "base");
-    snn_conv2d_sn_fp16_test<4,1,1,1,1,0,0>(128, 40, 40, 128, V_TH, V_RESET, "C128");
-    snn_conv2d_sn_fp16_test<2,1,1,1,1,0,0>( 64, 80, 80,  48, V_TH, V_RESET, "C_out boundary");
-    snn_conv2d_sn_fp16_test<1,1,1,1,1,0,0>( 64, 80, 80,  64, V_TH, V_RESET, "T=1");
-    snn_conv2d_sn_fp16_test<4,1,1,1,1,0,0>( 64, 40, 40, 128, V_TH, V_RESET, "expand x2");
-    snn_conv2d_sn_fp16_test<4,1,1,1,1,0,0>(128, 40, 40,  64, V_TH, V_RESET, "squeeze x0.5");
+    std::cout << "\n--- 1x1, s=1, p=0 ---\n";
+    snn_conv2d_sn_fp16_test<4,1,1,1,1,0,0>( 64, 80, 80,  64, V_TH, TAU, "base");
+    snn_conv2d_sn_fp16_test<4,1,1,1,1,0,0>(128, 40, 40, 128, V_TH, TAU, "C128");
+    snn_conv2d_sn_fp16_test<2,1,1,1,1,0,0>( 64, 80, 80,  48, V_TH, TAU, "C_out boundary");
+    snn_conv2d_sn_fp16_test<1,1,1,1,1,0,0>( 64, 80, 80,  64, V_TH, TAU, "T=1");
+    snn_conv2d_sn_fp16_test<4,1,1,1,1,0,0>( 64, 40, 40, 128, V_TH, TAU, "expand x2");
+    snn_conv2d_sn_fp16_test<4,1,1,1,1,0,0>(128, 40, 40,  64, V_TH, TAU, "squeeze x0.5");
 
-    printf("\n--- 3x3, s=1, p=1 ---\n");
-    snn_conv2d_sn_fp16_test<4,3,3,1,1,1,1>( 64, 80, 80,  64, V_TH, V_RESET, "base");
-    snn_conv2d_sn_fp16_test<4,3,3,1,1,1,1>( 32, 40, 40,  32, V_TH, V_RESET, "small");
-    snn_conv2d_sn_fp16_test<2,3,3,1,1,1,1>( 32, 43, 43,  48, V_TH, V_RESET, "boundary");
-    snn_conv2d_sn_fp16_test<1,3,3,1,1,1,1>( 64, 80, 80,  64, V_TH, V_RESET, "T=1");
-    snn_conv2d_sn_fp16_test<3,3,3,1,1,1,1>( 64, 80, 80,  64, V_TH, V_RESET, "T=3");
+    std::cout << "\n--- 3x3, s=1, p=1 ---\n";
+    snn_conv2d_sn_fp16_test<4,3,3,1,1,1,1>( 64, 80, 80,  64, V_TH, TAU, "base");
+    snn_conv2d_sn_fp16_test<4,3,3,1,1,1,1>( 32, 40, 40,  32, V_TH, TAU, "small");
+    snn_conv2d_sn_fp16_test<2,3,3,1,1,1,1>( 32, 43, 43,  48, V_TH, TAU, "boundary");
+    snn_conv2d_sn_fp16_test<1,3,3,1,1,1,1>( 64, 80, 80,  64, V_TH, TAU, "T=1");
+    snn_conv2d_sn_fp16_test<3,3,3,1,1,1,1>( 64, 80, 80,  64, V_TH, TAU, "T=3");
 
-    printf("\n--- 3x3, s=2, p=1 ---\n");
-    snn_conv2d_sn_fp16_test<4,3,3,2,2,1,1>( 64, 80, 80,  64, V_TH, V_RESET, "H_out=40");
-    snn_conv2d_sn_fp16_test<4,3,3,2,2,1,1>( 32, 80, 80,  64, V_TH, V_RESET, "C expand");
-    snn_conv2d_sn_fp16_test<4,3,3,2,2,1,1>( 16, 40, 40,  32, V_TH, V_RESET, "small H=40");
-    snn_conv2d_sn_fp16_test<2,3,3,2,2,1,1>( 32, 43, 43, 128, V_TH, V_RESET, "boundary");
+    std::cout << "\n--- 3x3, s=2, p=1 ---\n";
+    snn_conv2d_sn_fp16_test<4,3,3,2,2,1,1>( 64, 80, 80,  64, V_TH, TAU, "H_out=40");
+    snn_conv2d_sn_fp16_test<4,3,3,2,2,1,1>( 32, 80, 80,  64, V_TH, TAU, "C expand");
+    snn_conv2d_sn_fp16_test<4,3,3,2,2,1,1>( 16, 40, 40,  32, V_TH, TAU, "small H=40");
+    snn_conv2d_sn_fp16_test<2,3,3,2,2,1,1>( 32, 43, 43, 128, V_TH, 0.25f, "tau=0.25");
 
-    printf("\n=== Done ===\n");
+    std::cout << "\n=== Done ===\n";
     return 0;
 }
 #endif

@@ -48,6 +48,9 @@ class LoRAMoEStandard(nn.Module):
         self.lora_dropout = nn.Dropout(p=lora_dropout)
         self.gmm_backend = gmm_backend
 
+        for parameter in self.original_mlp.parameters():
+            parameter.requires_grad = False
+
         gate_proj = original_mlp.gate_proj
         up_proj = original_mlp.up_proj
         down_proj = original_mlp.down_proj
@@ -309,14 +312,14 @@ class LoRAMoEStandard(nn.Module):
             intermediate_per_expert,
             self.down_lora_A,
         )
-        down_delta_per_expert = torch.einsum(
-            "ner,eir->nei",
-            down_hidden,
-            self.down_lora_B,
+        down_hidden_weighted = (
+            down_hidden * weight_full.unsqueeze(-1)
         )
-        down_delta = (
-            down_delta_per_expert * weight_full.unsqueeze(-1)
-        ).sum(dim=1) * self.scaling
+        down_delta = torch.einsum(
+            "ner,eir->ni",
+            down_hidden_weighted,
+            self.down_lora_B,
+        ) * self.scaling
 
         return (
             down_base + down_delta

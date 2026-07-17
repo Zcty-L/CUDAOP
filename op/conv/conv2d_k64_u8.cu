@@ -1,7 +1,7 @@
 #include <bitset>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include "cuda_utils.cuh"
+#include "config.h"
 #include "ptx_utils.cuh"
 
 // =============================================================================
@@ -228,7 +228,8 @@ __global__ void snn_conv2d_64x64_k16_u8(
                         uint32_t word  = (j < 4) ? input_frag_lo : input_frag_hi;
                         int      shift = (j % 4) * 8 + t;
                         int      spike = (word >> shift) & 1;
-                        add_f32(output_frag[t][i][j], weight_frag[i], spike);
+                        ptx::add_f32(
+                            output_frag[t][i][j], weight_frag[i], spike);
                     }
                 }
             }
@@ -592,6 +593,7 @@ cleanup:
 // Main
 // =============================================================================
 
+#ifndef CONV2D_K64_U8_BENCH_INC
 int main()
 {
     printf("\n=== snn_conv2d_64x64_k16_u8 — three specialized variants ===\n");
@@ -633,3 +635,4 @@ int main()
     printf("\n=== All tests complete ===\n");
     return 0;
 }
+#endif

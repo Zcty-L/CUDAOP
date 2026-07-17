@@ -14,6 +14,30 @@ __device__ __forceinline__ uint32_t smem_u32addr(const void *ptr)
 }
 
 // =============================================================================
+// Global Memory Prefetch
+// =============================================================================
+//
+// Instruction: prefetch.global.L1
+// Source: NVIDIA PTX ISA, data movement and conversion instructions
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html
+// Purpose: issue a cache prefetch for a global memory address without allocating
+// a destination register.
+
+__device__ __forceinline__ void prefetch_global_l1(
+    const void *ptr,
+    bool guard)
+{
+    asm volatile (
+        "{.reg .pred p;\n"
+        " setp.ne.b32 p, %1, 0;\n"
+        " @p prefetch.global.L1 [%0];\n"
+        "}"
+        :
+        : "l"(ptr), "r"((int)guard)
+    );
+}
+
+// =============================================================================
 // Standard Non-Coherent Loads (ldg_nc)
 // =============================================================================
 
@@ -327,6 +351,22 @@ __device__ __forceinline__ void ldg_nc_0(T &reg, const void *ptr, bool guard = t
     else if constexpr (sizeof(T) == 16) { ldg128_nc_0(reg, ptr, guard); }
 }
 
+
+// Instruction: add.f32 with predicate guard
+// Source: NVIDIA PTX ISA, floating-point arithmetic instructions
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html
+// Purpose: conditionally accumulate one FP32 weight for a binary spike.
+__device__ __forceinline__ void add_f32(float &a, const float &b, int guard)
+{
+    asm volatile(
+        "{.reg .pred p;\n"
+        " setp.ne.b32 p, %2, 0;\n"
+        " @p add.f32 %0, %0, %1;\n"
+        "}"
+        : "+f"(a)
+        : "f"(b), "r"(guard)
+    );
+}
 
 // Predicated fp16x2 add: @p add.f16x2 acc, acc, w
 __device__ __forceinline__ void add_f16x2(__half2 &a, const __half2 &b, int guard)
