@@ -85,5 +85,49 @@ module = LoRAMoEStandard(
 ```
 
 `gmm_backend` 支持 `cutlass`、`triton` 和 `cutile`，默认值为
-`cutlass`。Triton 与 cuTile 使用融合 LoRA down/up kernel，目前仅支持
-rank=16；CUTLASS 仍支持通用 rank。
+`cutlass`。Triton 与 cuTile 支持 rank=16/32，并在 Group 路径中完成
+前向和反向分发；CUTLASS 仍支持通用 rank。
+
+标准 LoRA-MoE 的 CUTLASS 路径通过合并 GMM 计算 gate/up；Triton 和
+cuTile 路径分别使用各自的两路 fused LoRA kernel，均支持 rank=16/32，
+便于在相同模型配置下独立对比三个后端。
+
+## RTX 5070 Ti Laptop 吞吐测试
+
+测试设备与配置：
+
+- GPU：NVIDIA GeForce RTX 5070 Ti Laptop GPU（SM120，12 GiB）。
+- 数据类型：BF16。
+- PyTorch：2.12.0+cu132。
+- experts=8，rank=16，top_k=2。
+- batch_size=1，seq_len=3507。
+- hidden_size=2048，intermediate_size=8192。
+- 前向 warmup/iterations=10/50。
+- 反向 warmup/iterations=5/20。
+
+最初使用 batch_size=4。该配置下 standard 的三种 Grouped GEMM 后端
+均通过前向和反向精度验证，但 loop backward 在吞吐测试中超出 12 GiB
+显存，因此以下完整端到端对比统一使用 batch_size=1。
+
+### Standard LoRA-MoE
+
+| 方法 | 前向（us） | 反向（us） | 总耗时（us） | tokens/s | 相对 loop | 后端/CUTLASS（tokens/s） |
+|---|---:|---:|---:|---:|---:|---:|
+| loop | 28675.266 | 58458.053 | 87133.319 | 40248.7 | 1.000x | |
+| pad | 38653.164 | 57498.207 | 96151.371 | 36473.7 | 0.906x | |
+| group/CUTLASS | 17784.923 | 30433.742 | 48218.665 | 72731.2 | 1.807x | |
+| group/Triton | 18372.211 | 30985.094 | 49357.305 | 71053.3 | 1.765x | 0.977x |
+| group/cuTile | 18643.066 | 31608.773 | 50251.839 | 69788.5 | 1.734x | 0.960x |
+
+### Nonstandard LoRA-MoE
+
+| 方法 | 前向（us） | 反向（us） | 总耗时（us） | tokens/s | 相对 loop | 后端/CUTLASS（tokens/s） |
+|---|---:|---:|---:|---:|---:|---:|
+| loop | 33504.404 | 26619.587 | 60123.991 | 58329.5 | 1.000x | |
+| pad | 13949.520 | 14744.619 | 28694.139 | 122220.1 | 2.095x | |
+| group/CUTLASS | 17382.111 | 19519.107 | 36901.218 | 95037.5 | 1.629x | |
+| group/Triton | 17344.379 | 18756.389 | 36100.767 | 97144.7 | 1.665x | 1.022x |
+| group/cuTile | 17278.005 | 19042.040 | 36320.045 | 96558.2 | 1.655x | 1.016x |
+
+两个测试的 loop、pad、CUTLASS、Triton 和 cuTile 路径均通过 BF16
+前向精度与反向传播验证，并输出 `[SUCCESS]`。
