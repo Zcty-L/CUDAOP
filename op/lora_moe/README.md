@@ -243,6 +243,38 @@ module = LoRAMoEStandard(
 cuTile 路径分别使用各自的两路 fused LoRA kernel，均支持 rank=16/32，
 便于在相同模型配置下独立对比三个后端。
 
+## RTX 4090 吞吐测试
+
+测试设备与配置：
+
+- GPU：NVIDIA GeForce RTX 4090（SM89，24 GiB）。
+- 驱动：590.44.01。
+- 数据类型：BF16。
+- PyTorch：2.9.1+cu130。
+- experts=8，rank=16，top_k=2。
+- batch_size=1，seq_len=3507。
+- hidden_size=2048，intermediate_size=8192。
+- 前向 warmup/iterations=10/50。
+- 反向 warmup/iterations=5/20。
+
+### Nonstandard LoRA-MoE
+
+| 方法 | 前向（us） | 反向（us） | 总耗时（us） | tokens/s | 相对 loop | 后端/CUTLASS（tokens/s） |
+|---|---:|---:|---:|---:|---:|---:|
+| loop | 9313.587 | 16295.816 | 25609.403 | 136941.9 | 1.000x | |
+| pad | 3410.801 | 4133.486 | 7544.287 | 464855.0 | 3.395x | |
+| group/CUTLASS | 5393.183 | 7792.800 | 13185.983 | 265964.2 | 1.942x | 1.000x |
+| group/Triton | 5332.501 | 6718.346 | 12050.846 | 291016.9 | 2.125x | 1.094x |
+| group/cuTile | 不支持 | 不支持 | 不支持 | 不支持 | 不支持 | 不支持 |
+
+loop、pad、CUTLASS 和 Triton 路径均通过 BF16 前向与反向传播验证，并
+输出 `[SUCCESS]`。相对 loop，CUTLASS 和 Triton 的前向+反向吞吐分别
+提升 1.942x 和 2.125x；Triton 相对 CUTLASS 提升 1.094x。
+
+当前 CUDA 13.1 的 Tile IR 编译器仅支持 SM100、SM103、SM110、SM120
+和 SM121，不支持 RTX 4090 的 SM89，因此 cuTile 无法在该设备上编译，
+测试会明确输出跳过信息，不记录伪造的性能数据。
+
 ## RTX 5070 Ti Laptop 吞吐测试
 
 测试设备与配置：
