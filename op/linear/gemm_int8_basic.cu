@@ -19,6 +19,8 @@ constexpr int K = 2048;
 constexpr int M_TILE = 128;
 constexpr int N_TILE = 128;
 constexpr int K_TILE = 16;
+constexpr int INT8_VALUES_PER_PACK = 4;
+constexpr int K_PACKS = K_TILE / INT8_VALUES_PER_PACK;
 constexpr int THREADS = 256;
 constexpr int THREAD_TILE_M = 8;
 constexpr int THREAD_TILE_N = 8;
@@ -76,8 +78,9 @@ __global__ void gemm_int8_128x128x16_kernel(
     std::int32_t *__restrict__ c,
     int k_size)
 {
-    __shared__ std::int8_t a_shared[M_TILE][K_TILE];
-    __shared__ std::int8_t b_shared[N_TILE][K_TILE];
+    // Each int32 stores four consecutive signed int8 values along K.
+    __shared__ std::int32_t a_shared[M_TILE][K_PACKS];
+    __shared__ std::int32_t b_shared[N_TILE][K_PACKS];
 
     const int thread_id = threadIdx.x;
     const int thread_tile_row = thread_id / 16;
@@ -86,28 +89,35 @@ __global__ void gemm_int8_128x128x16_kernel(
     const int local_n_base = thread_tile_col * THREAD_TILE_N;
     const int global_m_base = blockIdx.y * M_TILE;
     const int global_n_base = blockIdx.x * N_TILE;
+    const int k_size_packed = k_size / INT8_VALUES_PER_PACK;
+    const std::int32_t *a_packed_global =
+        reinterpret_cast<const std::int32_t *>(a);
+    const std::int32_t *b_packed_global =
+        reinterpret_cast<const std::int32_t *>(b);
 
     std::int32_t accumulators[THREAD_TILE_M][THREAD_TILE_N] = {};
 
     for (int k_base = 0; k_base < k_size; k_base += K_TILE)
     {
-        // Each block loads 128 * 16 bytes from A and the same amount from B.
-        // 256 threads each load eight bytes from each operand.
+        // Each block loads 128 * 4 packed int32 values from each operand.
+        // Every packed value contains four consecutive signed int8 values.
         for (int index = thread_id;
-             index < M_TILE * K_TILE;
+             index < M_TILE * K_PACKS;
              index += THREADS)
         {
-            const int row = index / K_TILE;
-            const int k = index % K_TILE;
-            a_shared[row][k] =
-                a[(global_m_base + row) * k_size + k_base + k];
-            b_shared[row][k] =
-                b[(global_n_base + row) * k_size + k_base + k];
+            const int row = index / K_PACKS;
+            const int k_pack = index % K_PACKS;
+            const int global_k_pack =
+                k_base / INT8_VALUES_PER_PACK + k_pack;
+            a_shared[row][k_pack] = a_packed_global[
+                (global_m_base + row) * k_size_packed + global_k_pack];
+            b_shared[row][k_pack] = b_packed_global[
+                (global_n_base + row) * k_size_packed + global_k_pack];
         }
         __syncthreads();
 
-#pragma unroll
-        for (int k = 0; k < K_TILE; ++k)
+#pragma unroll 1
+        for (int k_pack = 0; k_pack < K_PACKS; ++k_pack)
         {
             std::int32_t a_fragment[THREAD_TILE_M];
             std::int32_t b_fragment[THREAD_TILE_N];
@@ -115,15 +125,15 @@ __global__ void gemm_int8_128x128x16_kernel(
 #pragma unroll
             for (int i = 0; i < THREAD_TILE_M; ++i)
             {
-                a_fragment[i] = static_cast<std::int32_t>(
-                    a_shared[local_m_base + i][k]);
+                a_fragment[i] =
+                    a_shared[local_m_base + i][k_pack];
             }
 
 #pragma unroll
             for (int j = 0; j < THREAD_TILE_N; ++j)
             {
-                b_fragment[j] = static_cast<std::int32_t>(
-                    b_shared[local_n_base + j][k]);
+                b_fragment[j] =
+                    b_shared[local_n_base + j][k_pack];
             }
 
 #pragma unroll
@@ -132,8 +142,10 @@ __global__ void gemm_int8_128x128x16_kernel(
 #pragma unroll
                 for (int j = 0; j < THREAD_TILE_N; ++j)
                 {
-                    accumulators[i][j] +=
-                        a_fragment[i] * b_fragment[j];
+                    accumulators[i][j] = __dp4a(
+                        a_fragment[i],
+                        b_fragment[j],
+                        accumulators[i][j]);
                 }
             }
         }
@@ -212,6 +224,7 @@ int main()
     static_assert(M % M_TILE == 0);
     static_assert(N % N_TILE == 0);
     static_assert(K % K_TILE == 0);
+    static_assert(K_TILE % INT8_VALUES_PER_PACK == 0);
     static_assert(
         THREADS * THREAD_TILE_M * THREAD_TILE_N == M_TILE * N_TILE);
 
