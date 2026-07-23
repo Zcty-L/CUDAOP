@@ -33,4 +33,13 @@ typedef struct
     size_t biasWeightsCount;
 } Conv2DParam;
 
+typedef struct
+{
+    uint32_t batch_size;
+    uint32_t input_size;
+    uint32_t hidden_size;
+    uint32_t output_size;
+    uint32_t warmup_iterations;
+    uint32_t benchmark_iterations;
+} NcclMlpParam;
 

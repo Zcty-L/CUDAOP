@@ -86,6 +86,22 @@ endif()
 find_package(CUDAToolkit REQUIRED)
 find_library(CUDNN_LIBRARY cudnn PATHS /usr/lib/x86_64-linux-gnu /usr/local/cuda/lib64 REQUIRED)
 find_path(CUDNN_INCLUDE cudnn.h PATHS /usr/include /usr/local/cuda/include REQUIRED)
+find_library(
+    NCCL_LIBRARY
+    nccl
+    PATHS
+        /usr/lib/x86_64-linux-gnu
+        /usr/local/cuda/lib64
+    REQUIRED
+)
+find_path(
+    NCCL_INCLUDE_DIR
+    nccl.h
+    PATHS
+        /usr/include
+        /usr/local/cuda/include
+    REQUIRED
+)
 
 include_directories(
         ${PROJECT_SOURCE_DIR}
@@ -156,6 +172,37 @@ foreach(SRC_FILE ${OP_SOURCES})
     
     message(STATUS "Added standalone target: ${EXE_NAME}")
 endforeach()
+
+# Validate a two-GPU tensor-parallel MLP with cuBLAS GEMMs and NCCL AllReduce.
+add_executable(
+    nccl_mlp_test
+    op/nccl/nccl_mlp_test.cu
+)
+target_include_directories(
+    nccl_mlp_test
+    PRIVATE
+        ${NCCL_INCLUDE_DIR}
+)
+target_link_libraries(
+    nccl_mlp_test
+    PRIVATE
+        CUDA::cudart
+        CUDA::cublas
+        ${NCCL_LIBRARY}
+)
+target_compile_options(
+    nccl_mlp_test
+    PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v;-Wno-deprecated-gpu-targets>
+)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_test(
+        NAME nccl_mlp_test
+        COMMAND nccl_mlp_test
+    )
+endif()
 
 # Compare separate Conv2D + LIF kernels against the fused Conv2D-LIF kernel.
 add_executable(
