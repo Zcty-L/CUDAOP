@@ -138,6 +138,14 @@ set(OP_SOURCES
     "op/linear/linear_k128.cu"
     "op/linear/linear_sn_k64_u8.cu"
     "op/linear/linear_sn_k64_u8_fp16.cu"
+    "op/test/dram_bandwidth.cu"
+    "op/test/dram_latency.cu"
+    "op/test/l1cache_bandwidth.cu"
+    "op/test/l1cache_latency.cu"
+    "op/test/l2cache_bandwidth.cu"
+    "op/test/l2cache_latency.cu"
+    "op/test/smem_bandwidth.cu"
+    "op/test/smem_latency.cu"
 )
 
 foreach(SRC_FILE ${OP_SOURCES})
@@ -198,6 +206,38 @@ target_compile_options(
 
 include(CTest)
 if(BUILD_TESTING)
+    add_test(
+        NAME dram_bandwidth
+        COMMAND dram_bandwidth
+    )
+    add_test(
+        NAME dram_latency
+        COMMAND dram_latency
+    )
+    add_test(
+        NAME l1cache_bandwidth
+        COMMAND l1cache_bandwidth
+    )
+    add_test(
+        NAME l1cache_latency
+        COMMAND l1cache_latency
+    )
+    add_test(
+        NAME l2cache_bandwidth
+        COMMAND l2cache_bandwidth
+    )
+    add_test(
+        NAME l2cache_latency
+        COMMAND l2cache_latency
+    )
+    add_test(
+        NAME smem_bandwidth
+        COMMAND smem_bandwidth
+    )
+    add_test(
+        NAME smem_latency
+        COMMAND smem_latency
+    )
     add_test(
         NAME nccl_mlp_test
         COMMAND nccl_mlp_test

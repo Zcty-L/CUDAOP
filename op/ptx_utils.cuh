@@ -14,6 +14,27 @@ __device__ __forceinline__ uint32_t smem_u32addr(const void *ptr)
 }
 
 // =============================================================================
+// Clock Counter
+// =============================================================================
+//
+// Instruction: mov.u64 from %clock64
+// Source: NVIDIA PTX ISA, special registers
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#special-registers-clock64
+// Purpose: read the per-SM cycle counter for device-side latency measurement.
+
+__device__ __forceinline__ uint64_t read_clock64()
+{
+    uint64_t value;
+    asm volatile (
+        "mov.u64 %0, %%clock64;"
+        : "=l"(value)
+        :
+        : "memory"
+    );
+    return value;
+}
+
+// =============================================================================
 // Global Memory Prefetch
 // =============================================================================
 //
@@ -40,6 +61,49 @@ __device__ __forceinline__ void prefetch_global_l1(
 // =============================================================================
 // Standard Non-Coherent Loads (ldg_nc)
 // =============================================================================
+
+// Instruction: ld.global.cg.b32
+// Source: NVIDIA PTX ISA, cache operators
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#cache-operators
+// Purpose: load a 32-bit value through the global-memory path while bypassing
+// L1 and caching the line only in L2.
+
+template <typename T>
+__device__ __forceinline__ void ldg32_cg(T &reg, const void *ptr)
+{
+    static_assert(sizeof(T) == 4, "ldg32_cg requires 4-byte type");
+    asm volatile (
+        "ld.global.cg.b32 %0, [%1];"
+        : "=r"(*reinterpret_cast<unsigned*>(&reg))
+        : "l"(ptr)
+        : "memory"
+    );
+}
+
+// Instruction: ld.global.cs.v4.b32
+// Source: NVIDIA PTX ISA, cache operators
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#cache-operators
+// Purpose: issue a 128-bit streaming global load with evict-first cache policy.
+
+template <typename T>
+__device__ __forceinline__ void ldg128_cs(
+    T &reg0,
+    T &reg1,
+    T &reg2,
+    T &reg3,
+    const void *ptr)
+{
+    static_assert(sizeof(T) == 4, "ldg128_cs registers must be 4-byte types");
+    asm volatile (
+        "ld.global.cs.v4.b32 {%0, %1, %2, %3}, [%4];"
+        : "=r"(*reinterpret_cast<unsigned*>(&reg0)),
+          "=r"(*reinterpret_cast<unsigned*>(&reg1)),
+          "=r"(*reinterpret_cast<unsigned*>(&reg2)),
+          "=r"(*reinterpret_cast<unsigned*>(&reg3))
+        : "l"(ptr)
+        : "memory"
+    );
+}
 
 template <typename T>
 __device__ __forceinline__ void ldg16_nc(T &reg, const void *ptr, bool guard)
@@ -73,6 +137,24 @@ __device__ __forceinline__ void ldg32_nc(T &reg, const void *ptr, bool guard)
     );
 }
 
+// Instruction: ld.global.nc.b64
+// Source: NVIDIA PTX ISA, data movement and conversion instructions
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-ld
+// Purpose: issue an unguarded 64-bit non-coherent load for dependent
+// L1/TEX-cache pointer chasing.
+
+template <typename T>
+__device__ __forceinline__ void ldg64_nc(T &reg, const void *ptr)
+{
+    static_assert(sizeof(T) == 8, "ldg64_nc requires 8-byte type");
+    asm volatile (
+        "ld.global.nc.b64 %0, [%1];"
+        : "=l"(*reinterpret_cast<unsigned long long*>(&reg))
+        : "l"(ptr)
+        : "memory"
+    );
+}
+
 template <typename T>
 __device__ __forceinline__ void ldg64_nc(T &reg, const void *ptr, bool guard)
 {
@@ -84,6 +166,28 @@ __device__ __forceinline__ void ldg64_nc(T &reg, const void *ptr, bool guard)
         "}"
         : "=l"(*reinterpret_cast<unsigned long long*>(&reg))
         : "l"(ptr), "r"((int)guard)
+    );
+}
+
+// Instruction: ld.global.nc.v4.b32
+// Source: NVIDIA PTX ISA, data movement and conversion instructions
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-ld
+// Purpose: issue an unguarded 128-bit non-coherent load for L1/TEX-cache
+// throughput measurement.
+
+template <typename T>
+__device__ __forceinline__ void ldg128_nc(T &reg, const void *ptr)
+{
+    static_assert(sizeof(T) == 16, "ldg128_nc requires 16-byte type");
+    unsigned *values = reinterpret_cast<unsigned*>(&reg);
+    asm volatile (
+        "ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+        : "=r"(values[0]),
+          "=r"(values[1]),
+          "=r"(values[2]),
+          "=r"(values[3])
+        : "l"(ptr)
+        : "memory"
     );
 }
 
@@ -258,6 +362,32 @@ __device__ __forceinline__ void sts128(const T &reg0, const T &reg1, const T &re
 // =============================================================================
 // Global Memory Stores (stg)
 // =============================================================================
+
+// Instruction: st.global.cs.v4.b32
+// Source: NVIDIA PTX ISA, cache operators
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#cache-operators
+// Purpose: issue a 128-bit streaming global store with evict-first cache policy.
+
+template <typename T>
+__device__ __forceinline__ void stg128_cs(
+    const T &reg0,
+    const T &reg1,
+    const T &reg2,
+    const T &reg3,
+    void *ptr)
+{
+    static_assert(sizeof(T) == 4, "stg128_cs registers must be 4-byte types");
+    asm volatile (
+        "st.global.cs.v4.b32 [%4], {%0, %1, %2, %3};"
+        :
+        : "r"(*reinterpret_cast<const unsigned*>(&reg0)),
+          "r"(*reinterpret_cast<const unsigned*>(&reg1)),
+          "r"(*reinterpret_cast<const unsigned*>(&reg2)),
+          "r"(*reinterpret_cast<const unsigned*>(&reg3)),
+          "l"(ptr)
+        : "memory"
+    );
+}
 
 template <typename T>
 __device__ __forceinline__ void stg8(const T &reg, void *ptr, bool guard)
