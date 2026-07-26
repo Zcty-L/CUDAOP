@@ -204,6 +204,30 @@ if(BUILD_TESTING)
     )
 endif()
 
+# Row-wise float32 Top-K implementation with a C++ reference.
+add_executable(
+    topk_test
+    op/topk/topk_test.cu
+    op/topk/topk_cuda.cu
+    op/topk/topk_cpu.cpp
+)
+target_link_libraries(
+    topk_test
+    PRIVATE
+        CUDA::cudart
+)
+target_compile_options(
+    topk_test
+    PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v;-Wno-deprecated-gpu-targets>
+)
+if(BUILD_TESTING)
+    add_test(
+        NAME topk_test
+        COMMAND topk_test
+    )
+endif()
+
 # Compare separate Conv2D + LIF kernels against the fused Conv2D-LIF kernel.
 add_executable(
     conv2d_lif_fusion_cmp
