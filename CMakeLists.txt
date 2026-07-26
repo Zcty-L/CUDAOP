@@ -146,6 +146,7 @@ set(OP_SOURCES
     "op/test/l2cache_latency.cu"
     "op/test/smem_bandwidth.cu"
     "op/test/smem_latency.cu"
+    "op/test/smem_sts128_transactions.cu"
 )
 
 foreach(SRC_FILE ${OP_SOURCES})
@@ -237,6 +238,10 @@ if(BUILD_TESTING)
     add_test(
         NAME smem_latency
         COMMAND smem_latency
+    )
+    add_test(
+        NAME smem_sts128_transactions
+        COMMAND smem_sts128_transactions
     )
     add_test(
         NAME nccl_mlp_test
