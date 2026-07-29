@@ -119,6 +119,7 @@ set(OP_SOURCES
     "op/dwconv/opt_conv2d_groups_fp16.cu"
     "op/resize/resize_u8.cu"
     "op/mul/mul_u8.cu"
+    "op/softmax/softmax.cu"
     "op/linear/linear_k128.cu"
     "op/linear/linear_sn_k64_u8.cu"
     "op/linear/linear_sn_k64_u8_fp16.cu"
