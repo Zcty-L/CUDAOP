@@ -32,7 +32,6 @@
 ## 代码编写规定
 - 禁止使用 **printf**, **print**, 统一使用 **std::cout** (C++ 要求)。输出要考虑对齐
 - **{ }** 的使用需要换行
-- 较长的代码行需要换行，**禁止**编写很长的代码行
 
 
 ## 编译代码规则
@@ -56,19 +55,19 @@
 
 ## Git 规范
 - 修改代码前必须执行 `git status --short --branch` 检查当前分支
-- 禁止在 `main` 分支修改文件；如果当前分支是 `main`，立即停止并提醒用户先切换或创建分支
+- 涉及 `./op/{op_name}/` 的任务，包括对应的实现、测试、`CMakeLists.txt` 和文档修改，工作分支应为 `feature/{op_name}`, 发现不对应需要切换或新建，禁止把其他功能分支的提交一并带入目标分支
+- 禁止在 `main` 分支修改；如果当前分支是 `main`，应先切换或创建正确分支; 仅当任务只修改 `AGENTS.md` 时，允许修改
 - Commit 前缀: `feat:`, `fix:`, `perf:`, `refactor:`, `docs:`, `chore:`
-- 分支命名: `feat/{op_name}`, `fix/{描述}`
+- 分支命名: `feature/{op_name}`
 
 
 # 可用 Skill
 
-## `$opt-kernel` — CUDA Kernel 优化工作流
+## `$opt-kernel` — GPU Kernel 优化工作流
 
 > 仅用于需要修改、迭代和优化 CUDA kernel 实现的性能优化任务。
 > 调用方式：`$opt-kernel 优化 op/dwconv/example.cu:128 的 dwconv_forward_kernel。`
->
-> 触发条件：用户显式调用 `$opt-kernel`，或明确要求优化、调优、迭代修改 kernel 以提升性能。仅出现“性能”“提升”“分析”等词不足以触发。
+> 仅当用户在当前请求中以命令方式显式调用 `$opt-kernel`。
 
 ### 各阶段说明
 

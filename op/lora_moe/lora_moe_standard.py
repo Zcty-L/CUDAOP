@@ -34,9 +34,9 @@ class LoRAMoEStandard(nn.Module):
                 f"不支持的 GMM 后端: {gmm_backend}，"
                 f"可选值为 {self._GMM_BACKENDS}"
             )
-        if gmm_backend != "cutlass" and rank != 16:
+        if gmm_backend != "cutlass" and rank not in (16, 32):
             raise ValueError(
-                f"{gmm_backend} GMM 后端仅支持 rank=16"
+                f"{gmm_backend} GMM 后端仅支持 rank=16/32"
             )
 
         self._validate_original_mlp(original_mlp)
@@ -47,6 +47,9 @@ class LoRAMoEStandard(nn.Module):
         self.scaling = lora_alpha / rank
         self.lora_dropout = nn.Dropout(p=lora_dropout)
         self.gmm_backend = gmm_backend
+
+        for parameter in self.original_mlp.parameters():
+            parameter.requires_grad = False
 
         gate_proj = original_mlp.gate_proj
         up_proj = original_mlp.up_proj
@@ -309,14 +312,14 @@ class LoRAMoEStandard(nn.Module):
             intermediate_per_expert,
             self.down_lora_A,
         )
-        down_delta_per_expert = torch.einsum(
-            "ner,eir->nei",
-            down_hidden,
-            self.down_lora_B,
+        down_hidden_weighted = (
+            down_hidden * weight_full.unsqueeze(-1)
         )
-        down_delta = (
-            down_delta_per_expert * weight_full.unsqueeze(-1)
-        ).sum(dim=1) * self.scaling
+        down_delta = torch.einsum(
+            "ner,eir->ni",
+            down_hidden_weighted,
+            self.down_lora_B,
+        ) * self.scaling
 
         return (
             down_base + down_delta
@@ -415,6 +418,7 @@ class LoRAMoEStandard(nn.Module):
                 self.gate_up_lora_A,
                 batch_sizes,
                 trans_b=True,
+                backend="cutlass",
             )
             gate_hidden, up_hidden = gate_up_hidden.chunk(2, dim=-1)
             gate_delta = gmm_ops.gmm(
@@ -422,27 +426,49 @@ class LoRAMoEStandard(nn.Module):
                 self.gate_lora_B,
                 batch_sizes,
                 trans_b=True,
+                backend="cutlass",
             )
             up_delta = gmm_ops.gmm(
                 up_hidden.contiguous(),
                 self.up_lora_B,
                 batch_sizes,
                 trans_b=True,
+                backend="cutlass",
             )
-        else:
+        elif self.gmm_backend == "triton":
             gate_delta = gmm_ops.lora_gmm(
                 x_dropped,
                 self.gate_up_lora_A[:, :self.rank],
                 self.gate_lora_B,
                 batch_sizes,
-                self.gmm_backend,
+                "triton",
             )
             up_delta = gmm_ops.lora_gmm(
                 x_dropped,
                 self.gate_up_lora_A[:, self.rank:],
                 self.up_lora_B,
                 batch_sizes,
-                self.gmm_backend,
+                "triton",
+            )
+        elif self.gmm_backend == "cutile":
+            gate_delta = gmm_ops.lora_gmm(
+                x_dropped,
+                self.gate_up_lora_A[:, :self.rank],
+                self.gate_lora_B,
+                batch_sizes,
+                "cutile",
+            )
+            up_delta = gmm_ops.lora_gmm(
+                x_dropped,
+                self.gate_up_lora_A[:, self.rank:],
+                self.up_lora_B,
+                batch_sizes,
+                "cutile",
+            )
+        else:
+            raise ValueError(
+                f"不支持的 GMM 后端: {self.gmm_backend}，"
+                f"可选值为 {self._GMM_BACKENDS}"
             )
         gate_delta = gate_delta * self.scaling
         up_delta = up_delta * self.scaling
