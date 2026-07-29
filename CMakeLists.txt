@@ -145,6 +145,7 @@ set(OP_SOURCES
     "op/test/l2cache_bandwidth.cu"
     "op/test/l2cache_latency.cu"
     "op/test/smem_bandwidth.cu"
+    "op/test/smem_float4_broadcast.cu"
     "op/test/smem_latency.cu"
     "op/test/smem_sts128_transactions.cu"
 )
@@ -234,6 +235,10 @@ if(BUILD_TESTING)
     add_test(
         NAME smem_bandwidth
         COMMAND smem_bandwidth
+    )
+    add_test(
+        NAME smem_float4_broadcast
+        COMMAND smem_float4_broadcast
     )
     add_test(
         NAME smem_latency
