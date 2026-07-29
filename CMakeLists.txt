@@ -282,3 +282,15 @@ add_custom_target(cudaop_grouped_gemm_test
         "Testing cudaop_grouped_gemm"
     VERBATIM
 )
+
+add_custom_target(flashattn_torch_test
+    COMMAND
+        ${CMAKE_COMMAND} -E env
+        "PYTHONPATH=${PROJECT_SOURCE_DIR}/op"
+        ${Python3_EXECUTABLE} -m flashattn.test_torch_impl
+    WORKING_DIRECTORY
+        "${PROJECT_SOURCE_DIR}"
+    COMMENT
+        "Testing the Flash Attention Torch reference implementations"
+    VERBATIM
+)
