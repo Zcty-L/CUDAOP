@@ -6,6 +6,8 @@
 #include <iostream>
 #include <limits>
 #include <random>
+#include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -20,6 +22,11 @@ constexpr int WARPS_PER_BLOCK = 4;
 constexpr int ROWS_PER_WARP = 2;
 constexpr int MAX_COLS = 1024;
 constexpr int MAX_GRID_SIZE = 65535;
+
+constexpr int32_t INT8_MIN_VALUE = -128;
+constexpr int32_t INT8_MAX_VALUE = 127;
+constexpr float INT8_OUTPUT_SCALE = 1.0f / 256.0f;
+constexpr int32_t INT8_OUTPUT_ZERO_POINT = -128;
 
 constexpr int BENCHMARK_ROWS = 512;
 constexpr int BENCHMARK_COLS = 1024;
@@ -71,6 +78,42 @@ void softmax_cpu(
                     max_value) *
                 reciprocal_sum;
         }
+    }
+}
+
+void dequantize_int8_cpu(
+    const std::vector<int8_t> &source,
+    std::vector<float> &destination,
+    float input_scale,
+    int32_t input_zero_point)
+{
+    for (size_t index = 0; index < source.size(); index++)
+    {
+        destination[index] =
+            (static_cast<int32_t>(source[index]) - input_zero_point) *
+            input_scale;
+    }
+}
+
+int8_t quantize_probability_int8(float probability)
+{
+    int32_t quantized = static_cast<int32_t>(
+        std::nearbyint(probability / INT8_OUTPUT_SCALE));
+    quantized += INT8_OUTPUT_ZERO_POINT;
+    quantized = std::clamp<int32_t>(
+        quantized,
+        std::numeric_limits<int8_t>::min(),
+        std::numeric_limits<int8_t>::max());
+    return static_cast<int8_t>(quantized);
+}
+
+void quantize_softmax_int8_cpu(
+    const std::vector<float> &source,
+    std::vector<int8_t> &destination)
+{
+    for (size_t index = 0; index < source.size(); index++)
+    {
+        destination[index] = quantize_probability_int8(source[index]);
     }
 }
 
@@ -148,6 +191,114 @@ __global__ void softmax_warp_kernel(
                 {
                     destination[row * cols + col] =
                         values[index] * reciprocal_sum;
+                }
+            }
+        }
+    }
+}
+
+template <int COLS_PER_THREAD, typename OutputType>
+__global__ void softmax_int8_warp_kernel(
+    const int8_t *__restrict__ source,
+    OutputType *__restrict__ destination,
+    int64_t rows,
+    int64_t cols,
+    float input_scale)
+{
+    const int lane_id = threadIdx.x;
+    const int64_t global_warp_id =
+        static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+    const int64_t warp_stride =
+        static_cast<int64_t>(gridDim.x) * blockDim.y;
+
+    for (int64_t first_row = global_warp_id * ROWS_PER_WARP;
+         first_row < rows;
+         first_row += warp_stride * ROWS_PER_WARP)
+    {
+#pragma unroll
+        for (int row_index = 0; row_index < ROWS_PER_WARP; row_index++)
+        {
+            const int64_t row = first_row + row_index;
+            if (row >= rows)
+            {
+                continue;
+            }
+
+            int32_t quantized_values[COLS_PER_THREAD];
+            int32_t thread_max = INT8_MIN_VALUE;
+
+#pragma unroll
+            for (int index = 0; index < COLS_PER_THREAD; index++)
+            {
+                const int col = lane_id + index * WARP_SIZE;
+                const int32_t value =
+                    col < cols ?
+                    static_cast<int32_t>(source[row * cols + col]) :
+                    INT8_MIN_VALUE;
+                quantized_values[index] = value;
+                thread_max = max(thread_max, value);
+            }
+
+#pragma unroll
+            for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2)
+            {
+                thread_max = max(
+                    thread_max,
+                    __shfl_xor_sync(0xffffffffU, thread_max, mask));
+            }
+
+            float exponentials[COLS_PER_THREAD];
+            float thread_sum = 0.0f;
+#pragma unroll
+            for (int index = 0; index < COLS_PER_THREAD; index++)
+            {
+                const int col = lane_id + index * WARP_SIZE;
+                const float value =
+                    col < cols ?
+                    expf(
+                        static_cast<float>(
+                            quantized_values[index] - thread_max) *
+                        input_scale) :
+                    0.0f;
+                exponentials[index] = value;
+                thread_sum += value;
+            }
+
+#pragma unroll
+            for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2)
+            {
+                thread_sum +=
+                    __shfl_xor_sync(0xffffffffU, thread_sum, mask);
+            }
+
+            const float reciprocal_sum = 1.0f / thread_sum;
+#pragma unroll
+            for (int index = 0; index < COLS_PER_THREAD; index++)
+            {
+                const int col = lane_id + index * WARP_SIZE;
+                if (col >= cols)
+                {
+                    continue;
+                }
+
+                const float probability =
+                    exponentials[index] * reciprocal_sum;
+                if constexpr (std::is_same_v<OutputType, float>)
+                {
+                    destination[row * cols + col] = probability;
+                }
+                else
+                {
+                    int32_t quantized = __float2int_rn(
+                        probability / INT8_OUTPUT_SCALE);
+                    quantized += INT8_OUTPUT_ZERO_POINT;
+                    quantized = max(
+                        INT8_MIN_VALUE,
+                        min(
+                            INT8_MAX_VALUE,
+                            quantized));
+                    destination[row * cols + col] =
+                        static_cast<int8_t>(quantized);
                 }
             }
         }
@@ -245,6 +396,148 @@ cudaError_t launch_softmax(
         stream);
 }
 
+template <int COLS_PER_THREAD, typename OutputType>
+cudaError_t launch_softmax_int8_kernel(
+    const int8_t *source,
+    OutputType *destination,
+    int64_t rows,
+    int64_t cols,
+    float input_scale,
+    cudaStream_t stream)
+{
+    constexpr int ROWS_PER_BLOCK = WARPS_PER_BLOCK * ROWS_PER_WARP;
+    const int64_t required_blocks = (rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+    const int grid_size = static_cast<int>(std::min<int64_t>(required_blocks, MAX_GRID_SIZE));
+
+    const dim3 block(WARP_SIZE, WARPS_PER_BLOCK);
+    softmax_int8_warp_kernel<COLS_PER_THREAD, OutputType>
+        <<<grid_size, block, 0, stream>>>(
+            source,
+            destination,
+            rows,
+            cols,
+            input_scale);
+    return cudaGetLastError();
+}
+
+template <typename OutputType>
+cudaError_t launch_softmax_int8_impl(
+    const int8_t *source,
+    OutputType *destination,
+    int64_t rows,
+    int64_t cols,
+    float input_scale,
+    int32_t input_zero_point,
+    cudaStream_t stream)
+{
+    if (source == nullptr || destination == nullptr ||
+        rows <= 0 || cols <= 0 || cols > MAX_COLS ||
+        !std::isfinite(input_scale) || input_scale <= 0.0f ||
+        input_zero_point < std::numeric_limits<int8_t>::min() ||
+        input_zero_point > std::numeric_limits<int8_t>::max())
+    {
+        return cudaErrorInvalidValue;
+    }
+
+    // 对同一张量使用统一 zero point 时，减去行最大值后 zero point 抵消。
+    if (cols <= 32)
+    {
+        return launch_softmax_int8_kernel<1>(
+            source,
+            destination,
+            rows,
+            cols,
+            input_scale,
+            stream);
+    }
+    if (cols <= 64)
+    {
+        return launch_softmax_int8_kernel<2>(
+            source,
+            destination,
+            rows,
+            cols,
+            input_scale,
+            stream);
+    }
+    if (cols <= 128)
+    {
+        return launch_softmax_int8_kernel<4>(
+            source,
+            destination,
+            rows,
+            cols,
+            input_scale,
+            stream);
+    }
+    if (cols <= 256)
+    {
+        return launch_softmax_int8_kernel<8>(
+            source,
+            destination,
+            rows,
+            cols,
+            input_scale,
+            stream);
+    }
+    if (cols <= 512)
+    {
+        return launch_softmax_int8_kernel<16>(
+            source,
+            destination,
+            rows,
+            cols,
+            input_scale,
+            stream);
+    }
+
+    return launch_softmax_int8_kernel<32>(
+        source,
+        destination,
+        rows,
+        cols,
+        input_scale,
+        stream);
+}
+
+cudaError_t launch_softmax_int8_to_float(
+    const int8_t *source,
+    float *destination,
+    int64_t rows,
+    int64_t cols,
+    float input_scale,
+    int32_t input_zero_point,
+    cudaStream_t stream = nullptr)
+{
+    return launch_softmax_int8_impl(
+        source,
+        destination,
+        rows,
+        cols,
+        input_scale,
+        input_zero_point,
+        stream);
+}
+
+cudaError_t launch_softmax_int8_to_int8(
+    const int8_t *source,
+    int8_t *destination,
+    int64_t rows,
+    int64_t cols,
+    float input_scale,
+    int32_t input_zero_point,
+    cudaStream_t stream = nullptr)
+{
+    return launch_softmax_int8_impl(
+        source,
+        destination,
+        rows,
+        cols,
+        input_scale,
+        input_zero_point,
+        stream);
+}
+
 void fill_input(std::vector<float> &input, uint32_t seed)
 {
     std::mt19937 generator(seed);
@@ -252,6 +545,16 @@ void fill_input(std::vector<float> &input, uint32_t seed)
     for (float &value : input)
     {
         value = distribution(generator);
+    }
+}
+
+void fill_int8_input(std::vector<int8_t> &input, uint32_t seed)
+{
+    std::mt19937 generator(seed);
+    std::uniform_int_distribution<int32_t> distribution(-128, 127);
+    for (int8_t &value : input)
+    {
+        value = static_cast<int8_t>(distribution(generator));
     }
 }
 
@@ -390,7 +693,217 @@ bool run_accuracy_case(int64_t rows, int64_t cols, uint32_t seed)
     return true;
 }
 
-bool run_benchmark()
+bool run_int8_accuracy_case(
+    int64_t rows,
+    int64_t cols,
+    float input_scale,
+    int32_t input_zero_point,
+    uint32_t seed)
+{
+    const size_t element_count = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+    const size_t input_byte_count = element_count * sizeof(int8_t);
+    const size_t float_byte_count = element_count * sizeof(float);
+
+    std::vector<int8_t> source(element_count);
+    std::vector<float> dequantized_source(element_count);
+    std::vector<float> float_reference(element_count);
+    std::vector<float> float_actual(element_count);
+    std::vector<int8_t> int8_reference(element_count);
+    std::vector<int8_t> int8_actual(element_count);
+
+    fill_int8_input(source, seed);
+    dequantize_int8_cpu(
+        source,
+        dequantized_source,
+        input_scale,
+        input_zero_point);
+    softmax_cpu(
+        dequantized_source,
+        float_reference,
+        rows,
+        cols);
+    quantize_softmax_int8_cpu(float_reference, int8_reference);
+
+    int8_t *device_source = nullptr;
+    float *device_float_destination = nullptr;
+    int8_t *device_int8_destination = nullptr;
+
+    std::cout << "[INT8 精度阶段] rows=" << std::setw(4) << rows
+              << " cols=" << std::setw(4) << cols
+              << " scale=" << input_scale
+              << " zero_point=" << input_zero_point << '\n';
+
+    bool success =
+        check_cuda(
+            cudaMalloc(
+                reinterpret_cast<void **>(&device_source),
+                input_byte_count),
+            "cudaMalloc(int8 source)") &&
+        check_cuda(
+            cudaMalloc(
+                reinterpret_cast<void **>(&device_float_destination),
+                float_byte_count),
+            "cudaMalloc(float destination)") &&
+        check_cuda(
+            cudaMalloc(
+                reinterpret_cast<void **>(&device_int8_destination),
+                input_byte_count),
+            "cudaMalloc(int8 destination)");
+
+    if (!success)
+    {
+        if (device_source != nullptr)
+        {
+            cudaFree(device_source);
+        }
+        if (device_float_destination != nullptr)
+        {
+            cudaFree(device_float_destination);
+        }
+        if (device_int8_destination != nullptr)
+        {
+            cudaFree(device_int8_destination);
+        }
+        return false;
+    }
+
+    success =
+        check_cuda(
+            cudaMemcpy(
+                device_source,
+                source.data(),
+                input_byte_count,
+                cudaMemcpyHostToDevice),
+            "cudaMemcpy(int8 source)") &&
+        check_cuda(
+            launch_softmax_int8_to_float(
+                device_source,
+                device_float_destination,
+                rows,
+                cols,
+                input_scale,
+                input_zero_point),
+            "launch_softmax_int8_to_float") &&
+        check_cuda(
+            launch_softmax_int8_to_int8(
+                device_source,
+                device_int8_destination,
+                rows,
+                cols,
+                input_scale,
+                input_zero_point),
+            "launch_softmax_int8_to_int8") &&
+        check_cuda(
+            cudaDeviceSynchronize(),
+            "cudaDeviceSynchronize(int8 accuracy)") &&
+        check_cuda(
+            cudaMemcpy(
+                float_actual.data(),
+                device_float_destination,
+                float_byte_count,
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy(float destination)") &&
+        check_cuda(
+            cudaMemcpy(
+                int8_actual.data(),
+                device_int8_destination,
+                input_byte_count,
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy(int8 destination)");
+
+    cudaFree(device_source);
+    cudaFree(device_float_destination);
+    cudaFree(device_int8_destination);
+
+    if (!success)
+    {
+        return false;
+    }
+
+    constexpr float ABSOLUTE_TOLERANCE = 1.0e-6f;
+    constexpr float RELATIVE_TOLERANCE = 1.0e-5f;
+    size_t float_error_count = 0;
+    size_t int8_error_count = 0;
+    int32_t max_int8_difference = 0;
+    float max_float_absolute_error = 0.0f;
+    float max_int8_dequantized_error = 0.0f;
+    float max_int8_row_sum_error = 0.0f;
+
+    for (size_t index = 0; index < element_count; index++)
+    {
+        const float float_absolute_error =
+            std::abs(float_reference[index] - float_actual[index]);
+        const float tolerance =
+            ABSOLUTE_TOLERANCE +
+            RELATIVE_TOLERANCE * std::abs(float_reference[index]);
+        if (!std::isfinite(float_actual[index]) ||
+            float_absolute_error > tolerance)
+        {
+            float_error_count++;
+        }
+        max_float_absolute_error = std::max(
+            max_float_absolute_error,
+            float_absolute_error);
+
+        const int32_t int8_difference = std::abs(
+            static_cast<int32_t>(int8_reference[index]) -
+            static_cast<int32_t>(int8_actual[index]));
+        if (int8_difference > 1)
+        {
+            int8_error_count++;
+        }
+        max_int8_difference =
+            std::max(max_int8_difference, int8_difference);
+
+        const float dequantized_probability =
+            (static_cast<int32_t>(int8_actual[index]) -
+             INT8_OUTPUT_ZERO_POINT) *
+            INT8_OUTPUT_SCALE;
+        max_int8_dequantized_error = std::max(
+            max_int8_dequantized_error,
+            std::abs(
+                float_reference[index] -
+                dequantized_probability));
+    }
+
+    for (int64_t row = 0; row < rows; row++)
+    {
+        float row_sum = 0.0f;
+        for (int64_t col = 0; col < cols; col++)
+        {
+            const int64_t index = row * cols + col;
+            row_sum +=
+                (static_cast<int32_t>(
+                     int8_actual[static_cast<size_t>(index)]) -
+                 INT8_OUTPUT_ZERO_POINT) *
+                INT8_OUTPUT_SCALE;
+        }
+        max_int8_row_sum_error = std::max(
+            max_int8_row_sum_error,
+            std::abs(row_sum - 1.0f));
+    }
+
+    const bool passed =
+        float_error_count == 0 && int8_error_count == 0;
+    std::cout << "  [关键结果] float_errors=" << float_error_count
+              << '/' << element_count
+              << " float_max_abs=" << std::scientific
+              << max_float_absolute_error
+              << " int8_errors_gt_1=" << int8_error_count
+              << " int8_max_diff=" << max_int8_difference
+              << " int8_dequant_max_abs="
+              << max_int8_dequantized_error
+              << " int8_row_sum_error="
+              << max_int8_row_sum_error
+              << std::defaultfloat << '\n';
+
+    std::cout << "  " << (passed ? "[SUCCESS]" : "[FAILED]")
+              << " INT8 输入精度验证"
+              << (passed ? "通过" : "失败") << "\n\n";
+    return passed;
+}
+
+bool run_fp32_benchmark()
 {
     const int64_t rows = BENCHMARK_ROWS;
     const int64_t cols = BENCHMARK_COLS;
@@ -406,7 +919,7 @@ bool run_benchmark()
     cudaEvent_t start = nullptr;
     cudaEvent_t stop = nullptr;
 
-    std::cout << "[性能阶段] rows=" << rows
+    std::cout << "[FP32 性能阶段] rows=" << rows
               << " cols=" << cols
               << " warmup=" << WARMUP_ITERATIONS
               << " iterations=" << BENCHMARK_ITERATIONS << '\n';
@@ -528,6 +1041,209 @@ bool run_benchmark()
     return true;
 }
 
+bool run_int8_benchmark()
+{
+    const int64_t rows = BENCHMARK_ROWS;
+    const int64_t cols = BENCHMARK_COLS;
+    constexpr float INPUT_SCALE = 1.0f / 32.0f;
+    constexpr int32_t INPUT_ZERO_POINT = -3;
+
+    const size_t element_count =
+        static_cast<size_t>(rows) * static_cast<size_t>(cols);
+    const size_t int8_byte_count = element_count * sizeof(int8_t);
+    const size_t float_byte_count = element_count * sizeof(float);
+
+    std::vector<int8_t> source(element_count);
+    fill_int8_input(source, 2027U);
+
+    int8_t *device_source = nullptr;
+    float *device_float_destination = nullptr;
+    int8_t *device_int8_destination = nullptr;
+
+    std::cout << "[INT8 性能阶段] rows=" << rows
+              << " cols=" << cols
+              << " input_scale=" << INPUT_SCALE
+              << " input_zero_point=" << INPUT_ZERO_POINT
+              << " warmup=" << WARMUP_ITERATIONS
+              << " iterations=" << BENCHMARK_ITERATIONS << '\n';
+
+    bool success =
+        check_cuda(
+            cudaMalloc(
+                reinterpret_cast<void **>(&device_source),
+                int8_byte_count),
+            "cudaMalloc(int8 benchmark source)") &&
+        check_cuda(
+            cudaMalloc(
+                reinterpret_cast<void **>(&device_float_destination),
+                float_byte_count),
+            "cudaMalloc(float benchmark destination)") &&
+        check_cuda(
+            cudaMalloc(
+                reinterpret_cast<void **>(&device_int8_destination),
+                int8_byte_count),
+            "cudaMalloc(int8 benchmark destination)") &&
+        check_cuda(
+            cudaMemcpy(
+                device_source,
+                source.data(),
+                int8_byte_count,
+                cudaMemcpyHostToDevice),
+            "cudaMemcpy(int8 benchmark source)");
+
+    if (!success)
+    {
+        if (device_source != nullptr)
+        {
+            cudaFree(device_source);
+        }
+        if (device_float_destination != nullptr)
+        {
+            cudaFree(device_float_destination);
+        }
+        if (device_int8_destination != nullptr)
+        {
+            cudaFree(device_int8_destination);
+        }
+        return false;
+    }
+
+    auto measure_latency =
+        [](
+            const char *name,
+            auto launch,
+            float &average_ms)
+        {
+            cudaEvent_t start = nullptr;
+            cudaEvent_t stop = nullptr;
+            bool measured =
+                check_cuda(
+                    cudaEventCreate(&start),
+                    "cudaEventCreate(int8 start)") &&
+                check_cuda(
+                    cudaEventCreate(&stop),
+                    "cudaEventCreate(int8 stop)");
+
+            if (!measured)
+            {
+                if (start != nullptr)
+                {
+                    cudaEventDestroy(start);
+                }
+                if (stop != nullptr)
+                {
+                    cudaEventDestroy(stop);
+                }
+                return false;
+            }
+
+            for (int iteration = 0;
+                 iteration < WARMUP_ITERATIONS && measured;
+                 iteration++)
+            {
+                measured = check_cuda(launch(), name);
+            }
+            measured = measured &&
+                check_cuda(
+                    cudaDeviceSynchronize(),
+                    "cudaDeviceSynchronize(int8 warmup)") &&
+                check_cuda(
+                    cudaEventRecord(start),
+                    "cudaEventRecord(int8 start)");
+
+            for (int iteration = 0;
+                 iteration < BENCHMARK_ITERATIONS && measured;
+                 iteration++)
+            {
+                measured = check_cuda(launch(), name);
+            }
+
+            measured = measured &&
+                check_cuda(
+                    cudaEventRecord(stop),
+                    "cudaEventRecord(int8 stop)") &&
+                check_cuda(
+                    cudaEventSynchronize(stop),
+                    "cudaEventSynchronize(int8 stop)");
+
+            float elapsed_ms = 0.0f;
+            measured = measured &&
+                check_cuda(
+                    cudaEventElapsedTime(
+                        &elapsed_ms,
+                        start,
+                        stop),
+                    "cudaEventElapsedTime(int8)");
+
+            cudaEventDestroy(start);
+            cudaEventDestroy(stop);
+            average_ms = elapsed_ms / BENCHMARK_ITERATIONS;
+            return measured;
+        };
+
+    float int8_to_float_ms = 0.0f;
+    float int8_to_int8_ms = 0.0f;
+    success =
+        measure_latency(
+            "launch_softmax_int8_to_float(benchmark)",
+            [&]()
+            {
+                return launch_softmax_int8_to_float(
+                    device_source,
+                    device_float_destination,
+                    rows,
+                    cols,
+                    INPUT_SCALE,
+                    INPUT_ZERO_POINT);
+            },
+            int8_to_float_ms) &&
+        measure_latency(
+            "launch_softmax_int8_to_int8(benchmark)",
+            [&]()
+            {
+                return launch_softmax_int8_to_int8(
+                    device_source,
+                    device_int8_destination,
+                    rows,
+                    cols,
+                    INPUT_SCALE,
+                    INPUT_ZERO_POINT);
+            },
+            int8_to_int8_ms);
+
+    cudaFree(device_source);
+    cudaFree(device_float_destination);
+    cudaFree(device_int8_destination);
+
+    if (!success)
+    {
+        return false;
+    }
+
+    const double int8_to_float_bytes =
+        static_cast<double>(int8_byte_count + float_byte_count);
+    const double int8_to_int8_bytes =
+        static_cast<double>(int8_byte_count) * 2.0;
+    const double int8_to_float_bandwidth =
+        int8_to_float_bytes /
+        (static_cast<double>(int8_to_float_ms) * 1.0e6);
+    const double int8_to_int8_bandwidth =
+        int8_to_int8_bytes /
+        (static_cast<double>(int8_to_int8_ms) * 1.0e6);
+
+    std::cout << "  [关键结果] INT8->FP32 latency=" << std::fixed
+              << std::setprecision(6) << int8_to_float_ms
+              << " ms effective_bandwidth=" << std::setprecision(2)
+              << int8_to_float_bandwidth << " GB/s\n"
+              << "  [关键结果] INT8->INT8 latency="
+              << std::setprecision(6) << int8_to_int8_ms
+              << " ms effective_bandwidth=" << std::setprecision(2)
+              << int8_to_int8_bandwidth << " GB/s\n"
+              << std::defaultfloat
+              << "  [SUCCESS] INT8 性能测试完成\n\n";
+    return true;
+}
+
 } // namespace
 
 int main()
@@ -544,9 +1260,13 @@ int main()
 
     std::cout << "\n=== CUDA Softmax 算子测试 ===\n\n"
               << "[配置] device=" << device_properties.name
-              << " dtype=float32"
+              << " input_types={float32,int8}"
+              << " output_types={float32,int8}"
               << " max_cols=" << MAX_COLS
-              << " warp_size=" << WARP_SIZE << "\n\n";
+              << " warp_size=" << WARP_SIZE << '\n'
+              << "[配置] INT8 output_scale=" << INT8_OUTPUT_SCALE
+              << " output_zero_point=" << INT8_OUTPUT_ZERO_POINT
+              << " compute=float32\n\n";
 
     constexpr std::array<std::pair<int64_t, int64_t>, 9> TEST_CASES =
     {{
@@ -568,9 +1288,38 @@ int main()
         success = run_accuracy_case(rows, cols, seed++) && success;
     }
 
+    constexpr std::array<
+        std::tuple<int64_t, int64_t, float, int32_t>,
+        9> INT8_TEST_CASES =
+    {{
+        {1, 1, 1.0f / 32.0f, -3},
+        {3, 17, 1.0f / 16.0f, -128},
+        {7, 32, 1.0f / 32.0f, 127},
+        {9, 33, 1.0f / 64.0f, 5},
+        {17, 127, 1.0f / 32.0f, -17},
+        {31, 256, 1.0f / 64.0f, 0},
+        {33, 511, 1.0f / 32.0f, 23},
+        {65, 1023, 1.0f / 16.0f, -7},
+        {65, 1024, 1.0f / 32.0f, 11},
+    }};
+
+    for (const auto &[rows, cols, input_scale, input_zero_point] :
+         INT8_TEST_CASES)
+    {
+        success =
+            run_int8_accuracy_case(
+                rows,
+                cols,
+                input_scale,
+                input_zero_point,
+                seed++) &&
+            success;
+    }
+
     if (success)
     {
-        success = run_benchmark();
+        success = run_fp32_benchmark() && success;
+        success = run_int8_benchmark() && success;
     }
 
     std::cout << (success ? "[SUCCESS]" : "[FAILED]")
