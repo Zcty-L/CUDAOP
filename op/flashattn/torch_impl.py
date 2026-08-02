@@ -34,6 +34,7 @@ class MHA(nn.Module):
         self,
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
+        is_causal: bool = False,
     ) -> torch.Tensor:
         batch, sequence, _ = x.shape
 
@@ -66,20 +67,33 @@ class MHA(nn.Module):
         scores = q @ k.transpose(-2, -1)
         scores = scores / math.sqrt(self.head_dim)
 
-        # 4. mask=True 表示该位置可以参与注意力。
+        # 4. Causal mask：每个 token 只能看到自己和之前的 token。
+        if is_causal:
+            causal_mask = torch.ones(
+                sequence,
+                sequence,
+                dtype=torch.bool,
+                device=x.device,
+            ).tril()
+            scores = scores.masked_fill(
+                ~causal_mask,
+                -torch.inf,
+            )
+
+        # 5. mask=True 表示该位置可以参与注意力。
         if mask is not None:
             if mask.dtype == torch.bool:
                 scores = scores.masked_fill(~mask, -torch.inf)
             else:
                 scores = scores + mask
 
-        # 5. P = softmax(S)。
+        # 6. P = softmax(S)。
         attention = torch.softmax(scores, dim=-1)
 
-        # 6. O = P @ V。
+        # 7. O = P @ V。
         output = attention @ v
 
-        # 7. 合并多头并进行输出投影。
+        # 8. 合并多头并进行输出投影。
         output = output.transpose(1, 2).contiguous()
         output = output.view(batch, sequence, -1)
         return self.out_proj(output)

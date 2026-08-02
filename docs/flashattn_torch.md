@@ -26,6 +26,16 @@ attention = torch.softmax(scores, dim=-1)
 output = attention @ v
 ```
 
+MHA 可以通过 `is_causal=True` 在内部生成下三角 causal mask，使每个 token
+只能关注自己和之前的 token：
+
+```python
+output = attention(
+    x,
+    is_causal=True,
+)
+```
+
 MLA 的 K/V 投影过程为：
 
 ```python

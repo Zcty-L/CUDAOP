@@ -97,6 +97,34 @@ def _test_linear_attention_formula(
     )
 
 
+def _test_causal_mask(
+    x: torch.Tensor,
+    mask: torch.Tensor,
+) -> None:
+    module = MHA(
+        d_model=x.shape[-1],
+        num_heads=8,
+    )
+    automatic = module(
+        x,
+        is_causal=True,
+    )
+    explicit = module(
+        x,
+        mask=mask,
+    )
+    torch.testing.assert_close(
+        automatic,
+        explicit,
+        rtol=0.0,
+        atol=0.0,
+    )
+    LOGGER.info(
+        "%-6s | 与显式下三角 mask 等价",
+        "CAUSAL",
+    )
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -161,6 +189,13 @@ def main() -> None:
     _test_linear_attention_formula(
         modules["LINEAR"],
         x.detach().clone(),
+    )
+
+    LOGGER.info("")
+    LOGGER.info("阶段：Causal mask 验证")
+    _test_causal_mask(
+        x.detach().clone(),
+        mask,
     )
 
     LOGGER.info("")
