@@ -86,6 +86,22 @@ endif()
 find_package(CUDAToolkit REQUIRED)
 find_library(CUDNN_LIBRARY cudnn PATHS /usr/lib/x86_64-linux-gnu /usr/local/cuda/lib64 REQUIRED)
 find_path(CUDNN_INCLUDE cudnn.h PATHS /usr/include /usr/local/cuda/include REQUIRED)
+find_library(
+    NCCL_LIBRARY
+    nccl
+    PATHS
+        /usr/lib/x86_64-linux-gnu
+        /usr/local/cuda/lib64
+    REQUIRED
+)
+find_path(
+    NCCL_INCLUDE_DIR
+    nccl.h
+    PATHS
+        /usr/include
+        /usr/local/cuda/include
+    REQUIRED
+)
 
 include_directories(
         ${PROJECT_SOURCE_DIR}
@@ -123,6 +139,15 @@ set(OP_SOURCES
     "op/linear/gemm_int8_basic.cu"
     "op/linear/linear_sn_k64_u8.cu"
     "op/linear/linear_sn_k64_u8_fp16.cu"
+    "op/test/dram_bandwidth.cu"
+    "op/test/dram_latency.cu"
+    "op/test/l1cache_bandwidth.cu"
+    "op/test/l1cache_latency.cu"
+    "op/test/l2cache_bandwidth.cu"
+    "op/test/l2cache_latency.cu"
+    "op/test/smem_bandwidth.cu"
+    "op/test/smem_latency.cu"
+    "op/test/smem_sts128_transactions.cu"
 )
 
 foreach(SRC_FILE ${OP_SOURCES})
@@ -157,6 +182,97 @@ foreach(SRC_FILE ${OP_SOURCES})
     
     message(STATUS "Added standalone target: ${EXE_NAME}")
 endforeach()
+
+# Validate a two-GPU tensor-parallel MLP with cuBLAS GEMMs and NCCL AllReduce.
+add_executable(
+    nccl_mlp_test
+    op/nccl/nccl_mlp_test.cu
+)
+target_include_directories(
+    nccl_mlp_test
+    PRIVATE
+        ${NCCL_INCLUDE_DIR}
+)
+target_link_libraries(
+    nccl_mlp_test
+    PRIVATE
+        CUDA::cudart
+        CUDA::cublas
+        ${NCCL_LIBRARY}
+)
+target_compile_options(
+    nccl_mlp_test
+    PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v;-Wno-deprecated-gpu-targets>
+)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_test(
+        NAME dram_bandwidth
+        COMMAND dram_bandwidth
+    )
+    add_test(
+        NAME dram_latency
+        COMMAND dram_latency
+    )
+    add_test(
+        NAME l1cache_bandwidth
+        COMMAND l1cache_bandwidth
+    )
+    add_test(
+        NAME l1cache_latency
+        COMMAND l1cache_latency
+    )
+    add_test(
+        NAME l2cache_bandwidth
+        COMMAND l2cache_bandwidth
+    )
+    add_test(
+        NAME l2cache_latency
+        COMMAND l2cache_latency
+    )
+    add_test(
+        NAME smem_bandwidth
+        COMMAND smem_bandwidth
+    )
+    add_test(
+        NAME smem_latency
+        COMMAND smem_latency
+    )
+    add_test(
+        NAME smem_sts128_transactions
+        COMMAND smem_sts128_transactions
+    )
+    add_test(
+        NAME nccl_mlp_test
+        COMMAND nccl_mlp_test
+    )
+endif()
+
+# Row-wise float32 Top-K implementation with a C++ reference.
+add_executable(
+    topk_test
+    op/topk/topk_test.cu
+    op/topk/topk_cuda.cu
+    op/topk/topk_cpu.cpp
+)
+target_link_libraries(
+    topk_test
+    PRIVATE
+        CUDA::cudart
+)
+target_compile_options(
+    topk_test
+    PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v;-Wno-deprecated-gpu-targets>
+)
+if(BUILD_TESTING)
+    add_test(
+        NAME topk_test
+        COMMAND topk_test
+    )
+endif()
 
 # Compare separate Conv2D + LIF kernels against the fused Conv2D-LIF kernel.
 add_executable(
