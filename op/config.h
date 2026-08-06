@@ -1,3 +1,5 @@
+#pragma once
+
 #include <iostream>
 #include <vector>
 #include <string>
@@ -51,3 +53,13 @@ typedef struct
     uint32_t warmup_iterations;
     uint32_t benchmark_iterations;
 } TopKParam;
+
+struct LinearParam
+{
+    uint32_t in_ch;          // M
+    uint32_t in_dim;         // K
+    uint32_t out_dim;        // N
+    uint32_t out_dim_padded; // N padded to the kernel output tile
+    uint32_t inBatchNumel;   // Input stride between time steps
+    uint32_t outBatchNumel;  // Output stride between time steps
+};
