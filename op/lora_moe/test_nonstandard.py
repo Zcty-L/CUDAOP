@@ -22,6 +22,13 @@ WARMUP_ITERATIONS = 10
 BENCHMARK_ITERATIONS = 50
 BACKWARD_WARMUP_ITERATIONS = 5
 BACKWARD_BENCHMARK_ITERATIONS = 20
+CUTILE_CAPABILITIES = {
+    (10, 0),
+    (10, 3),
+    (11, 0),
+    (12, 0),
+    (12, 1),
+}
 
 
 class TestMlp(nn.Module):
@@ -206,6 +213,20 @@ def benchmark_backward(
     ) / BACKWARD_BENCHMARK_ITERATIONS
 
 
+def get_group_backends() -> tuple[str, ...]:
+    backends = ["cutlass", "triton"]
+    capability = torch.cuda.get_device_capability()
+    if capability in CUTILE_CAPABILITIES:
+        backends.append("cutile")
+    else:
+        LOGGER.info(
+            "[DEBUG] cuTile 跳过：当前 GPU 为 SM%d%d，"
+            "CUDA Tile 编译器仅支持 SM100 及以上架构",
+            *capability,
+        )
+    return tuple(backends)
+
+
 def main() -> None:
     torch.manual_seed(11)
     device = torch.device(
@@ -278,7 +299,8 @@ def main() -> None:
     )
 
     if torch.cuda.is_available():
-        for backend in ("cutlass", "triton", "cutile"):
+        group_backends = get_group_backends()
+        for backend in group_backends:
             group_module = copy.deepcopy(reference_module)
             group_module.gmm_backend = backend
             group_module.zero_grad(set_to_none=True)
@@ -386,7 +408,7 @@ def main() -> None:
             )
 
         results = {}
-        cases = (
+        cases = [
             ("loop", None, loop_forward, loop_forward_grad),
             ("pad", None, pad_forward, pad_forward_grad),
             (
@@ -401,13 +423,16 @@ def main() -> None:
                 group_forward,
                 group_forward_grad,
             ),
-            (
-                "group/cutile",
-                "cutile",
-                group_forward,
-                group_forward_grad,
-            ),
-        )
+        ]
+        if "cutile" in group_backends:
+            cases.append(
+                (
+                    "group/cutile",
+                    "cutile",
+                    group_forward,
+                    group_forward_grad,
+                )
+            )
         for name, backend, forward, forward_grad in cases:
             if backend is not None:
                 reference_module.gmm_backend = backend

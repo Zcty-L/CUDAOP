@@ -35,6 +35,61 @@ __device__ __forceinline__ uint64_t read_clock64()
 }
 
 // =============================================================================
+// Asynchronous Global-to-Shared Copies (cp.async)
+// =============================================================================
+//
+// Instruction: cp.async.{ca,cg}.shared.global, cp.async.commit_group and
+//              cp.async.wait_group
+// Source: NVIDIA PTX ISA, asynchronous copy instructions
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html
+// Purpose: build a double-buffered global-to-shared memory pipeline on
+// Ampere-and-newer GPUs. valid_bytes enables zero-filled boundary loads.
+
+__device__ __forceinline__ void cp_async_cg(
+    uint32_t destination,
+    const void *source,
+    int valid_bytes)
+{
+    asm volatile(
+        "cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+        :
+        : "r"(destination), "l"(source), "r"(valid_bytes));
+}
+
+__device__ __forceinline__ void cp_async_ca(
+    uint32_t destination,
+    const void *source,
+    int valid_bytes)
+{
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 16, %2;\n"
+        :
+        : "r"(destination), "l"(source), "r"(valid_bytes));
+}
+
+__device__ __forceinline__ void cp_async_commit_group()
+{
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+template <int PENDING_GROUPS>
+__device__ __forceinline__ void cp_async_wait_group()
+{
+    static_assert(
+        PENDING_GROUPS == 0 || PENDING_GROUPS == 1,
+        "Only wait_group 0 and 1 are currently supported");
+
+    if constexpr (PENDING_GROUPS == 0)
+    {
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    }
+    else
+    {
+        asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+    }
+}
+
+// =============================================================================
 // Global Memory Prefetch
 // =============================================================================
 //
