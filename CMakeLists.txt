@@ -92,7 +92,6 @@ find_library(
     PATHS
         /usr/lib/x86_64-linux-gnu
         /usr/local/cuda/lib64
-    REQUIRED
 )
 find_path(
     NCCL_INCLUDE_DIR
@@ -100,8 +99,25 @@ find_path(
     PATHS
         /usr/include
         /usr/local/cuda/include
-    REQUIRED
 )
+
+# CuTe is header-only and is provided by the sibling CUTLASS checkout by
+# default. Users can override discovery with -DCUDAOP_CUTLASS_INCLUDE_DIR=...
+# or the CUTLASS_PATH environment variable.
+find_path(
+    CUDAOP_CUTLASS_INCLUDE_DIR
+    cute/tensor.hpp
+    HINTS
+        "$ENV{CUTLASS_PATH}/include"
+        "${PROJECT_SOURCE_DIR}/../cutlass/include"
+)
+if(NOT CUDAOP_CUTLASS_INCLUDE_DIR)
+    message(
+        FATAL_ERROR
+        "Cannot find cute/tensor.hpp. Set CUDAOP_CUTLASS_INCLUDE_DIR to "
+        "the CUTLASS include directory."
+    )
+endif()
 
 include_directories(
         ${PROJECT_SOURCE_DIR}
@@ -136,6 +152,7 @@ set(OP_SOURCES
     "op/resize/resize_u8.cu"
     "op/mul/mul_u8.cu"
     "op/linear/linear_k128.cu"
+    "op/linear/cute_gemm_fp32.cu"
     "op/linear/gemm_int8_basic.cu"
     "op/linear/linear_sn_k64_u8.cu"
     "op/linear/linear_sn_k64_u8_fp16.cu"
@@ -156,6 +173,34 @@ foreach(SRC_FILE ${OP_SOURCES})
     
     # 将该文件编译为独立的可执行程序
     add_executable(${EXE_NAME} ${SRC_FILE})
+
+    if(EXE_NAME STREQUAL "cute_gemm_fp32")
+        target_include_directories(
+            ${EXE_NAME}
+            PRIVATE
+                ${CUDAOP_CUTLASS_INCLUDE_DIR}
+        )
+
+        # NVCC/CuTe 通过 family-specific 架构目标（例如 sm_120f）开放
+        # Blackwell TMA。Hopper 保持不变；仅为该 TMA 目标转换普通
+        # Blackwell 架构编号。
+        set(CUDAOP_CUTE_TMA_ARCHITECTURES "")
+        foreach(CUDAOP_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+            if(CUDAOP_CUDA_ARCH MATCHES "^(100|101|103|110|120|121)(-(real|virtual))?$")
+                list(
+                    APPEND
+                    CUDAOP_CUTE_TMA_ARCHITECTURES
+                    "${CMAKE_MATCH_1}f${CMAKE_MATCH_2}"
+                )
+            else()
+                list(APPEND CUDAOP_CUTE_TMA_ARCHITECTURES "${CUDAOP_CUDA_ARCH}")
+            endif()
+        endforeach()
+        set_property(
+            TARGET ${EXE_NAME}
+            PROPERTY CUDA_ARCHITECTURES ${CUDAOP_CUTE_TMA_ARCHITECTURES}
+        )
+    endif()
 
     if(EXE_NAME STREQUAL "opt_conv2d_groups_fp32")
         target_sources(${EXE_NAME} PRIVATE op/cpu/cpu_ops.cpp)
@@ -179,32 +224,45 @@ foreach(SRC_FILE ${OP_SOURCES})
     target_compile_options(${EXE_NAME} PRIVATE 
         $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v;-Wno-deprecated-gpu-targets>
     )
+
+    if(EXE_NAME STREQUAL "cute_gemm_fp32")
+        target_compile_options(
+            ${EXE_NAME}
+            PRIVATE
+                $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+        )
+    endif()
     
     message(STATUS "Added standalone target: ${EXE_NAME}")
 endforeach()
 
-# Validate a two-GPU tensor-parallel MLP with cuBLAS GEMMs and NCCL AllReduce.
-add_executable(
-    nccl_mlp_test
-    op/nccl/nccl_mlp_test.cu
-)
-target_include_directories(
-    nccl_mlp_test
-    PRIVATE
-        ${NCCL_INCLUDE_DIR}
-)
-target_link_libraries(
-    nccl_mlp_test
-    PRIVATE
-        CUDA::cudart
-        CUDA::cublas
-        ${NCCL_LIBRARY}
-)
-target_compile_options(
-    nccl_mlp_test
-    PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v;-Wno-deprecated-gpu-targets>
-)
+# Validate a two-GPU tensor-parallel MLP when NCCL is installed. NCCL is not
+# required by the standalone CuTe GEMM or the other single-GPU targets.
+if(NCCL_LIBRARY AND NCCL_INCLUDE_DIR)
+    add_executable(
+        nccl_mlp_test
+        op/nccl/nccl_mlp_test.cu
+    )
+    target_include_directories(
+        nccl_mlp_test
+        PRIVATE
+            ${NCCL_INCLUDE_DIR}
+    )
+    target_link_libraries(
+        nccl_mlp_test
+        PRIVATE
+            CUDA::cudart
+            CUDA::cublas
+            ${NCCL_LIBRARY}
+    )
+    target_compile_options(
+        nccl_mlp_test
+        PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v;-Wno-deprecated-gpu-targets>
+    )
+else()
+    message(STATUS "NCCL not found; skipping nccl_mlp_test")
+endif()
 
 include(CTest)
 if(BUILD_TESTING)
@@ -245,9 +303,21 @@ if(BUILD_TESTING)
         COMMAND smem_sts128_transactions
     )
     add_test(
-        NAME nccl_mlp_test
-        COMMAND nccl_mlp_test
+        NAME cute_gemm_fp32
+        COMMAND
+            cute_gemm_fp32
+            --m 512
+            --n 512
+            --k 512
+            --warmup 1
+            --iterations 2
     )
+    if(TARGET nccl_mlp_test)
+        add_test(
+            NAME nccl_mlp_test
+            COMMAND nccl_mlp_test
+        )
+    endif()
 endif()
 
 # Row-wise float32 Top-K implementation with a C++ reference.
