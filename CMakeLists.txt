@@ -92,7 +92,6 @@ find_library(
     PATHS
         /usr/lib/x86_64-linux-gnu
         /usr/local/cuda/lib64
-    REQUIRED
 )
 find_path(
     NCCL_INCLUDE_DIR
@@ -100,7 +99,6 @@ find_path(
     PATHS
         /usr/include
         /usr/local/cuda/include
-    REQUIRED
 )
 
 include_directories(
@@ -147,6 +145,10 @@ set(OP_SOURCES
     "op/test/smem_bandwidth.cu"
     "op/test/smem_latency.cu"
     "op/test/smem_sts128_transactions.cu"
+    "op/test/arch_primitives/tma_copy.cu"
+    "op/test/arch_primitives/tma_swizzle.cu"
+    "op/test/arch_primitives/cluster_launch.cu"
+    "op/test/arch_primitives/cluster_dsm.cu"
 )
 
 foreach(SRC_FILE ${OP_SOURCES})
@@ -183,27 +185,31 @@ foreach(SRC_FILE ${OP_SOURCES})
 endforeach()
 
 # Validate a two-GPU tensor-parallel MLP with cuBLAS GEMMs and NCCL AllReduce.
-add_executable(
-    nccl_mlp_test
-    op/nccl/nccl_mlp_test.cu
-)
-target_include_directories(
-    nccl_mlp_test
-    PRIVATE
-        ${NCCL_INCLUDE_DIR}
-)
-target_link_libraries(
-    nccl_mlp_test
-    PRIVATE
-        CUDA::cudart
-        CUDA::cublas
-        ${NCCL_LIBRARY}
-)
-target_compile_options(
-    nccl_mlp_test
-    PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v;-Wno-deprecated-gpu-targets>
-)
+if(NCCL_LIBRARY AND NCCL_INCLUDE_DIR)
+    add_executable(
+        nccl_mlp_test
+        op/nccl/nccl_mlp_test.cu
+    )
+    target_include_directories(
+        nccl_mlp_test
+        PRIVATE
+            ${NCCL_INCLUDE_DIR}
+    )
+    target_link_libraries(
+        nccl_mlp_test
+        PRIVATE
+            CUDA::cudart
+            CUDA::cublas
+            ${NCCL_LIBRARY}
+    )
+    target_compile_options(
+        nccl_mlp_test
+        PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v;-Wno-deprecated-gpu-targets>
+    )
+else()
+    message(STATUS "NCCL not found; skipping nccl_mlp_test")
+endif()
 
 include(CTest)
 if(BUILD_TESTING)
@@ -244,9 +250,27 @@ if(BUILD_TESTING)
         COMMAND smem_sts128_transactions
     )
     add_test(
-        NAME nccl_mlp_test
-        COMMAND nccl_mlp_test
+        NAME tma_copy
+        COMMAND tma_copy
     )
+    add_test(
+        NAME tma_swizzle
+        COMMAND tma_swizzle
+    )
+    add_test(
+        NAME cluster_launch
+        COMMAND cluster_launch
+    )
+    add_test(
+        NAME cluster_dsm
+        COMMAND cluster_dsm
+    )
+    if(TARGET nccl_mlp_test)
+        add_test(
+            NAME nccl_mlp_test
+            COMMAND nccl_mlp_test
+        )
+    endif()
 endif()
 
 # Row-wise float32 Top-K implementation with a C++ reference.
