@@ -153,6 +153,19 @@ set(OP_SOURCES
     "op/mul/mul_u8.cu"
     "op/linear/linear_k128.cu"
     "op/linear/cute_gemm_fp32.cu"
+    "op/linear/cute_gemm_fp16_fp32.cu"
+    "op/linear/cute_gemm_bf16_fp32.cu"
+    "op/linear/cute_gemm_fp8_fp16.cu"
+    "op/linear/cute_gemm_fp8_fp32.cu"
+    "op/linear/cute_gemm_fp4_fp16.cu"
+    "op/linear/cute_gemm_mxfp8_fp16.cu"
+    "op/linear/cute_gemm_nvfp4_dynamic.cu"
+    "op/linear/cute_gemm_fp6_mxfp6.cu"
+    "op/linear/cute_gemm_int8_int32.cu"
+    "op/linear/cute_gemm_w4a16.cu"
+    "op/linear/cute_gemm_tf32.cu"
+    "op/linear/cute_gemm_int4_int32.cu"
+    "op/linear/cute_gemm_sparse.cu"
     "op/linear/gemm_int8_basic.cu"
     "op/linear/linear_sn_k64_u8.cu"
     "op/linear/linear_sn_k64_u8_fp16.cu"
@@ -174,16 +187,22 @@ foreach(SRC_FILE ${OP_SOURCES})
     # 将该文件编译为独立的可执行程序
     add_executable(${EXE_NAME} ${SRC_FILE})
 
-    if(EXE_NAME STREQUAL "cute_gemm_fp32")
+    if(EXE_NAME MATCHES "^cute_gemm_")
         target_include_directories(
             ${EXE_NAME}
             PRIVATE
                 ${CUDAOP_CUTLASS_INCLUDE_DIR}
         )
+    endif()
 
+    if(EXE_NAME STREQUAL "cute_gemm_fp32" OR
+       EXE_NAME STREQUAL "cute_gemm_fp4_fp16" OR
+       EXE_NAME STREQUAL "cute_gemm_mxfp8_fp16" OR
+       EXE_NAME STREQUAL "cute_gemm_nvfp4_dynamic" OR
+       EXE_NAME STREQUAL "cute_gemm_fp6_mxfp6")
         # NVCC/CuTe 通过 family-specific 架构目标（例如 sm_120f）开放
-        # Blackwell TMA。Hopper 保持不变；仅为该 TMA 目标转换普通
-        # Blackwell 架构编号。
+        # Blackwell TMA 和 block-scaled/narrow-precision MMA。Hopper 保持
+        # 不变；仅为需要架构特性的目标转换普通 Blackwell 编号。
         set(CUDAOP_CUTE_TMA_ARCHITECTURES "")
         foreach(CUDAOP_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
             if(CUDAOP_CUDA_ARCH MATCHES "^(100|101|103|110|120|121)(-(real|virtual))?$")
@@ -213,6 +232,12 @@ foreach(SRC_FILE ${OP_SOURCES})
         CUDA::cublas
     )
 
+    if(EXE_NAME STREQUAL "cute_gemm_fp8_fp16" OR
+       EXE_NAME STREQUAL "cute_gemm_fp8_fp32" OR
+       EXE_NAME STREQUAL "cute_gemm_int8_int32")
+        target_link_libraries(${EXE_NAME} PRIVATE CUDA::cublasLt)
+    endif()
+
     if(TARGET CUDA::cudnn)
         target_link_libraries(${EXE_NAME} PRIVATE CUDA::cudnn)
     elseif(CUDNN_LIBRARY)
@@ -225,7 +250,7 @@ foreach(SRC_FILE ${OP_SOURCES})
         $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v;-Wno-deprecated-gpu-targets>
     )
 
-    if(EXE_NAME STREQUAL "cute_gemm_fp32")
+    if(EXE_NAME MATCHES "^cute_gemm_")
         target_compile_options(
             ${EXE_NAME}
             PRIVATE
@@ -306,9 +331,137 @@ if(BUILD_TESTING)
         NAME cute_gemm_fp32
         COMMAND
             cute_gemm_fp32
-            --m 512
-            --n 512
-            --k 512
+            --m 1152
+            --n 1280
+            --k 264
+            --warmup 1
+            --iterations 2
+    )
+    add_test(
+        NAME cute_gemm_fp16_fp32
+        COMMAND
+            cute_gemm_fp16_fp32
+            --m 1152
+            --n 1280
+            --k 320
+            --warmup 1
+            --iterations 2
+    )
+
+    add_test(
+        NAME cute_gemm_fp8_fp16
+        COMMAND
+            cute_gemm_fp8_fp16
+            --m 1152
+            --n 1280
+            --k 384
+            --warmup 1
+            --iterations 2
+    )
+    add_test(
+        NAME cute_gemm_fp4_fp16
+        COMMAND
+            cute_gemm_fp4_fp16
+            --m 1152
+            --n 1280
+            --k 384
+            --warmup 1
+            --iterations 2
+    )
+    add_test(
+        NAME cute_gemm_int8_int32
+        COMMAND
+            cute_gemm_int8_int32
+            --m 1152
+            --n 1280
+            --k 384
+            --warmup 1
+            --iterations 2
+    )
+    add_test(
+        NAME cute_gemm_bf16_fp32
+        COMMAND
+            cute_gemm_bf16_fp32
+            --m 256
+            --n 256
+            --k 128
+            --warmup 1
+            --iterations 2
+    )
+    add_test(
+        NAME cute_gemm_fp8_fp32
+        COMMAND
+            cute_gemm_fp8_fp32
+            --m 256
+            --n 256
+            --k 256
+            --warmup 1
+            --iterations 2
+    )
+    add_test(
+        NAME cute_gemm_mxfp8_fp16
+        COMMAND
+            cute_gemm_mxfp8_fp16
+            --m 256
+            --n 256
+            --k 128
+            --warmup 1
+            --iterations 2
+    )
+    add_test(
+        NAME cute_gemm_nvfp4_dynamic
+        COMMAND
+            cute_gemm_nvfp4_dynamic
+            --m 256
+            --n 256
+            --k 128
+            --warmup 1
+            --iterations 2
+    )
+    add_test(
+        NAME cute_gemm_fp6_mxfp6
+        COMMAND
+            cute_gemm_fp6_mxfp6
+            --m 256
+            --n 256
+            --k 128
+            --warmup 1
+            --iterations 2
+    )
+    add_test(
+        NAME cute_gemm_w4a16
+        COMMAND
+            cute_gemm_w4a16
+            --m 256
+            --n 256
+            --k 128
+            --warmup 1
+            --iterations 2
+    )
+    add_test(
+        NAME cute_gemm_tf32
+        COMMAND
+            cute_gemm_tf32
+            --m 256
+            --n 256
+            --k 128
+            --warmup 1
+            --iterations 2
+    )
+    add_test(
+        NAME cute_gemm_int4_int32
+        COMMAND
+            cute_gemm_int4_int32
+            --m 256
+            --n 256
+            --k 128
+            --warmup 1
+            --iterations 2
+    )
+    add_test(
+        NAME cute_gemm_sparse
+        COMMAND
+            cute_gemm_sparse
             --warmup 1
             --iterations 2
     )

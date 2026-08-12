@@ -66,7 +66,10 @@ constexpr int kBlockM = 128;
 constexpr int kBlockN = 128;
 constexpr int kBlockK = 8;
 constexpr int kPipelineStages = 3;
+constexpr int kBlockSwizzleSize = 8;
 constexpr const char *kTmaGemmName = "TMA-SW32";
+constexpr const char *kBlockSwizzleGemmName =
+    "Vec16-BlockSwizzle8";
 
 constexpr float kAbsoluteTolerance = 5.0e-2F;
 constexpr float kRelativeTolerance = 2.0e-3F;
@@ -80,6 +83,59 @@ enum class SharedLayoutMode
     kSwizzle323,
     kVector16Swizzle123
 };
+
+enum class BlockRasterMode
+{
+    kIdentity,
+    kSwizzle8
+};
+
+struct BlockTileCoordinate
+{
+    int m;
+    int n;
+};
+
+// Block Swizzle 与 Shared Memory Swizzle 作用在不同层级：后者改变一个
+// CTA 内的 SMEM 地址，前者只重排物理 blockIdx 到逻辑 GEMM tile 的映射。
+// 这里复刻 CUTLASS Blackwell sm100_tile_scheduler.hpp 的二维 SxS 映射：
+// 完整的 8x8 tile 区域参与重排，不足 8 的 M/N 尾部保持 identity。
+__host__ __device__ BlockTileCoordinate map_block_to_gemm_tile(
+    int physical_m,
+    int physical_n,
+    int tile_count_m,
+    int tile_count_n,
+    BlockRasterMode raster_mode)
+{
+    if (raster_mode == BlockRasterMode::kIdentity)
+    {
+        return {physical_m, physical_n};
+    }
+
+    const int swizzled_tile_count_m =
+        tile_count_m / kBlockSwizzleSize * kBlockSwizzleSize;
+    const int swizzled_tile_count_n =
+        tile_count_n / kBlockSwizzleSize * kBlockSwizzleSize;
+
+    if (physical_m >= swizzled_tile_count_m ||
+        physical_n >= swizzled_tile_count_n)
+    {
+        return {physical_m, physical_n};
+    }
+
+    const int m_group_count = tile_count_m / kBlockSwizzleSize;
+    const int m_group = physical_m / kBlockSwizzleSize;
+    const int m_in_group = physical_m % kBlockSwizzleSize;
+    const int n_group = physical_n / kBlockSwizzleSize;
+    const int n_in_group = physical_n % kBlockSwizzleSize;
+
+    // 在每个 Mx8 子网格中把原来的 M-major 发射顺序转成 8x8 分组顺序：
+    //   logical_m = m_group + (M_groups * n_in_group)
+    //   logical_n = m_in_group + (8 * n_group)
+    return {
+        m_group + m_group_count * n_in_group,
+        m_in_group + kBlockSwizzleSize * n_group};
+}
 
 template <SharedLayoutMode Mode>
 constexpr const char *shared_layout_name()
@@ -441,6 +497,70 @@ Options parse_options(int argc, char **argv)
     return options;
 }
 
+struct BlockSwizzleMappingValidation
+{
+    size_t tile_count = 0;
+    size_t unique_tile_count = 0;
+    size_t duplicate_count = 0;
+    size_t out_of_range_count = 0;
+    size_t relocated_tile_count = 0;
+};
+
+BlockSwizzleMappingValidation validate_block_swizzle_mapping(
+    int tile_count_m,
+    int tile_count_n)
+{
+    BlockSwizzleMappingValidation result;
+    result.tile_count =
+        static_cast<size_t>(tile_count_m) * tile_count_n;
+    std::vector<uint32_t> visits(result.tile_count, 0U);
+
+    // Host 与 kernel 共用 map_block_to_gemm_tile：枚举整个物理 grid，
+    // 显式证明输出是合法 tile 的置换，而不只是依赖 GEMM 数值
+    // 对比间接发现重复或遗漏。
+    for (int physical_n = 0; physical_n < tile_count_n; ++physical_n)
+    {
+        for (int physical_m = 0; physical_m < tile_count_m; ++physical_m)
+        {
+            const BlockTileCoordinate logical_tile =
+                map_block_to_gemm_tile(
+                    physical_m,
+                    physical_n,
+                    tile_count_m,
+                    tile_count_n,
+                    BlockRasterMode::kSwizzle8);
+
+            if (logical_tile.m < 0 || logical_tile.m >= tile_count_m ||
+                logical_tile.n < 0 || logical_tile.n >= tile_count_n)
+            {
+                ++result.out_of_range_count;
+                continue;
+            }
+
+            if (logical_tile.m != physical_m ||
+                logical_tile.n != physical_n)
+            {
+                ++result.relocated_tile_count;
+            }
+
+            const size_t logical_index =
+                static_cast<size_t>(logical_tile.n) * tile_count_m +
+                logical_tile.m;
+            if (visits[logical_index] == 0U)
+            {
+                ++result.unique_tile_count;
+            }
+            else
+            {
+                ++result.duplicate_count;
+            }
+            ++visits[logical_index];
+        }
+    }
+
+    return result;
+}
+
 __host__ __device__ uint32_t mix_bits(uint32_t value)
 {
     value ^= value >> 16;
@@ -526,6 +646,9 @@ __global__ __launch_bounds__(decltype(size(TiledMma{}))::value)
 void cute_gemm_kernel(
     ProblemShape problem_shape,
     CtaTiler cta_tiler,
+    int tile_count_m,
+    int tile_count_n,
+    BlockRasterMode block_raster_mode,
     const float *a,
     AStride stride_a,
     ASmemLayout smem_layout_a,
@@ -562,10 +685,21 @@ void cute_gemm_kernel(
         select<0, 1>(problem_shape),
         stride_c);
 
-    // local_tile 根据 blockIdx 取出本 CTA 负责的逻辑 tile：
-    // A[128,8,k_tile]、B[128,8,k_tile] 和 C[128,128]。
+    // Identity 直接使用 (blockIdx.x, blockIdx.y)；Swizzle8 只在这里
+    // 将物理 CTA 重排到另一个逻辑 (M_tile,N_tile)。下面的 G2S、
+    // SMEM layout、S2R、FMA 和 epilogue 完全共用，因此是 Block
+    // Swizzle 的单变量对照。
+    const BlockTileCoordinate block_tile = map_block_to_gemm_tile(
+        static_cast<int>(blockIdx.x),
+        static_cast<int>(blockIdx.y),
+        tile_count_m,
+        tile_count_n,
+        block_raster_mode);
+
+    // local_tile 取出重排后的逻辑 tile：A[128,8,k_tile]、
+    // B[128,8,k_tile] 和 C[128,128]。
     const auto cta_coordinate =
-        make_coord(blockIdx.x, blockIdx.y, _);
+        make_coord(block_tile.m, block_tile.n, _);
     Tensor block_a = local_tile(
         global_a,
         cta_tiler,
@@ -1012,7 +1146,8 @@ void launch_cute_gemm(
     int m,
     int n,
     int k,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    BlockRasterMode block_raster_mode = BlockRasterMode::kIdentity)
 {
     using namespace cute;
 
@@ -1071,14 +1206,17 @@ void launch_cute_gemm(
         decltype(smem_layout_b)>;
     const int shared_memory_bytes = static_cast<int>(sizeof(Storage));
 
+    const int tile_count_m = size(ceil_div(m, Int<kBlockM>{}));
+    const int tile_count_n = size(ceil_div(n, Int<kBlockN>{}));
     const dim3 block(size(tiled_mma));
-    const dim3 grid(
-        size(ceil_div(m, Int<kBlockM>{})),
-        size(ceil_div(n, Int<kBlockN>{})));
+    const dim3 grid(tile_count_m, tile_count_n);
 
     cute_gemm_kernel<<<grid, block, shared_memory_bytes, stream>>>(
         problem_shape,
         cta_tiler,
+        tile_count_m,
+        tile_count_n,
+        block_raster_mode,
         a,
         stride_a,
         smem_layout_a,
@@ -1300,6 +1438,7 @@ __global__ void compare_outputs_kernel(
     size_t element_count,
     float absolute_tolerance,
     float relative_tolerance,
+    bool compare_bits,
     DeviceComparison *comparison)
 {
     const size_t first =
@@ -1330,10 +1469,13 @@ __global__ void compare_outputs_kernel(
             &comparison->max_relative_error_bits,
             __float_as_uint(relative_error));
 
-        const float tolerance =
-            absolute_tolerance +
+        const float tolerance = absolute_tolerance +
             relative_tolerance * fabsf(reference_value);
-        if (absolute_error > tolerance)
+        const bool mismatch = compare_bits
+            ? __float_as_uint(actual_value) !=
+                __float_as_uint(reference_value)
+            : absolute_error > tolerance;
+        if (mismatch)
         {
             atomicAdd(&comparison->mismatch_count, 1ULL);
         }
@@ -1345,7 +1487,10 @@ DeviceComparison compare_outputs(
     const float *reference,
     size_t element_count,
     int block_count,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    float absolute_tolerance = kAbsoluteTolerance,
+    float relative_tolerance = kRelativeTolerance,
+    bool compare_bits = false)
 {
     DeviceBuffer<DeviceComparison> device_comparison(1);
     CUDA_CHECK(cudaMemsetAsync(
@@ -1358,8 +1503,9 @@ DeviceComparison compare_outputs(
         actual,
         reference,
         element_count,
-        kAbsoluteTolerance,
-        kRelativeTolerance,
+        absolute_tolerance,
+        relative_tolerance,
+        compare_bits,
         device_comparison.get());
     CUDA_CHECK(cudaGetLastError());
 
@@ -1406,6 +1552,7 @@ bool verify_cpu_samples(
     const float *swizzle_223_output,
     const float *swizzle_323_output,
     const float *vector_16_output,
+    const float *block_swizzle_output,
     const float *tma_output,
     const float *cublas_output,
     int m,
@@ -1429,6 +1576,7 @@ bool verify_cpu_samples(
               << std::setw(15) << "Swizzle223"
               << std::setw(15) << "Swizzle323"
               << std::setw(18) << "Vec16Swizzle123"
+              << std::setw(22) << "BlockSwizzle8"
               << std::setw(15) << kTmaGemmName
               << std::setw(15) << "cuBLAS FP32"
               << '\n';
@@ -1448,6 +1596,8 @@ bool verify_cpu_samples(
             copy_device_value(swizzle_323_output, index);
         const float vector_16_value =
             copy_device_value(vector_16_output, index);
+        const float block_swizzle_value =
+            copy_device_value(block_swizzle_output, index);
         const float tma_value =
             copy_device_value(tma_output, index);
         const float cublas_value =
@@ -1462,6 +1612,9 @@ bool verify_cpu_samples(
             std::abs(static_cast<double>(swizzle_323_value) - reference);
         const double vector_16_error =
             std::abs(static_cast<double>(vector_16_value) - reference);
+        const double block_swizzle_error =
+            std::abs(
+                static_cast<double>(block_swizzle_value) - reference);
         const double tma_error =
             std::abs(static_cast<double>(tma_value) - reference);
         const double cublas_error =
@@ -1474,6 +1627,7 @@ bool verify_cpu_samples(
             swizzle_223_error <= tolerance &&
             swizzle_323_error <= tolerance &&
             vector_16_error <= tolerance &&
+            block_swizzle_error <= tolerance &&
             tma_error <= tolerance &&
             cublas_error <= tolerance;
 
@@ -1487,6 +1641,7 @@ bool verify_cpu_samples(
                   << std::setw(15) << swizzle_223_value
                   << std::setw(15) << swizzle_323_value
                   << std::setw(18) << vector_16_value
+                  << std::setw(22) << block_swizzle_value
                   << std::setw(15) << tma_value
                   << std::setw(15) << cublas_value
                   << '\n';
@@ -1622,13 +1777,14 @@ int main(int argc, char **argv)
         const size_t count_c =
             static_cast<size_t>(options.m) * options.n;
         const size_t required_bytes =
-            (count_a + count_b + 6 * count_c) * sizeof(float);
+            (count_a + count_b + 7 * count_c) * sizeof(float);
 
         size_t free_bytes = 0;
         size_t total_bytes = 0;
         CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
 
-        std::cout << "CuTe FP32 GEMM G2S/shared-layout test vs cuBLAS\n\n";
+        std::cout << "CuTe FP32 GEMM G2S/shared-layout/block-raster test "
+                  << "vs cuBLAS\n\n";
         std::cout << "[Configuration]\n";
         std::cout << "  " << std::left << std::setw(30)
                   << "GPU" << properties.name << '\n';
@@ -1653,6 +1809,9 @@ int main(int argc, char **argv)
                   << "Padding-129 / Swizzle<2,2,3> / Swizzle<3,2,3> / "
                   << "Vec16-Swizzle<1,2,3> / TMA-SW32\n";
         std::cout << "  " << std::left << std::setw(30)
+                  << "Block raster"
+                  << "Identity / CUTLASS-style 2D Swizzle8\n";
+        std::cout << "  " << std::left << std::setw(30)
                   << "G2S copy widths"
                   << "4B scalar (first 3) / 16B cp.async (Vec16) / "
                   << "4096B/operand per TMA tile\n";
@@ -1676,7 +1835,7 @@ int main(int argc, char **argv)
         if (required_bytes + memory_margin > free_bytes)
         {
             throw std::runtime_error(
-                "insufficient free device memory for A, B and six C buffers");
+                "insufficient free device memory for A, B and seven C buffers");
         }
 
         CudaStream stream;
@@ -1693,6 +1852,7 @@ int main(int argc, char **argv)
         DeviceBuffer<float> device_swizzle_223_c(count_c);
         DeviceBuffer<float> device_swizzle_323_c(count_c);
         DeviceBuffer<float> device_vector_16_c(count_c);
+        DeviceBuffer<float> device_block_swizzle_c(count_c);
         DeviceBuffer<float> device_tma_c(count_c);
         DeviceBuffer<float> device_cublas_c(count_c);
         // Tensor-map 编码是 host setup，不属于 kernel 时间；plan 在所有
@@ -1724,8 +1884,44 @@ int main(int argc, char **argv)
                 kSeedB);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaStreamSynchronize(stream.get()));
+        const int tile_count_m = options.m / kBlockM;
+        const int tile_count_n = options.n / kBlockN;
+        const BlockSwizzleMappingValidation mapping_validation =
+            validate_block_swizzle_mapping(tile_count_m, tile_count_n);
+        const bool block_swizzle_mapping_passed =
+            mapping_validation.unique_tile_count ==
+                mapping_validation.tile_count &&
+            mapping_validation.duplicate_count == 0 &&
+            mapping_validation.out_of_range_count == 0;
         std::cout << "  Deterministic FP32 inputs initialized on GPU\n";
         std::cout << "  TMA tensor maps encoded once on host\n\n";
+        std::cout << "[Block Swizzle mapping]\n";
+        std::cout << "  " << std::left << std::setw(30)
+                  << "Physical tile grid" << tile_count_m << 'x'
+                  << tile_count_n << '\n';
+        std::cout << "  " << std::left << std::setw(30)
+                  << "Swizzled main region"
+                  << tile_count_m / kBlockSwizzleSize * kBlockSwizzleSize
+                  << 'x'
+                  << tile_count_n / kBlockSwizzleSize * kBlockSwizzleSize
+                  << '\n';
+        std::cout << "  " << std::left << std::setw(30)
+                  << "Unique logical tiles"
+                  << mapping_validation.unique_tile_count << " / "
+                  << mapping_validation.tile_count << '\n';
+        std::cout << "  " << std::left << std::setw(30)
+                  << "Relocated tiles"
+                  << mapping_validation.relocated_tile_count << '\n';
+        std::cout << "  " << std::left << std::setw(30)
+                  << "Duplicate / out-of-range"
+                  << mapping_validation.duplicate_count << " / "
+                  << mapping_validation.out_of_range_count << "\n\n";
+
+        if (!block_swizzle_mapping_passed)
+        {
+            throw std::runtime_error(
+                "Block Swizzle mapping is not a bijection");
+        }
 
         std::cout << "[Correctness]\n";
         std::cout << std::defaultfloat << std::setprecision(6);
@@ -1761,6 +1957,15 @@ int main(int argc, char **argv)
             options.n,
             options.k,
             stream.get());
+        launch_cute_gemm<SharedLayoutMode::kVector16Swizzle123>(
+            device_a.get(),
+            device_b.get(),
+            device_block_swizzle_c.get(),
+            options.m,
+            options.n,
+            options.k,
+            stream.get(),
+            BlockRasterMode::kSwizzle8);
         launch_cute_tma_gemm(
             tma_gemm_plan,
             device_tma_c.get(),
@@ -1776,7 +1981,7 @@ int main(int argc, char **argv)
             options.k);
         CUDA_CHECK(cudaStreamSynchronize(stream.get()));
 
-        const std::array<ComparisonResult, 5> comparisons = {{
+        const std::array<ComparisonResult, 6> comparisons = {{
             {
                 shared_layout_name<SharedLayoutMode::kPadding129>(),
                 compare_outputs(
@@ -1815,6 +2020,15 @@ int main(int argc, char **argv)
                     stream.get())
             },
             {
+                kBlockSwizzleGemmName,
+                compare_outputs(
+                    device_block_swizzle_c.get(),
+                    device_cublas_c.get(),
+                    count_c,
+                    utility_block_count,
+                    stream.get())
+            },
+            {
                 kTmaGemmName,
                 compare_outputs(
                     device_tma_c.get(),
@@ -1825,12 +2039,26 @@ int main(int argc, char **argv)
             }
         }};
 
+        // Block raster 只改变 CTA 顺序，每个输出元素的 FP32 FMA
+        // 顺序不变，所以它应与 Vec16 identity 输出 bitwise 一致。
+        const DeviceComparison block_swizzle_vs_identity =
+            compare_outputs(
+                device_block_swizzle_c.get(),
+                device_vector_16_c.get(),
+                count_c,
+                utility_block_count,
+                stream.get(),
+                0.0F,
+                0.0F,
+                true);
+
         std::cout << "  " << std::left << std::setw(30)
-                  << "Compared elements per layout" << count_c << '\n';
+                  << "Compared elements" << count_c
+                  << '\n';
         std::cout << "  " << std::left << std::setw(30)
                   << "Tolerance" << "atol=" << kAbsoluteTolerance
                   << ", rtol=" << kRelativeTolerance << "\n\n";
-        std::cout << "  " << std::left << std::setw(24) << "Shared layout"
+        std::cout << "  " << std::left << std::setw(24) << "Implementation"
                   << std::right << std::setw(16) << "Mismatches"
                   << std::setw(18) << "Max abs error"
                   << std::setw(18) << "Max rel error" << '\n';
@@ -1853,6 +2081,13 @@ int main(int argc, char **argv)
         }
         std::cout << '\n';
 
+        std::cout << "  " << std::left << std::setw(30)
+                  << "Swizzle8 vs Vec16 identity"
+                  << block_swizzle_vs_identity.mismatch_count
+                  << " bitwise mismatches\n\n";
+        all_layouts_passed = all_layouts_passed &&
+            block_swizzle_vs_identity.mismatch_count == 0;
+
         std::cout << "[CPU FP64 samples]\n";
         std::cout << std::fixed << std::setprecision(7);
         const bool cpu_samples_passed = verify_cpu_samples(
@@ -1860,6 +2095,7 @@ int main(int argc, char **argv)
             device_swizzle_223_c.get(),
             device_swizzle_323_c.get(),
             device_vector_16_c.get(),
+            device_block_swizzle_c.get(),
             device_tma_c.get(),
             device_cublas_c.get(),
             options.m,
@@ -1876,7 +2112,7 @@ int main(int argc, char **argv)
         std::cout << "  Method: rotate the starting implementation each round; "
                   << "report the median of "
                   << options.benchmark_iterations << " samples\n\n";
-        const std::array<BenchmarkCase, 6> benchmark_cases = {{
+        const std::array<BenchmarkCase, 7> benchmark_cases = {{
             {
                 shared_layout_name<SharedLayoutMode::kPadding129>(),
                 [&]()
@@ -1940,6 +2176,23 @@ int main(int argc, char **argv)
                 }
             },
             {
+                kBlockSwizzleGemmName,
+                [&]()
+                {
+                    launch_cute_gemm<
+                        SharedLayoutMode::kVector16Swizzle123>(
+                            device_a.get(),
+                            device_b.get(),
+                            device_block_swizzle_c.get(),
+                            options.m,
+                            options.n,
+                            options.k,
+                            stream.get(),
+                            BlockRasterMode::kSwizzle8);
+                    CUDA_CHECK(cudaGetLastError());
+                }
+            },
+            {
                 kTmaGemmName,
                 [&]()
                 {
@@ -1966,7 +2219,7 @@ int main(int argc, char **argv)
             }
         }};
 
-        const std::array<double, 6> benchmark_milliseconds =
+        const std::array<double, 7> benchmark_milliseconds =
             benchmark_round_robin(
                 benchmark_cases,
                 options.warmup_iterations,
@@ -1977,9 +2230,9 @@ int main(int argc, char **argv)
             options.m,
             options.n,
             options.k,
-            benchmark_milliseconds[5]);
+            benchmark_milliseconds[6]);
 
-        std::array<BenchmarkResult, 6> benchmark_results{};
+        std::array<BenchmarkResult, 7> benchmark_results{};
         for (size_t index = 0; index < benchmark_results.size(); ++index)
         {
             benchmark_results[index] = {
@@ -2010,8 +2263,8 @@ int main(int argc, char **argv)
         }
         std::cout << '\n';
 
-        std::cout << "[SUCCESS] cp.async/TMA CuTe FP32 GEMMs passed "
-                  << "correctness and cuBLAS comparison\n";
+        std::cout << "[SUCCESS] cp.async/TMA/Block-Swizzle CuTe FP32 "
+                  << "GEMMs passed correctness and cuBLAS comparison\n";
     }
     catch (const std::exception &error)
     {
