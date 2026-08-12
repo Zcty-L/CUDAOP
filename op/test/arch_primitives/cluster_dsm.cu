@@ -8,8 +8,6 @@
 
 #include <cuda_runtime.h>
 
-#include "ptx_utils.cuh"
-
 namespace
 {
 
@@ -35,32 +33,140 @@ void check_cuda(cudaError_t status, const char *operation)
     }
 }
 
+__device__ __forceinline__ uint32_t shared_address_raw(const void *pointer)
+{
+    // mapa.shared::cluster.u32 接收 shared state-space 的 32-bit offset，
+    // 不能直接接收 CUDA C++ generic shared pointer。
+    return static_cast<uint32_t>(__cvta_generic_to_shared(pointer));
+}
+
+// PTX ISA 参考：
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#special-registers-clusterid
+//
+// 指令名称：mov.u32 from %clusterid.x
+// 用途：标识当前 CTA 所属的 grid cluster，本例用于构造不同 cluster 的值。
+__device__ __forceinline__ uint32_t cluster_id_x_raw()
+{
+    uint32_t value = 0;
+    asm volatile(
+        "mov.u32 %0, %%clusterid.x;\n"
+        : "=r"(value));
+    return value;
+}
+
+// PTX ISA 参考：
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#special-registers-cluster-ctarank
+//
+// 指令名称：mov.u32 from %cluster_ctarank
+// 用途：读取当前 CTA 在 cluster 内的 flattened rank；mapa 的目标 CTA
+// 操作数也使用同一 rank 空间。
+__device__ __forceinline__ uint32_t cluster_cta_rank_raw()
+{
+    uint32_t value = 0;
+    asm volatile(
+        "mov.u32 %0, %%cluster_ctarank;\n"
+        : "=r"(value));
+    return value;
+}
+
+// PTX ISA 参考：
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#special-registers-cluster-nctaid
+//
+// 指令名称：mov.u32 from %cluster_nctaid.x
+// 用途：读取 cluster x 维 CTA 数，作为遍历全部远端 DSM segment 的上界。
+__device__ __forceinline__ uint32_t cluster_cta_count_x_raw()
+{
+    uint32_t value = 0;
+    asm volatile(
+        "mov.u32 %0, %%cluster_nctaid.x;\n"
+        : "=r"(value));
+    return value;
+}
+
+// PTX ISA 参考：
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-barrier-cluster
+//
+// 指令名称：barrier.cluster.arrive.release / barrier.cluster.wait.acquire
+// 用途：第一次同步发布每个 CTA 写入的 dsm_value，第二次同步保证任何 CTA
+// 退出前都不再有其他 CTA 访问它的 shared-memory segment。
+__device__ __forceinline__ void cluster_sync_raw()
+{
+    asm volatile(
+        "barrier.cluster.arrive.release;\n"
+        :
+        :
+        : "memory");
+    asm volatile(
+        "barrier.cluster.wait.acquire;\n"
+        :
+        :
+        : "memory");
+}
+
+// PTX ISA 参考：
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-mapa
+//
+// 指令名称：mapa.shared::cluster.u32
+// 用途：把当前 CTA 中某个 shared offset 映射为 target_rank CTA 的 DSM
+// 地址。映射只改变所属 CTA segment，变量在该 segment 内的 offset 不变。
+__device__ __forceinline__ uint32_t map_shared_rank_raw(
+    const void *local_shared_pointer,
+    uint32_t target_rank)
+{
+    const uint32_t local_address = shared_address_raw(local_shared_pointer);
+    uint32_t remote_address = 0;
+    asm volatile(
+        "mapa.shared::cluster.u32 %0, %1, %2;\n"
+        : "=r"(remote_address)
+        : "r"(local_address), "r"(target_rank)
+        : "memory");
+    return remote_address;
+}
+
+// PTX ISA 参考：
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-ld
+//
+// 指令名称：ld.shared::cluster.b32
+// 用途：从 mapa 生成的 cluster shared 地址读取 32-bit 数据。若地址属于
+// 另一 CTA，该访问会通过 distributed shared memory 到达远端 segment。
+__device__ __forceinline__ uint32_t load_shared_cluster_u32_raw(
+    uint32_t cluster_shared_address)
+{
+    uint32_t value = 0;
+    asm volatile(
+        "ld.shared::cluster.b32 %0, [%1];\n"
+        : "=r"(value)
+        : "r"(cluster_shared_address)
+        : "memory");
+    return value;
+}
+
 __global__ void cluster_dsm_kernel(DsmResult *output)
 {
     __shared__ uint32_t dsm_value;
 
-    const uint32_t cluster_id = ptx::cluster_id_x();
-    const uint32_t block_rank = ptx::cluster_cta_rank();
-    const uint32_t cluster_blocks = ptx::cluster_cta_count_x();
+    const uint32_t cluster_id = cluster_id_x_raw();
+    const uint32_t block_rank = cluster_cta_rank_raw();
+    const uint32_t cluster_blocks = cluster_cta_count_x_raw();
 
     if (threadIdx.x == 0)
     {
         dsm_value = cluster_id * 100 + block_rank + 1;
     }
 
-    ptx::cluster_sync();
+    cluster_sync_raw();
 
     if (threadIdx.x == 0)
     {
         uint32_t remote_sum = 0;
         for (uint32_t target_rank = 0;
              target_rank < cluster_blocks;
-             ++target_rank)
+            ++target_rank)
         {
             const uint32_t remote_address =
-                ptx::map_shared_rank(&dsm_value, target_rank);
-            uint32_t remote_value = 0;
-            ptx::lds32_cluster(remote_value, remote_address);
+                map_shared_rank_raw(&dsm_value, target_rank);
+            const uint32_t remote_value =
+                load_shared_cluster_u32_raw(remote_address);
             remote_sum += remote_value;
         }
 
@@ -71,8 +177,8 @@ __global__ void cluster_dsm_kernel(DsmResult *output)
         };
     }
 
-    // No CTA may exit while another CTA can still access its shared memory.
-    ptx::cluster_sync();
+    // 只要还有 peer CTA 可能访问本 CTA 的 dsm_value，本 CTA 就不能退出。
+    cluster_sync_raw();
 }
 
 cudaLaunchConfig_t make_launch_config(

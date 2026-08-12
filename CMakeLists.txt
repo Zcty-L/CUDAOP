@@ -145,10 +145,17 @@ set(OP_SOURCES
     "op/test/smem_bandwidth.cu"
     "op/test/smem_latency.cu"
     "op/test/smem_sts128_transactions.cu"
-    "op/test/arch_primitives/tma_copy.cu"
     "op/test/arch_primitives/tma_swizzle.cu"
     "op/test/arch_primitives/cluster_launch.cu"
     "op/test/arch_primitives/cluster_dsm.cu"
+    "op/test/arch_primitives/ptx_cp_async.cu"
+    "op/test/arch_primitives/ptx_tma.cu"
+    "op/test/arch_primitives/ptx_mma_float.cu"
+    "op/test/arch_primitives/ptx_mma_fp4.cu"
+    "op/test/arch_primitives/ptx_mma_fp8.cu"
+    "op/test/arch_primitives/ptx_mma_fp6.cu"
+    "op/test/arch_primitives/ptx_mma_integer.cu"
+    "op/test/arch_primitives/ptx_mma_sparse.cu"
 )
 
 foreach(SRC_FILE ${OP_SOURCES})
@@ -157,6 +164,30 @@ foreach(SRC_FILE ${OP_SOURCES})
     
     # 将该文件编译为独立的可执行程序
     add_executable(${EXE_NAME} ${SRC_FILE})
+
+    if(EXE_NAME STREQUAL "ptx_mma_fp4" OR
+       EXE_NAME STREQUAL "ptx_mma_fp8" OR
+       EXE_NAME STREQUAL "ptx_mma_fp6")
+        # SM120 narrow-precision/block-scaled MMA 是 family-specific 特性。
+        # 仅将学习目标的普通 Blackwell 架构号转换为 120f/121f，
+        # 避免影响其他可执行目标。
+        set(CUDAOP_PTX_MMA_ARCHITECTURES "")
+        foreach(CUDAOP_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+            if(CUDAOP_CUDA_ARCH MATCHES "^(120|121)(-(real|virtual))?$")
+                list(
+                    APPEND
+                    CUDAOP_PTX_MMA_ARCHITECTURES
+                    "${CMAKE_MATCH_1}f${CMAKE_MATCH_2}"
+                )
+            else()
+                list(APPEND CUDAOP_PTX_MMA_ARCHITECTURES "${CUDAOP_CUDA_ARCH}")
+            endif()
+        endforeach()
+        set_property(
+            TARGET ${EXE_NAME}
+            PROPERTY CUDA_ARCHITECTURES ${CUDAOP_PTX_MMA_ARCHITECTURES}
+        )
+    endif()
 
     if(EXE_NAME STREQUAL "opt_conv2d_groups_fp32")
         target_sources(${EXE_NAME} PRIVATE op/cpu/cpu_ops.cpp)
@@ -250,10 +281,6 @@ if(BUILD_TESTING)
         COMMAND smem_sts128_transactions
     )
     add_test(
-        NAME tma_copy
-        COMMAND tma_copy
-    )
-    add_test(
         NAME tma_swizzle
         COMMAND tma_swizzle
     )
@@ -264,6 +291,38 @@ if(BUILD_TESTING)
     add_test(
         NAME cluster_dsm
         COMMAND cluster_dsm
+    )
+    add_test(
+        NAME ptx_cp_async
+        COMMAND ptx_cp_async
+    )
+    add_test(
+        NAME ptx_tma
+        COMMAND ptx_tma
+    )
+    add_test(
+        NAME ptx_mma_float
+        COMMAND ptx_mma_float
+    )
+    add_test(
+        NAME ptx_mma_fp4
+        COMMAND ptx_mma_fp4
+    )
+    add_test(
+        NAME ptx_mma_fp8
+        COMMAND ptx_mma_fp8
+    )
+    add_test(
+        NAME ptx_mma_fp6
+        COMMAND ptx_mma_fp6
+    )
+    add_test(
+        NAME ptx_mma_integer
+        COMMAND ptx_mma_integer
+    )
+    add_test(
+        NAME ptx_mma_sparse
+        COMMAND ptx_mma_sparse
     )
     if(TARGET nccl_mlp_test)
         add_test(

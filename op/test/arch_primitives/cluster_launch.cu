@@ -8,8 +8,6 @@
 
 #include <cuda_runtime.h>
 
-#include "ptx_utils.cuh"
-
 namespace
 {
 
@@ -37,19 +35,102 @@ void check_cuda(cudaError_t status, const char *operation)
     }
 }
 
+// PTX ISA 参考：
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#special-registers-clusterid
+//
+// 指令名称：mov.u32 from %clusterid.x
+// 用途：读取当前 CTA 所属 cluster 在 grid 中的 x 维 cluster 坐标。
+// 它不是普通 blockIdx；显式 cluster shape 为 4 x 1 x 1 时，每四个 CTA
+// 共享同一个 cluster_id.x。
+__device__ __forceinline__ uint32_t cluster_id_x_raw()
+{
+    uint32_t value = 0;
+    asm volatile(
+        "mov.u32 %0, %%clusterid.x;\n"
+        : "=r"(value));
+    return value;
+}
+
+// PTX ISA 参考：
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#special-registers-cluster-ctaid
+//
+// 指令名称：mov.u32 from %cluster_ctaid.x
+// 用途：读取 CTA 在本 cluster 的 x 维局部坐标，范围是
+// [0, %cluster_nctaid.x)。对于一维 cluster，它与 flattened rank 相同。
+__device__ __forceinline__ uint32_t cluster_cta_id_x_raw()
+{
+    uint32_t value = 0;
+    asm volatile(
+        "mov.u32 %0, %%cluster_ctaid.x;\n"
+        : "=r"(value));
+    return value;
+}
+
+// PTX ISA 参考：
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#special-registers-cluster-ctarank
+//
+// 指令名称：mov.u32 from %cluster_ctarank
+// 用途：读取 CTA 在 cluster 内按 x、y、z 展平后的 rank。DSM 的 mapa
+// 指令以这个 flattened rank 选择远端 CTA。
+__device__ __forceinline__ uint32_t cluster_cta_rank_raw()
+{
+    uint32_t value = 0;
+    asm volatile(
+        "mov.u32 %0, %%cluster_ctarank;\n"
+        : "=r"(value));
+    return value;
+}
+
+// PTX ISA 参考：
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#special-registers-cluster-nctaid
+//
+// 指令名称：mov.u32 from %cluster_nctaid.x
+// 用途：读取显式启动时配置的 cluster x 维 CTA 数。本例应恒为 4。
+__device__ __forceinline__ uint32_t cluster_cta_count_x_raw()
+{
+    uint32_t value = 0;
+    asm volatile(
+        "mov.u32 %0, %%cluster_nctaid.x;\n"
+        : "=r"(value));
+    return value;
+}
+
+// PTX ISA 参考：
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-barrier-cluster
+//
+// 指令名称：barrier.cluster.arrive.release / barrier.cluster.wait.acquire
+// 用途：所有 CTA 先以 release 语义到达 cluster barrier，再以 acquire
+// 语义等待同一 cluster 的 CTA 全部到达。arrive 与 wait 分离，允许在两者
+// 之间插入与 cluster 同步无依赖的工作；本最小示例直接连续执行。
+__device__ __forceinline__ void cluster_sync_raw()
+{
+    asm volatile(
+        "barrier.cluster.arrive.release;\n"
+        :
+        :
+        : "memory");
+    asm volatile(
+        "barrier.cluster.wait.acquire;\n"
+        :
+        :
+        : "memory");
+}
+
 __global__ void cluster_launch_kernel(ClusterInfo *output)
 {
     ClusterInfo info{};
     if (threadIdx.x == 0)
     {
         info.block_id = blockIdx.x;
-        info.cluster_id = ptx::cluster_id_x();
-        info.cluster_cta_id = ptx::cluster_cta_id_x();
-        info.cluster_cta_rank = ptx::cluster_cta_rank();
-        info.cluster_cta_count = ptx::cluster_cta_count_x();
+        info.cluster_id = cluster_id_x_raw();
+        info.cluster_cta_id = cluster_cta_id_x_raw();
+        info.cluster_cta_rank = cluster_cta_rank_raw();
+        info.cluster_cta_count = cluster_cta_count_x_raw();
     }
 
-    ptx::cluster_sync();
+    // 所有线程都执行 cluster barrier。即使只有 thread 0 读取特殊寄存器，
+    // cluster 同步仍是 CTA 级操作，不能只放在 threadIdx.x == 0 分支中。
+    cluster_sync_raw();
 
     if (threadIdx.x == 0)
     {

@@ -9,8 +9,6 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-#include "ptx_utils.cuh"
-
 namespace
 {
 
@@ -65,6 +63,198 @@ uint32_t make_input_value(int row, int column)
     return static_cast<uint32_t>(row * 1000 + column * 7 + 3);
 }
 
+__device__ __forceinline__ uint32_t shared_address_raw(const void *pointer)
+{
+    // TMA 与 mbarrier 的 shared 操作数是 32-bit shared-memory offset；
+    // CUDA C++ 传入的是 generic pointer，需要先转换 address space。
+    return static_cast<uint32_t>(__cvta_generic_to_shared(pointer));
+}
+
+// PTX ISA 参考：
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#special-registers-clock64
+//
+// 指令名称：mov.u64 from %clock64
+// 用途：读取 SM cycle counter，测量单次 load/store TMA 阶段的设备周期。
+__device__ __forceinline__ uint64_t read_clock64_raw()
+{
+    uint64_t value = 0;
+    asm volatile(
+        "mov.u64 %0, %%clock64;\n"
+        : "=l"(value)
+        :
+        : "memory");
+    return value;
+}
+
+// PTX ISA 参考：
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-mbarrier-init
+//
+// 指令名称：mbarrier.init.shared::cta.b64
+// 用途：初始化跟踪 TMA load 的 CTA transaction barrier。expected_arrivals=1
+// 仅表示 thread 0 稍后执行一次 arrive，不表示 TMA 指令或字节数量。
+__device__ __forceinline__ void mbarrier_init_raw(
+    uint64_t *barrier,
+    uint32_t expected_arrivals)
+{
+    const uint32_t barrier_address = shared_address_raw(barrier);
+    asm volatile(
+        "mbarrier.init.shared::cta.b64 [%0], %1;\n"
+        :
+        : "r"(barrier_address), "r"(expected_arrivals)
+        : "memory");
+}
+
+// PTX ISA 参考：
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-fence-proxy-async
+//
+// 指令名称：fence.proxy.async.shared::cta
+// 用途：把普通 shared proxy 完成的 mbarrier 初始化发布给 TMA async proxy。
+__device__ __forceinline__ void fence_proxy_async_shared_cta_raw()
+{
+    asm volatile(
+        "fence.proxy.async.shared::cta;\n"
+        :
+        :
+        : "memory");
+}
+
+// PTX ISA 参考：
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-mbarrier-arrive
+//
+// 指令名称：mbarrier.arrive.expect_tx.shared::cta.b64
+// 用途：让 thread 0 到达 barrier，并登记 TMA load 应完成的 tile 总字节数。
+__device__ __forceinline__ void mbarrier_arrive_expect_tx_raw(
+    uint64_t *barrier,
+    uint32_t transaction_bytes)
+{
+    const uint32_t barrier_address = shared_address_raw(barrier);
+    asm volatile(
+        "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
+        :
+        : "r"(barrier_address), "r"(transaction_bytes)
+        : "memory");
+}
+
+// PTX ISA 参考：
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-bulk-tensor
+//
+// 指令名称：
+// cp.async.bulk.tensor.2d.shared::cta.global.tile
+//     .mbarrier::complete_tx::bytes
+// 用途：按 Tensor Map 的 shape、stride、box 与 swizzle，从 global tensor
+// 的 (x, y) 坐标加载一个二维 tile，并把完成字节数报告给 mbarrier。
+__device__ __forceinline__ void tma_load_2d_raw(
+    void *shared_destination,
+    const void *tensor_map,
+    int32_t coordinate_x,
+    int32_t coordinate_y,
+    uint64_t *barrier)
+{
+    const uint32_t destination_address =
+        shared_address_raw(shared_destination);
+    const uint32_t barrier_address = shared_address_raw(barrier);
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cta.global.tile"
+        ".mbarrier::complete_tx::bytes "
+        "[%0], [%1, {%2, %3}], [%4];\n"
+        :
+        : "r"(destination_address),
+          "l"(tensor_map),
+          "r"(coordinate_x),
+          "r"(coordinate_y),
+          "r"(barrier_address)
+        : "memory");
+}
+
+// PTX ISA 参考：
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-mbarrier-test-wait-try-wait
+//
+// 指令名称：mbarrier.try_wait.parity.shared::cta.b64
+// 用途：轮询当前 phase，直到 arrival count 与 transaction byte count
+// 都归零。初始化后的首个 phase 使用 parity 0。
+__device__ __forceinline__ void mbarrier_wait_parity_raw(
+    uint64_t *barrier,
+    uint32_t parity)
+{
+    const uint32_t barrier_address = shared_address_raw(barrier);
+    uint32_t complete = 0;
+    do
+    {
+        asm volatile(
+            "{\n"
+            " .reg .pred done;\n"
+            " mbarrier.try_wait.parity.shared::cta.b64 "
+            "done, [%1], %2;\n"
+            " selp.b32 %0, 1, 0, done;\n"
+            "}\n"
+            : "=r"(complete)
+            : "r"(barrier_address), "r"(parity)
+            : "memory");
+    }
+    while (complete == 0);
+}
+
+// PTX ISA 参考：
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-bulk-tensor
+//
+// 指令名称：cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group
+// 用途：按输出 Tensor Map 的同一种 swizzle 解释 shared tile，执行逆布局
+// 变换并写回 row-major global tensor。store 通过 bulk group 而非 mbarrier
+// 跟踪完成状态。
+__device__ __forceinline__ void tma_store_2d_raw(
+    const void *tensor_map,
+    int32_t coordinate_x,
+    int32_t coordinate_y,
+    const void *shared_source)
+{
+    const uint32_t source_address = shared_address_raw(shared_source);
+    asm volatile(
+        "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group "
+        "[%0, {%1, %2}], [%3];\n"
+        :
+        : "l"(tensor_map),
+          "r"(coordinate_x),
+          "r"(coordinate_y),
+          "r"(source_address)
+        : "memory");
+}
+
+// PTX ISA 参考：
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-bulk-commit-group
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-bulk-wait-group
+//
+// 指令名称：cp.async.bulk.commit_group / cp.async.bulk.wait_group.read 0
+// 用途：提交 TMA store，并等到 async proxy 已读完 shared source，之后可以
+// 安全复用 shared tile。`.read` 不单独承诺 global 目的端已经对 host 可见；
+// kernel completion 与 cudaDeviceSynchronize 提供最终的 host 可见性。
+__device__ __forceinline__ void tma_store_wait_read_raw()
+{
+    asm volatile(
+        "cp.async.bulk.commit_group;\n"
+        :
+        :);
+    asm volatile(
+        "cp.async.bulk.wait_group.read 0;\n"
+        :
+        :
+        : "memory");
+}
+
+// PTX ISA 参考：
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-mbarrier-inval
+//
+// 指令名称：mbarrier.inval.shared::cta.b64
+// 用途：所有线程结束本次 TMA phase 后销毁 shared-memory barrier 状态。
+__device__ __forceinline__ void mbarrier_invalidate_raw(uint64_t *barrier)
+{
+    const uint32_t barrier_address = shared_address_raw(barrier);
+    asm volatile(
+        "mbarrier.inval.shared::cta.b64 [%0];\n"
+        :
+        : "r"(barrier_address)
+        : "memory");
+}
+
 // ChunkCount 表示共享内存每行包含多少个 16B chunk：
 //   2 / 4 / 8 chunk 分别对应 32B / 64B / 128B inner span。
 // None 模式也使用 8 chunk，作为相同 128B tile 大小下的无 swizzle 基线。
@@ -94,10 +284,10 @@ __global__ void tma_swizzle_kernel(
     // 对应稍后的唯一一次 arrive_expect_tx；它不是 TMA 事务数量。
     if (threadIdx.x == 0)
     {
-        ptx::mbarrier_init(&transaction_barrier, 1);
+        mbarrier_init_raw(&transaction_barrier, 1);
 
         // 将普通 shared proxy 完成的 barrier 初始化发布给 TMA async proxy。
-        ptx::fence_proxy_async_shared_cta();
+        fence_proxy_async_shared_cta_raw();
     }
 
     // 确保初始化阶段结束后再进入 TMA load/store 阶段。
@@ -105,17 +295,17 @@ __global__ void tma_swizzle_kernel(
 
     if (threadIdx.x == 0)
     {
-        const uint64_t start_cycles = ptx::read_clock64();
+        const uint64_t start_cycles = read_clock64_raw();
 
         // thread 0 到达 barrier，并登记 load 需要完成的 tile 总字节数。
-        ptx::mbarrier_arrive_expect_tx(
+        mbarrier_arrive_expect_tx_raw(
             &transaction_barrier,
             transaction_bytes);
 
         // 从 input tensor 的二维坐标 (x=0, y=0) 发起 TMA load。
         // 硬件先按 Tensor Map 的 global dimensions/stride 取数，再按该
         // Tensor Map 的 swizzle 模式把 16B chunks 排列到 shared_tile。
-        ptx::tma_load_2d(
+        tma_load_2d_raw(
             shared_tile,
             &input_tensor_map,
             0,
@@ -124,12 +314,12 @@ __global__ void tma_swizzle_kernel(
 
         // 等待第一个 barrier phase 完成，保证 store 开始读取 shared_tile
         // 之前，global-to-shared 搬运和 swizzle 已经全部完成。
-        ptx::mbarrier_wait_parity(&transaction_barrier, 0);
+        mbarrier_wait_parity_raw(&transaction_barrier, 0);
 
         // output Tensor Map 使用与 input 相同的 shape 和 swizzle，只替换了
         // global-memory 基地址。TMA store 按同一 swizzle 规则解释共享内存，
         // 将布局反变换后写回普通 row-major global memory。
-        ptx::tma_store_2d(
+        tma_store_2d_raw(
             &output_tensor_map,
             0,
             0,
@@ -138,18 +328,18 @@ __global__ void tma_swizzle_kernel(
         // store 属于 bulk async group。这里提交 group，并等待异步代理读完
         // shared_tile，使共享内存可以安全复用。它不代表 global 写入已经
         // 对 host 可见；测试依靠 kernel 完成和 cudaDeviceSynchronize 验证。
-        ptx::tma_store_wait_read();
+        tma_store_wait_read_raw();
 
         // 该计数覆盖 TMA load 等待，以及 store 读完 shared source 的时间；
         // 它不是 global-memory store 最终可见延迟。
-        completion_cycles[0] = ptx::read_clock64() - start_cycles;
+        completion_cycles[0] = read_clock64_raw() - start_cycles;
     }
 
     // 确保没有线程仍处于本次 TMA 阶段，再销毁 transaction barrier。
     __syncthreads();
     if (threadIdx.x == 0)
     {
-        ptx::mbarrier_invalidate(&transaction_barrier);
+        mbarrier_invalidate_raw(&transaction_barrier);
     }
 }
 
