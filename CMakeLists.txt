@@ -356,6 +356,51 @@ if(BUILD_TESTING)
     )
 endif()
 
+# Validate the standalone float32 adaptation of PyTorch radixSelect.
+add_executable(
+    sorting_radix_select_test
+    op/topk/sorting_radix_select_test.cu
+)
+target_link_libraries(
+    sorting_radix_select_test
+    PRIVATE
+        CUDA::cudart
+)
+target_compile_options(
+    sorting_radix_select_test
+    PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v;-Wno-deprecated-gpu-targets>
+)
+if(BUILD_TESTING)
+    add_test(
+        NAME sorting_radix_select_test
+        COMMAND sorting_radix_select_test
+    )
+endif()
+
+# Validate the complete threshold, gather and sort radix Top-K path.
+add_executable(
+    topk_radix_test
+    op/topk/topk_radix_test.cu
+    op/topk/topk_radix_cuda.cu
+)
+target_link_libraries(
+    topk_radix_test
+    PRIVATE
+        CUDA::cudart
+)
+target_compile_options(
+    topk_radix_test
+    PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v;-Wno-deprecated-gpu-targets>
+)
+if(BUILD_TESTING)
+    add_test(
+        NAME topk_radix_test
+        COMMAND topk_radix_test
+    )
+endif()
+
 # Compare separate Conv2D + LIF kernels against the fused Conv2D-LIF kernel.
 add_executable(
     conv2d_lif_fusion_cmp
