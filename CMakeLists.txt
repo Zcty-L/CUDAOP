@@ -133,6 +133,7 @@ set(OP_SOURCES
     "op/dwconv/opt_conv2d_groups_fp16.cu"
     "op/resize/resize_u8.cu"
     "op/mul/mul_u8.cu"
+    "op/softmax/softmax.cu"
     "op/linear/linear_k128.cu"
     "op/linear/linear_sn_k64_u8.cu"
     "op/linear/linear_sn_k64_u8_fp16.cu"
@@ -525,5 +526,17 @@ add_custom_target(cudaop_grouped_gemm_test
         cudaop_grouped_gemm
     COMMENT
         "Testing cudaop_grouped_gemm"
+    VERBATIM
+)
+
+add_custom_target(flashattn_torch_test
+    COMMAND
+        ${CMAKE_COMMAND} -E env
+        "PYTHONPATH=${PROJECT_SOURCE_DIR}/op"
+        ${Python3_EXECUTABLE} -m flashattn.test_torch_impl
+    WORKING_DIRECTORY
+        "${PROJECT_SOURCE_DIR}"
+    COMMENT
+        "Testing the Flash Attention Torch reference implementations"
     VERBATIM
 )
