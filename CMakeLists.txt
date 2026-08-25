@@ -357,6 +357,30 @@ if(BUILD_TESTING)
     )
 endif()
 
+# Shared-memory MxN transpose for float, BF16, FP8 E4M3, and packed FP4 E2M1.
+add_executable(
+    transpose_test
+    op/transpose/transpose_test.cu
+    op/transpose/transpose.cu
+    op/transpose/transpose_vectorized.cu
+)
+target_link_libraries(
+    transpose_test
+    PRIVATE
+        CUDA::cudart
+)
+target_compile_options(
+    transpose_test
+    PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v;-Wno-deprecated-gpu-targets>
+)
+if(BUILD_TESTING)
+    add_test(
+        NAME transpose_test
+        COMMAND transpose_test
+    )
+endif()
+
 # Compare separate Conv2D + LIF kernels against the fused Conv2D-LIF kernel.
 add_executable(
     conv2d_lif_fusion_cmp

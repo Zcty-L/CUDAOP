@@ -51,3 +51,11 @@ typedef struct
     uint32_t warmup_iterations;
     uint32_t benchmark_iterations;
 } TopKParam;
+
+typedef struct
+{
+    uint32_t rows;
+    uint32_t columns;
+    uint32_t warmup_iterations;
+    uint32_t benchmark_iterations;
+} TransposeParam;
