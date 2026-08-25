@@ -47,6 +47,18 @@ cudaError_t transpose_cuda(
     TransposeSharedMemoryLayout shared_memory_layout,
     cudaStream_t stream = nullptr);
 
+// Uses one 32-bit global-memory pack per thread: two BF16 values or four FP8
+// E4M3 values. Other data types return cudaErrorInvalidValue. Unaligned rows
+// and partial edge packs are handled by a scalar bit-preserving path.
+cudaError_t transpose_vectorized_cuda(
+    const void *input,
+    void *output,
+    uint32_t rows,
+    uint32_t columns,
+    TransposeDataType data_type,
+    TransposeSharedMemoryLayout shared_memory_layout,
+    cudaStream_t stream = nullptr);
+
 }  // namespace cudaop
 
 #endif

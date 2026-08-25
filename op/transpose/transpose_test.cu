@@ -21,16 +21,26 @@ namespace
 using cudaop::TransposeDataType;
 using cudaop::TransposeSharedMemoryLayout;
 
+using TransposeLauncher = cudaError_t (*)(
+    const void *,
+    void *,
+    uint32_t,
+    uint32_t,
+    TransposeDataType,
+    TransposeSharedMemoryLayout,
+    cudaStream_t);
+
 constexpr std::array<TransposeSharedMemoryLayout, 2> kLayouts = {
     TransposeSharedMemoryLayout::kPadded,
     TransposeSharedMemoryLayout::kSwizzled};
 
-constexpr std::array<TransposeParam, 7> kValidationCases = {{
+constexpr std::array<TransposeParam, 8> kValidationCases = {{
     {1, 1, 0, 0},
     {3, 5, 0, 0},
     {7, 33, 0, 0},
     {31, 32, 0, 0},
     {32, 31, 0, 0},
+    {32, 32, 0, 0},
     {65, 97, 0, 0},
     {129, 67, 0, 0}}};
 
@@ -226,6 +236,7 @@ bool compare_bytes(
 }
 
 void print_validation_result(
+    const char *implementation,
     TransposeDataType data_type,
     TransposeSharedMemoryLayout layout,
     const TransposeParam &config,
@@ -236,6 +247,7 @@ void print_validation_result(
         std::to_string(config.rows) + "x" +
         std::to_string(config.columns);
     std::cout << "  " << std::left
+              << std::setw(10) << implementation
               << std::setw(12) << cudaop::transpose_data_type_name(data_type)
               << std::setw(10) << cudaop::transpose_layout_name(layout)
               << std::setw(12) << shape
@@ -252,6 +264,8 @@ bool validate_regular_case(
     const TransposeParam &config,
     TransposeDataType data_type,
     TransposeSharedMemoryLayout layout,
+    const char *implementation,
+    TransposeLauncher launcher,
     cudaStream_t stream)
 {
     const size_t input_elements =
@@ -284,7 +298,7 @@ bool validate_regular_case(
         cudaMemsetAsync(device_output.get(), 0xa5, output_bytes, stream),
         "cudaMemsetAsync validation output");
     check_cuda(
-        cudaop::transpose_cuda(
+        launcher(
             device_input.get(),
             device_output.get(),
             config.rows,
@@ -312,6 +326,7 @@ bool validate_regular_case(
         output_bytes,
         &first_mismatch);
     print_validation_result(
+        implementation,
         data_type,
         layout,
         config,
@@ -409,6 +424,7 @@ bool validate_fp4_case(
         output_bytes,
         &first_mismatch);
     print_validation_result(
+        "scalar",
         data_type,
         layout,
         config,
@@ -457,6 +473,20 @@ bool validate_arguments()
         TransposeDataType::kFloat32,
         static_cast<TransposeSharedMemoryLayout>(99)) ==
         cudaErrorInvalidValue;
+    passed &= cudaop::transpose_vectorized_cuda(
+        nullptr,
+        static_cast<uint8_t *>(buffer.get()) + 8,
+        1,
+        1,
+        TransposeDataType::kBfloat16,
+        TransposeSharedMemoryLayout::kPadded) == cudaErrorInvalidValue;
+    passed &= cudaop::transpose_vectorized_cuda(
+        buffer.get(),
+        static_cast<uint8_t *>(buffer.get()) + 8,
+        1,
+        1,
+        TransposeDataType::kFloat32,
+        TransposeSharedMemoryLayout::kPadded) == cudaErrorInvalidValue;
     passed &= cudaop::transpose_storage_bytes(
         3,
         5,
@@ -487,16 +517,36 @@ bool validate_all(cudaStream_t stream)
                 config,
                 TransposeDataType::kFloat32,
                 layout,
+                "scalar",
+                cudaop::transpose_cuda,
                 stream);
             passed &= validate_regular_case<__nv_bfloat16>(
                 config,
                 TransposeDataType::kBfloat16,
                 layout,
+                "scalar",
+                cudaop::transpose_cuda,
+                stream);
+            passed &= validate_regular_case<__nv_bfloat16>(
+                config,
+                TransposeDataType::kBfloat16,
+                layout,
+                "vector32",
+                cudaop::transpose_vectorized_cuda,
                 stream);
             passed &= validate_regular_case<__nv_fp8_e4m3>(
                 config,
                 TransposeDataType::kFloat8E4M3,
                 layout,
+                "scalar",
+                cudaop::transpose_cuda,
+                stream);
+            passed &= validate_regular_case<__nv_fp8_e4m3>(
+                config,
+                TransposeDataType::kFloat8E4M3,
+                layout,
+                "vector32",
+                cudaop::transpose_vectorized_cuda,
                 stream);
             passed &= validate_fp4_case(config, layout, stream);
         }
@@ -508,6 +558,8 @@ void benchmark_case(
     const TransposeParam &config,
     TransposeDataType data_type,
     TransposeSharedMemoryLayout layout,
+    const char *implementation,
+    TransposeLauncher launcher,
     cudaStream_t stream)
 {
     const size_t input_bytes = cudaop::transpose_storage_bytes(
@@ -529,7 +581,7 @@ void benchmark_case(
          ++iteration)
     {
         check_cuda(
-            cudaop::transpose_cuda(
+            launcher(
                 device_input.get(),
                 device_output.get(),
                 config.rows,
@@ -548,7 +600,7 @@ void benchmark_case(
          ++iteration)
     {
         check_cuda(
-            cudaop::transpose_cuda(
+            launcher(
                 device_input.get(),
                 device_output.get(),
                 config.rows,
@@ -575,6 +627,7 @@ void benchmark_case(
         std::to_string(config.columns);
 
     std::cout << "  " << std::left
+              << std::setw(10) << implementation
               << std::setw(12) << cudaop::transpose_data_type_name(data_type)
               << std::setw(10) << cudaop::transpose_layout_name(layout)
               << std::setw(12) << shape
@@ -593,6 +646,7 @@ void benchmark_all(cudaStream_t stream)
         TransposeDataType::kFloat4E2M1};
 
     std::cout << "  " << std::left
+              << std::setw(10) << "kernel"
               << std::setw(12) << "type"
               << std::setw(10) << "layout"
               << std::setw(12) << "M x N"
@@ -604,7 +658,24 @@ void benchmark_all(cudaStream_t stream)
         {
             for (TransposeSharedMemoryLayout layout : kLayouts)
             {
-                benchmark_case(config, data_type, layout, stream);
+                benchmark_case(
+                    config,
+                    data_type,
+                    layout,
+                    "scalar",
+                    cudaop::transpose_cuda,
+                    stream);
+                if (data_type == TransposeDataType::kBfloat16 ||
+                    data_type == TransposeDataType::kFloat8E4M3)
+                {
+                    benchmark_case(
+                        config,
+                        data_type,
+                        layout,
+                        "vector32",
+                        cudaop::transpose_vectorized_cuda,
+                        stream);
+                }
             }
         }
     }
@@ -644,7 +715,10 @@ int main(int argc, char **argv)
         std::cout << "  " << std::left << std::setw(30)
                   << "Logical tile" << "32x32" << '\n';
         std::cout << "  " << std::left << std::setw(30)
-                  << "Threads per block" << "32x8" << '\n';
+                  << "Scalar threads per block" << "32x8" << '\n';
+        std::cout << "  " << std::left << std::setw(30)
+                  << "Vector threads per block"
+                  << "bf16=16x8, fp8=8x8" << '\n';
         std::cout << "  " << std::left << std::setw(30)
                   << "Data types"
                   << "float, bf16, fp8-e4m3, fp4-e2m1" << '\n';

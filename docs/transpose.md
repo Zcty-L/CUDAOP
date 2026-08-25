@@ -55,6 +55,42 @@ physical_col  = physical_bank * E + intra_bank
 | fp8-e4m3 | 1152 B | 1024 B |
 | fp4-e2m1 | 1152 B | 1024 B |
 
+## BF16/FP8 32-bit 向量化实现
+
+`op/transpose/transpose_vectorized.cu` 提供独立的 32-bit pack 实现：
+
+- BF16 使用一个 4-byte 对齐的 `Bfloat16x2Pack` 搬运两个元素；
+- FP8 E4M3 使用一个 4-byte 对齐的 `Float8E4M3x4Pack` 搬运四个元素；
+- BF16 和 FP8 线程块分别为 `16 x 8` 和 `8 x 8`，仍覆盖一个
+  `32 x 32` 逻辑 tile；
+- 输入侧执行一次 32-bit global load 和一次 32-bit shared store；
+- 输出侧从 shared memory gather 两个或四个元素，在寄存器中重组后执行一次
+  32-bit global store；
+- 行首地址未对齐或 tile 边界不足一个 pack 时，仅对应 pack 使用逐元素 bit
+  搬运，不改变任意 `M x N` 尺寸支持。
+
+Pad 布局仍使用普通 row-major 行尾 padding：BF16 每行 17 个 32-bit word，
+FP8 每行 9 个 word。输入时调整线程访问逻辑行的顺序，使同一 warp 访问的
+BF16 行相隔 16 行、FP8 行相隔 8 行，避免多个短行的 bank 区间重叠。Swizzle
+布局直接对 32-bit word 下标执行：
+
+```text
+physical_word = logical_word XOR (row / pack_elements)
+```
+
+在 RTX 4090、CUDA 13.1、SM89 上对独立完整 `32 x 32` CTA 使用 Nsight
+Compute 检查，结果如下：
+
+| 类型 | 布局 | shared load conflicts | shared store conflicts | load/store wavefronts |
+|---|---|---:|---:|---:|
+| BF16x2 | Pad | 0 | 0 | 32 / 16 |
+| BF16x2 | Swizzle | 0 | 0 | 32 / 16 |
+| FP8x4 | Pad | 0 | 0 | 32 / 8 |
+| FP8x4 | Swizzle | 0 | 0 | 32 / 8 |
+
+反汇编的完整对齐路径包含 32-bit `LDG.E` 和 `STG.E`；同一 kernel 中保留的
+`LDG.E.U8`/`STG.E.U8` 指令用于未对齐和尾部 pack。
+
 ## 接口
 
 接口声明位于 `op/transpose/transpose.h`：
@@ -68,7 +104,20 @@ cudaError_t transpose_cuda(
     TransposeDataType data_type,
     TransposeSharedMemoryLayout shared_memory_layout,
     cudaStream_t stream = nullptr);
+
+cudaError_t transpose_vectorized_cuda(
+    const void *input,
+    void *output,
+    uint32_t rows,
+    uint32_t columns,
+    TransposeDataType data_type,
+    TransposeSharedMemoryLayout shared_memory_layout,
+    cudaStream_t stream = nullptr);
 ```
+
+`transpose_vectorized_cuda` 只接受 BF16 和 FP8 E4M3；其他数据格式返回
+`cudaErrorInvalidValue`。原有 `transpose_cuda` 保留为覆盖四种数据格式的标量
+基线接口。
 
 `transpose_storage_bytes` 可分别计算输入 `M x N` 和输出 `N x M` 的存储大小，
 这对奇数宽度的 packed FP4 尤其必要。当前实现不支持原地转置，输入输出地址
@@ -90,8 +139,9 @@ compute-sanitizer --tool racecheck \
     ./build/transpose_test --validate-only
 ```
 
-测试覆盖 `1x1`、奇数尺寸、跨 tile 边界和非方阵，共验证 7 种 shape、4 种
-数据格式和 2 种 shared-memory 布局，即 56 组逐 bit 正确性组合；同一程序
+测试覆盖 `1x1`、完整 `32x32` tile、奇数尺寸、跨 tile 边界和非方阵。标量
+实现验证 8 种 shape、4 种数据格式和 2 种 shared-memory 布局，向量实现验证
+8 种 shape、2 种数据格式和 2 种布局，共 96 组逐 bit 正确性组合；同一程序
 还会输出 `1024x1024`、`3072x4096` 和 `4096x4096` 的 CUDA Event 性能结果。
 
 2026-08-22 在 RTX 4090、CUDA 13.1、SM89 上的一次 `4096x4096` 示例结果如下。
@@ -104,3 +154,15 @@ compute-sanitizer --tool racecheck \
 | bf16 | 0.0219 / 3061.00 | 0.0229 / 2927.02 |
 | fp8-e4m3 | 0.0175 / 1919.63 | 0.0223 / 1506.57 |
 | fp4-e2m1 | 0.0227 / 739.38 | 0.0293 / 572.07 |
+
+2026-08-24 在同一设备上的一次 `4096x4096` 标量/32-bit 向量化对比如下：
+
+| 类型 | 布局 | 标量 ms / GB/s | vector32 ms / GB/s |
+|---|---|---:|---:|
+| bf16 | Pad | 0.0221 / 3042.53 | 0.0225 / 2978.91 |
+| bf16 | Swizzle | 0.0229 / 2928.33 | 0.0230 / 2919.20 |
+| fp8-e4m3 | Pad | 0.0176 / 1910.67 | 0.0152 / 2214.05 |
+| fp8-e4m3 | Swizzle | 0.0223 / 1502.43 | 0.0160 / 2095.14 |
+
+该次测试中 BF16 基本持平，FP8 的 32-bit pack 收益更明显；这些数据用于展示
+本机相对趋势，不作为跨设备性能保证。

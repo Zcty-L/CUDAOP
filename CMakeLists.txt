@@ -362,6 +362,7 @@ add_executable(
     transpose_test
     op/transpose/transpose_test.cu
     op/transpose/transpose.cu
+    op/transpose/transpose_vectorized.cu
 )
 target_link_libraries(
     transpose_test
