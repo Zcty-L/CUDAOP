@@ -160,6 +160,10 @@ foreach(SRC_FILE ${OP_SOURCES})
     if(EXE_NAME STREQUAL "opt_conv2d_groups_fp32")
         target_sources(${EXE_NAME} PRIVATE op/cpu/cpu_ops.cpp)
     endif()
+
+    if(EXE_NAME STREQUAL "softmax")
+        target_sources(${EXE_NAME} PRIVATE op/softmax/softmax_test.cpp)
+    endif()
     
     # 链接基础 CUDA 库
     target_link_libraries(${EXE_NAME} PRIVATE 
