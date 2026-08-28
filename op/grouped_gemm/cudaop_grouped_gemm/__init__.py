@@ -8,7 +8,13 @@ from cudaop_grouped_gemm.cutile_ops import (
     CuTileLoraUpGrouped,
     cutile_fused_lora,
 )
-from cudaop_grouped_gemm.ops import gmm, lora_gmm, torch_gmm
+from cudaop_grouped_gemm.ops import (
+    gmm,
+    gmm_k16,
+    lora_gmm,
+    lora_gmm_k16,
+    torch_gmm,
+)
 from cudaop_grouped_gemm.triton_ops import (
     LoraBgradGrouped,
     LoraDownGrouped,
@@ -36,12 +42,14 @@ __all__ = [
     "LoraUpGrouped",
     "cutile_fused_lora",
     "gmm",
+    "gmm_k16",
     "grouped_bgrad_kernel",
     "grouped_down_kernel",
     "grouped_fused_agrad_kernel",
     "grouped_fused_downup_kernel",
     "grouped_up_kernel",
     "lora_gmm",
+    "lora_gmm_k16",
     "torch_gmm",
     "triton_fused_lora",
 ]

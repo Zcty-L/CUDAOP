@@ -529,6 +529,18 @@ add_custom_target(cudaop_grouped_gemm_test
     VERBATIM
 )
 
+add_custom_target(cudaop_grouped_gemm_k_tile_test
+    COMMAND
+        ${Python3_EXECUTABLE} test_cutlass_k_tile.py
+    WORKING_DIRECTORY
+        "${PROJECT_SOURCE_DIR}/op/grouped_gemm"
+    DEPENDS
+        cudaop_grouped_gemm
+    COMMENT
+        "Comparing CUTLASS grouped GEMM K tile configurations"
+    VERBATIM
+)
+
 add_custom_target(flashattn_torch_test
     COMMAND
         ${CMAKE_COMMAND} -E env

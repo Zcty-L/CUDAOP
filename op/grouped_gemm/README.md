@@ -3,6 +3,8 @@
 独立的 BF16 Grouped GEMM Python 包，包含：
 
 - `gmm`：支持自动求导的 CUTLASS Grouped GEMM。
+- `gmm_k16`：采用 CTA/warp K=16 和 `m16n8k8`、支持自动求导的
+  CUTLASS Grouped GEMM 对比实现。
 - `torch_gmm`：支持自动求导的 `torch.nn.functional.grouped_mm`。
 - `LoraDownGrouped`：Triton LoRA down 前向算子。
 - `LoraUpGrouped`：Triton LoRA up 前向算子。
@@ -61,6 +63,7 @@ conda activate py311
 cmake -S . -B build
 cmake --build build --target cudaop_grouped_gemm
 cmake --build build --target cudaop_grouped_gemm_test
+cmake --build build --target cudaop_grouped_gemm_k_tile_test
 ```
 
 也可以在当前目录原地构建：

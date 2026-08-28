@@ -32,6 +32,7 @@ class _GroupedGemm(torch.autograd.Function):
         b: torch.Tensor,
         batch_sizes: torch.Tensor,
         trans_b: bool,
+        use_k16: bool,
     ) -> torch.Tensor:
         sizes_cpu = batch_sizes.detach().to(
             device="cpu",
@@ -39,7 +40,11 @@ class _GroupedGemm(torch.autograd.Function):
         ).contiguous()
         context.save_for_backward(a, b, sizes_cpu)
         context.trans_b = trans_b
-        return _C.grouped_gemm(
+        context.use_k16 = use_k16
+        implementation = (
+            _C.grouped_gemm_k16 if use_k16 else _C.grouped_gemm
+        )
+        return implementation(
             a,
             b,
             sizes_cpu,
@@ -51,11 +56,16 @@ class _GroupedGemm(torch.autograd.Function):
     def backward(
         context: Any,
         grad: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, None, None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, None, None, None]:
         a, b, batch_sizes = context.saved_tensors
         grad = grad.contiguous()
         trans_b = context.trans_b
-        grad_a = _C.grouped_gemm(
+        implementation = (
+            _C.grouped_gemm_k16
+            if context.use_k16
+            else _C.grouped_gemm
+        )
+        grad_a = implementation(
             grad,
             b,
             batch_sizes,
@@ -63,14 +73,14 @@ class _GroupedGemm(torch.autograd.Function):
             not trans_b,
         )
         lhs, rhs = (grad, a) if trans_b else (a, grad)
-        grad_b = _C.grouped_gemm(
+        grad_b = implementation(
             lhs,
             rhs,
             batch_sizes,
             True,
             False,
         )
-        return grad_a, grad_b, None, None
+        return grad_a, grad_b, None, None, None
 
 
 def gmm(
@@ -80,7 +90,17 @@ def gmm(
     trans_b: bool = False,
 ) -> torch.Tensor:
     """按 ``batch_sizes`` 划分 A，并与各组权重执行矩阵乘。"""
-    return _GroupedGemm.apply(a, b, batch_sizes, trans_b)
+    return _GroupedGemm.apply(a, b, batch_sizes, trans_b, False)
+
+
+def gmm_k16(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    batch_sizes: torch.Tensor,
+    trans_b: bool = False,
+) -> torch.Tensor:
+    """使用 K16/K8 MMA 配置执行支持自动求导的 Grouped GEMM。"""
+    return _GroupedGemm.apply(a, b, batch_sizes, trans_b, True)
 
 
 def torch_gmm(
@@ -120,6 +140,27 @@ def lora_gmm(
         trans_b=True,
     )
     return gmm(
+        hidden,
+        up_weight,
+        batch_sizes,
+        trans_b=False,
+    )
+
+
+def lora_gmm_k16(
+    a: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    batch_sizes: torch.Tensor,
+) -> torch.Tensor:
+    """用两个 K16/K8 CUTLASS Grouped GEMM 组成 LoRA down/up。"""
+    hidden = gmm_k16(
+        a,
+        down_weight,
+        batch_sizes,
+        trans_b=True,
+    )
+    return gmm_k16(
         hidden,
         up_weight,
         batch_sizes,
