@@ -680,8 +680,11 @@ void cute_gemm_fp16_fp32_kernel(
         }
     }
 
-    // 输出保持 FP32，不在 epilogue 中降精度。
-    copy(accumulator, thread_global_c);
+    // MMA m16n8 的每个 lane 持有两组“同一行、相邻两列”的 FP32。
+    // C 由 cudaMalloc 分配，N/CTA tile 均满足 8B 对齐；显式声明对齐后，
+    // CuTe 将 common-vector=2 的 fragment 重解释为 64-bit copy，直接生成
+    // 合并的 STG.E.64，不需要 reg->SMEM->reg 的额外重排和 barrier。
+    copy_aligned(accumulator, thread_global_c);
 }
 
 void launch_cute_gemm(
@@ -1160,6 +1163,8 @@ int main(int argc, char **argv)
         std::cout << "  " << std::left << std::setw(30)
                   << "MMA" << "m16n8k16 FP16 inputs / FP32 accumulate\n";
         std::cout << "  " << std::left << std::setw(30)
+                  << "Epilogue" << "direct paired FP32 STG.64\n";
+        std::cout << "  " << std::left << std::setw(30)
                   << "Block raster"
                   << "Identity / CUTLASS-style 2D Swizzle8\n";
         std::cout << "  " << std::left << std::setw(30)
@@ -1442,8 +1447,8 @@ int main(int argc, char **argv)
                   << std::fixed << std::setprecision(3)
                   << block_swizzle_speedup << "x vs Identity\n\n";
         std::cout << "[SUCCESS] FP16 inputs, FP32 accumulation, "
-                  << "Swizzle<3,3,3>, Block Swizzle8 and cuBLAS "
-                  << "validation passed\n";
+                  << "Swizzle<3,3,3>, direct STG.64 epilogue, "
+                  << "Block Swizzle8 and cuBLAS validation passed\n";
         return 0;
     }
     catch (const std::exception &error)

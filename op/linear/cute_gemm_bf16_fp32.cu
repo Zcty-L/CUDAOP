@@ -43,7 +43,7 @@ constexpr int kBlockSwizzleSize = 8;
 
 constexpr const char *kIdentityName = "BF16-TC-Identity";
 constexpr const char *kBlockSwizzleName = "BF16-TC-BlockSwizzle8";
-constexpr const char *kCublasName = "cuBLAS BF16/FP32/BF16";
+constexpr const char *kCublasName = "cuBLAS BF16/FP32";
 
 constexpr float kAbsoluteTolerance = 5.0e-2F;
 constexpr float kRelativeTolerance = 2.0e-3F;
@@ -475,7 +475,7 @@ void cute_gemm_bf16_fp32_kernel(
     BSmemLayout smem_layout_b,
     TiledCopyB copy_b,
     S2RAtomB smem_to_register_b,
-    cute::bfloat16_t *c,
+    float *c,
     CStride stride_c,
     TiledMma tiled_mma)
 {
@@ -680,20 +680,17 @@ void cute_gemm_bf16_fp32_kernel(
         }
     }
 
-    // Epilogue：Tensor Core 始终使用 FP32 accumulator；完成整个 K 维
-    // 归约后才逐元素转换为 BF16 输出，避免在 MMA 主循环中提前损失精度。
-    CUTE_UNROLL
-    for (int index = 0; index < size(accumulator); ++index)
-    {
-        thread_global_c(index) =
-            bfloat16_t(static_cast<float>(accumulator(index)));
-    }
+    // MMA m16n8 的每个 lane 持有两组“同一行、相邻两列”的 FP32。
+    // C 由 cudaMalloc 分配，N/CTA tile 均满足 8B 对齐；显式声明对齐后，
+    // CuTe 将 common-vector=2 的 fragment 重解释为 64-bit copy，直接生成
+    // 合并的 STG.E.64，不需要 reg->SMEM->reg 的额外重排和 barrier。
+    copy_aligned(accumulator, thread_global_c);
 }
 
 void launch_cute_gemm(
     const cute::bfloat16_t *a,
     const cute::bfloat16_t *b,
-    cute::bfloat16_t *c,
+    float *c,
     int m,
     int n,
     int k,
@@ -811,7 +808,7 @@ void launch_cublas_gemm(
     cublasHandle_t handle,
     const cute::bfloat16_t *a,
     const cute::bfloat16_t *b,
-    cute::bfloat16_t *c,
+    float *c,
     int m,
     int n,
     int k)
@@ -820,9 +817,8 @@ void launch_cublas_gemm(
     constexpr float beta = 0.0F;
 
     // row-major C[M,N] 的内存等价于 column-major C^T[N,M]，因此令
-    // cuBLAS 计算 C^T = B * A^T。A/B/C 数据类型均为 CUDA_R_16BF，
-    // computeType 为 FP32，因此它是本测试 BF16×BF16→FP32→BF16 的
-    // 独立权威参考，而不是复用 CuTe kernel 的结果。
+    // cuBLAS 计算 C^T = B * A^T。A/B 为 CUDA_R_16BF，C 和
+    // computeType 均为 FP32，因此它是 BF16×BF16→FP32 的独立参考。
     CUBLAS_CHECK(cublasGemmEx(
         handle,
         CUBLAS_OP_T,
@@ -839,7 +835,7 @@ void launch_cublas_gemm(
         k,
         &beta,
         c,
-        CUDA_R_16BF,
+        CUDA_R_32F,
         n,
         CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
@@ -853,8 +849,8 @@ struct DeviceComparison
 };
 
 __global__ void compare_outputs_kernel(
-    const cute::bfloat16_t *actual,
-    const cute::bfloat16_t *reference,
+    const float *actual,
+    const float *reference,
     size_t element_count,
     float absolute_tolerance,
     float relative_tolerance,
@@ -867,8 +863,8 @@ __global__ void compare_outputs_kernel(
         static_cast<size_t>(gridDim.x) * blockDim.x;
     for (size_t index = first; index < element_count; index += stride)
     {
-        const float actual_value = static_cast<float>(actual[index]);
-        const float reference_value = static_cast<float>(reference[index]);
+        const float actual_value = actual[index];
+        const float reference_value = reference[index];
         float absolute_error = fabsf(actual_value - reference_value);
         float relative_error = absolute_error /
             fmaxf(fabsf(reference_value), 1.0e-6F);
@@ -899,8 +895,8 @@ __global__ void compare_outputs_kernel(
 }
 
 DeviceComparison compare_outputs(
-    const cute::bfloat16_t *actual,
-    const cute::bfloat16_t *reference,
+    const float *actual,
+    const float *reference,
     size_t element_count,
     int block_count,
     cudaStream_t stream,
@@ -943,15 +939,15 @@ float decode_float_bits(uint32_t bits)
     return value;
 }
 
-float copy_device_value(const cute::bfloat16_t *data, size_t index)
+float copy_device_value(const float *data, size_t index)
 {
-    cute::bfloat16_t value{};
+    float value = 0.0F;
     CUDA_CHECK(cudaMemcpy(
         &value,
         data + index,
-        sizeof(cute::bfloat16_t),
+        sizeof(float),
         cudaMemcpyDeviceToHost));
-    return static_cast<float>(value);
+    return value;
 }
 
 double cpu_reference_value(int row, int column, int k)
@@ -971,9 +967,9 @@ double cpu_reference_value(int row, int column, int k)
 }
 
 bool verify_cpu_samples(
-    const cute::bfloat16_t *identity_output,
-    const cute::bfloat16_t *block_swizzle_output,
-    const cute::bfloat16_t *cublas_output,
+    const float *identity_output,
+    const float *block_swizzle_output,
+    const float *cublas_output,
     int m,
     int n,
     int k)
@@ -991,7 +987,6 @@ bool verify_cpu_samples(
 
     std::cout << "  " << std::left << std::setw(16) << "Coordinate"
               << std::right << std::setw(16) << "CPU FP64"
-              << std::setw(16) << "CPU BF16"
               << std::setw(20) << kIdentityName
               << std::setw(26) << kBlockSwizzleName
               << std::setw(22) << kCublasName << '\n';
@@ -1008,19 +1003,15 @@ bool verify_cpu_samples(
             copy_device_value(block_swizzle_output, index);
         const float cublas_value = copy_device_value(cublas_output, index);
         const double reference = cpu_reference_value(row, column, k);
-        const float rounded_reference = static_cast<float>(
-            cute::bfloat16_t(static_cast<float>(reference)));
         const double tolerance =
             static_cast<double>(kAbsoluteTolerance) +
             static_cast<double>(kRelativeTolerance) * std::abs(reference);
         passed = passed &&
-            std::abs(static_cast<double>(identity_value) - rounded_reference) <=
+            std::abs(static_cast<double>(identity_value) - reference) <=
                 tolerance &&
-            std::abs(
-                static_cast<double>(block_swizzle_value) -
-                rounded_reference) <=
+            std::abs(static_cast<double>(block_swizzle_value) - reference) <=
                 tolerance &&
-            std::abs(static_cast<double>(cublas_value) - rounded_reference) <=
+            std::abs(static_cast<double>(cublas_value) - reference) <=
                 tolerance;
 
         const std::string coordinate =
@@ -1028,7 +1019,6 @@ bool verify_cpu_samples(
             std::to_string(column) + ")";
         std::cout << "  " << std::left << std::setw(16) << coordinate
                   << std::right << std::setw(16) << reference
-                  << std::setw(16) << rounded_reference
                   << std::setw(20) << identity_value
                   << std::setw(26) << block_swizzle_value
                   << std::setw(22) << cublas_value << '\n';
@@ -1135,13 +1125,13 @@ int main(int argc, char **argv)
             static_cast<size_t>(options.m) * options.n;
         const size_t required_bytes =
             (count_a + count_b) * sizeof(cute::bfloat16_t) +
-            3 * count_c * sizeof(cute::bfloat16_t);
+            3 * count_c * sizeof(float);
 
         size_t free_bytes = 0;
         size_t total_bytes = 0;
         CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
 
-        std::cout << "CuTe BF16 input / FP32 accumulate / BF16 output GEMM "
+        std::cout << "CuTe BF16 input / FP32 accumulate/output GEMM "
                   << "Block Swizzle "
                   << "test vs cuBLAS\n\n";
         std::cout << "[Configuration]\n";
@@ -1158,7 +1148,7 @@ int main(int argc, char **argv)
                   << options.n << ',' << options.k << "]\n";
         std::cout << "  " << std::left << std::setw(30)
                   << "C operation"
-                  << "BF16 C[M,N] = FP32-accumulate(A * B^T)\n";
+                  << "FP32 C[M,N] = A * B^T\n";
         std::cout << "  " << std::left << std::setw(30)
                   << "CTA tile" << kBlockM << 'x' << kBlockN
                   << 'x' << kBlockK << '\n';
@@ -1174,6 +1164,8 @@ int main(int argc, char **argv)
                   << "S2R" << "ldmatrix.x4\n";
         std::cout << "  " << std::left << std::setw(30)
                   << "MMA" << "m16n8k16 BF16 inputs / FP32 accumulate\n";
+        std::cout << "  " << std::left << std::setw(30)
+                  << "Epilogue" << "direct paired FP32 STG.64\n";
         std::cout << "  " << std::left << std::setw(30)
                   << "Block raster"
                   << "Identity / CUTLASS-style 2D Swizzle8\n";
@@ -1201,9 +1193,9 @@ int main(int argc, char **argv)
         std::cout << "[Setup]\n";
         DeviceBuffer<cute::bfloat16_t> device_a(count_a);
         DeviceBuffer<cute::bfloat16_t> device_b(count_b);
-        DeviceBuffer<cute::bfloat16_t> device_identity_c(count_c);
-        DeviceBuffer<cute::bfloat16_t> device_block_swizzle_c(count_c);
-        DeviceBuffer<cute::bfloat16_t> device_cublas_c(count_c);
+        DeviceBuffer<float> device_identity_c(count_c);
+        DeviceBuffer<float> device_block_swizzle_c(count_c);
+        DeviceBuffer<float> device_cublas_c(count_c);
         const int utility_block_count =
             std::max(1, properties.multiProcessorCount * 8);
         initialize_input_kernel<<<
@@ -1362,7 +1354,7 @@ int main(int argc, char **argv)
         if (!correctness_passed || !cpu_samples_passed)
         {
             throw std::runtime_error(
-                "BF16 input / FP32 accumulate / BF16 output GEMM "
+                "BF16 input / FP32 accumulate/output GEMM "
                 "correctness failed");
         }
 
@@ -1457,8 +1449,8 @@ int main(int argc, char **argv)
                   << "Block Swizzle speedup"
                   << std::fixed << std::setprecision(3)
                   << block_swizzle_speedup << "x vs Identity\n\n";
-        std::cout << "[SUCCESS] BF16 inputs, FP32 accumulation, BF16 output, "
-                  << "Swizzle<3,3,3>, Block Swizzle8 and cuBLAS "
+        std::cout << "[SUCCESS] BF16 inputs, FP32 accumulation/output, "
+                  << "Swizzle<3,3,3>, direct STG.64 epilogue, Block Swizzle8 and cuBLAS "
                   << "validation passed\n";
         return 0;
     }
