@@ -155,6 +155,8 @@ set(OP_SOURCES
     "op/linear/cute_gemm_fp32.cu"
     "op/linear/cute_gemm_fp16_fp32.cu"
     "op/linear/cute_gemm_bf16_fp32.cu"
+    "op/linear/cute_gemm_bf16_bf16.cu"
+    "op/linear/cute_gemm_fp16_fp16.cu"
     "op/linear/cute_gemm_fp8_fp16.cu"
     "op/linear/cute_gemm_fp8_fp32.cu"
     "op/linear/cute_gemm_fp4_fp16.cu"
@@ -196,13 +198,15 @@ foreach(SRC_FILE ${OP_SOURCES})
     endif()
 
     if(EXE_NAME STREQUAL "cute_gemm_fp32" OR
+       EXE_NAME STREQUAL "cute_gemm_bf16_bf16" OR
+       EXE_NAME STREQUAL "cute_gemm_fp16_fp16" OR
        EXE_NAME STREQUAL "cute_gemm_fp4_fp16" OR
        EXE_NAME STREQUAL "cute_gemm_mxfp8_fp16" OR
        EXE_NAME STREQUAL "cute_gemm_nvfp4_dynamic" OR
        EXE_NAME STREQUAL "cute_gemm_fp6_mxfp6")
         # NVCC/CuTe 通过 family-specific 架构目标（例如 sm_120f）开放
-        # Blackwell TMA 和 block-scaled/narrow-precision MMA。Hopper 保持
-        # 不变；仅为需要架构特性的目标转换普通 Blackwell 编号。
+        # Blackwell TMA、stmatrix 和 block-scaled/narrow-precision MMA。
+        # Hopper 保持不变；仅为需要架构特性的目标转换普通 Blackwell 编号。
         set(CUDAOP_CUTE_TMA_ARCHITECTURES "")
         foreach(CUDAOP_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
             if(CUDAOP_CUDA_ARCH MATCHES "^(100|101|103|110|120|121)(-(real|virtual))?$")
@@ -382,6 +386,26 @@ if(BUILD_TESTING)
         NAME cute_gemm_bf16_fp32
         COMMAND
             cute_gemm_bf16_fp32
+            --m 256
+            --n 256
+            --k 128
+            --warmup 1
+            --iterations 2
+    )
+    add_test(
+        NAME cute_gemm_bf16_bf16
+        COMMAND
+            cute_gemm_bf16_bf16
+            --m 256
+            --n 256
+            --k 128
+            --warmup 1
+            --iterations 2
+    )
+    add_test(
+        NAME cute_gemm_fp16_fp16
+        COMMAND
+            cute_gemm_fp16_fp16
             --m 256
             --n 256
             --k 128
