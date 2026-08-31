@@ -7,12 +7,18 @@ from collections.abc import Callable
 import torch
 
 from cudaop_grouped_gemm import (
+    CuTileLoraBgradGrouped,
     CuTileLoraDownGrouped,
     CuTileLoraFusedDownUpGrouped,
     CuTileLoraUpGrouped,
+    CutlassLoraBgradGrouped,
+    CutlassLoraFusedDownUp,
+    CutlassLoraFusedDownUpGrouped,
+    LoraBgradGrouped,
     LoraDownGrouped,
     LoraFusedDownUpGrouped,
     LoraUpGrouped,
+    cutlass_fused_lora,
     cutile_fused_lora,
     gmm,
     lora_gmm,
@@ -83,6 +89,41 @@ def reference_up(
     return torch.cat(outputs, dim=0)
 
 
+def reference_lora(
+    a: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    batch_sizes: torch.Tensor,
+) -> torch.Tensor:
+    """使用逐 expert PyTorch matmul 构造可求导参考。"""
+    hidden = reference_down(a, down_weight, batch_sizes)
+    return reference_up(hidden, up_weight, batch_sizes)
+
+
+def reference_bgrad(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    batch_sizes: torch.Tensor,
+) -> torch.Tensor:
+    """使用逐 expert FP32 matmul 构造 LoRA 权重梯度参考。"""
+    output = torch.zeros(
+        batch_sizes.numel(),
+        16,
+        rhs.shape[1],
+        device=lhs.device,
+        dtype=torch.float32,
+    )
+    offset = 0
+    for expert, size in enumerate(batch_sizes.tolist()):
+        if size > 0:
+            output[expert] = (
+                lhs[offset:offset + size].float().transpose(0, 1)
+                @ rhs[offset:offset + size].float()
+            )
+        offset += size
+    return output
+
+
 def max_error(
     actual: torch.Tensor,
     expected: torch.Tensor,
@@ -115,6 +156,10 @@ def run_accuracy() -> None:
     cutile_down = CuTileLoraDownGrouped(down_weight)
     cutile_up = CuTileLoraUpGrouped(up_weight)
     cutile_fused = CuTileLoraFusedDownUpGrouped(
+        down_weight,
+        up_weight,
+    )
+    cutlass_fused = CutlassLoraFusedDownUpGrouped(
         down_weight,
         up_weight,
     )
@@ -160,6 +205,10 @@ def run_accuracy() -> None:
         a,
         sizes,
     )
+    cutlass_fused_hidden, cutlass_fused_output = cutlass_fused(
+        a,
+        sizes,
+    )
     for actual in (
         cutlass_output,
         torch_output,
@@ -195,6 +244,23 @@ def run_accuracy() -> None:
         cutile_output,
         rtol=0.0,
         atol=0.0,
+    )
+    torch.testing.assert_close(
+        cutlass_fused_hidden.float(),
+        expected_hidden,
+        rtol=BF16_RTOL,
+        atol=BF16_ATOL,
+    )
+    expected_cutlass_fused_output = reference_up(
+        cutlass_fused_hidden.float(),
+        up_weight.float(),
+        sizes,
+    )
+    torch.testing.assert_close(
+        cutlass_fused_output.float(),
+        expected_cutlass_fused_output,
+        rtol=BF16_RTOL,
+        atol=BF16_ATOL,
     )
 
     LOGGER.info(
@@ -279,6 +345,74 @@ def run_accuracy() -> None:
         str(tuple(cutile_fused_output.shape)),
         max_error(cutile_fused_output, cutile_output),
     )
+    LOGGER.info(
+        "%-14s | %-14s | %18.6f",
+        "CUTLASS output",
+        str(tuple(cutlass_fused_output.shape)),
+        max_error(
+            cutlass_fused_output,
+            expected_cutlass_fused_output,
+        ),
+    )
+
+    tail_sizes = torch.tensor([0, 67, 2, 0, 129])
+    tail_input = torch.randn(
+        int(tail_sizes.sum()),
+        33,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.1
+    tail_down = torch.randn(
+        5,
+        16,
+        33,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.1
+    tail_up = torch.randn(
+        5,
+        16,
+        130,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.1
+    tail_fused = CutlassLoraFusedDownUpGrouped(
+        tail_down,
+        tail_up,
+    )
+    tail_hidden, tail_output = tail_fused(tail_input, tail_sizes)
+    tail_expected_hidden = reference_down(
+        tail_input.float(),
+        tail_down.float(),
+        tail_sizes,
+    )
+    tail_expected_output = reference_up(
+        tail_hidden.float(),
+        tail_up.float(),
+        tail_sizes,
+    )
+    torch.testing.assert_close(
+        tail_hidden.float(),
+        tail_expected_hidden,
+        rtol=BF16_RTOL,
+        atol=BF16_ATOL,
+    )
+    torch.testing.assert_close(
+        tail_output.float(),
+        tail_expected_output,
+        rtol=BF16_RTOL,
+        atol=BF16_ATOL,
+    )
+    LOGGER.info("")
+    LOGGER.info(
+        (
+            "CUTLASS fusion 尾块：sizes=%s D=33 I=130 "
+            "hidden_error=%.6f output_error=%.6f [PASS]"
+        ),
+        tail_sizes.tolist(),
+        max_error(tail_hidden, tail_expected_hidden),
+        max_error(tail_output, tail_expected_output),
+    )
 
 
 def run_backward_accuracy() -> None:
@@ -325,6 +459,7 @@ def run_backward_accuracy() -> None:
         )
 
     cutlass_results = execute(lora_gmm)
+    cutlass_fused_results = execute(cutlass_fused_lora)
     torch_results = execute(torch_lora_gmm)
     triton_results = execute(triton_fused_lora)
     cutile_results = execute(cutile_fused_lora)
@@ -340,6 +475,16 @@ def run_backward_accuracy() -> None:
     ):
         torch.testing.assert_close(
             triton_value,
+            cutlass_value,
+            rtol=BF16_RTOL,
+            atol=BF16_GRAD_ATOL,
+        )
+    for fused_value, cutlass_value in zip(
+        cutlass_fused_results,
+        cutlass_results,
+    ):
+        torch.testing.assert_close(
+            fused_value,
             cutlass_value,
             rtol=BF16_RTOL,
             atol=BF16_GRAD_ATOL,
@@ -373,23 +518,29 @@ def run_backward_accuracy() -> None:
         )
 
     LOGGER.info(
-        "%-12s | %-18s | %18s | %18s | %18s",
+        (
+            "%-12s | %-18s | %18s | %18s | "
+            "%18s | %18s"
+        ),
         "tensor",
         "shape",
         "Torch/CUTLASS diff",
+        "CUTLASS fused diff",
         "Triton/CUTLASS diff",
         "cuTile/CUTLASS diff",
     )
-    LOGGER.info("-" * 98)
+    LOGGER.info("-" * 119)
     for (
         name,
         torch_value,
+        fused_value,
         triton_value,
         cutile_value,
         cutlass_value,
     ) in zip(
         names,
         torch_results,
+        cutlass_fused_results,
         triton_results,
         cutile_results,
         cutlass_results,
@@ -397,11 +548,12 @@ def run_backward_accuracy() -> None:
         LOGGER.info(
             (
                 "%-12s | %-18s | %18.6f | "
-                "%18.6f | %18.6f"
+                "%18.6f | %18.6f | %18.6f"
             ),
             name,
             str(tuple(triton_value.shape)),
             max_error(torch_value, cutlass_value),
+            max_error(fused_value, cutlass_value),
             max_error(triton_value, cutlass_value),
             max_error(cutile_value, cutlass_value),
         )
@@ -442,6 +594,7 @@ def run_backward_accuracy() -> None:
         return a.grad, down_weight.grad, up_weight.grad
 
     cutlass_empty = execute_empty(lora_gmm)
+    cutlass_fused_empty = execute_empty(cutlass_fused_lora)
     triton_empty = execute_empty(triton_fused_lora)
     cutile_empty = execute_empty(cutile_fused_lora)
     for triton_value, cutlass_value in zip(
@@ -450,6 +603,16 @@ def run_backward_accuracy() -> None:
     ):
         torch.testing.assert_close(
             triton_value,
+            cutlass_value,
+            rtol=BF16_RTOL,
+            atol=BF16_GRAD_ATOL,
+        )
+    for fused_value, cutlass_value in zip(
+        cutlass_fused_empty,
+        cutlass_empty,
+    ):
+        torch.testing.assert_close(
+            fused_value,
             cutlass_value,
             rtol=BF16_RTOL,
             atol=BF16_GRAD_ATOL,
@@ -464,7 +627,11 @@ def run_backward_accuracy() -> None:
             rtol=BF16_RTOL,
             atol=BF16_GRAD_ATOL,
         )
-    for implementation in (triton_empty, cutile_empty):
+    for implementation in (
+        cutlass_fused_empty,
+        triton_empty,
+        cutile_empty,
+    ):
         for weight_grad in implementation[1:]:
             if torch.count_nonzero(weight_grad[[0, 2]]).item() != 0:
                 raise AssertionError("空 expert 的权重梯度必须为零")
@@ -472,6 +639,254 @@ def run_backward_accuracy() -> None:
     LOGGER.info(
         "空 expert 与 K 尾块回归：sizes=%s hidden_size=32 [PASS]",
         empty_sizes.tolist(),
+    )
+
+    tail_sizes = torch.tensor([0, 67, 2, 0, 129])
+    tail_tokens = int(tail_sizes.sum())
+    tail_input = torch.randn(
+        tail_tokens,
+        33,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.1
+    tail_down = torch.randn(
+        5,
+        16,
+        33,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.1
+    tail_up = torch.randn(
+        5,
+        16,
+        130,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.1
+    tail_grad_output = torch.randn(
+        tail_tokens,
+        130,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.1
+
+    def execute_tail(operation):
+        a = tail_input.detach().clone().requires_grad_(True)
+        down_weight = tail_down.detach().clone().requires_grad_(True)
+        up_weight = tail_up.detach().clone().requires_grad_(True)
+        output = operation(
+            a,
+            down_weight,
+            up_weight,
+            tail_sizes,
+        )
+        output.backward(tail_grad_output)
+        return output, a.grad, down_weight.grad, up_weight.grad
+
+    tail_reference = execute_tail(reference_lora)
+    tail_fused = execute_tail(cutlass_fused_lora)
+    for fused_value, reference_value in zip(
+        tail_fused,
+        tail_reference,
+    ):
+        torch.testing.assert_close(
+            fused_value,
+            reference_value,
+            rtol=BF16_RTOL,
+            atol=BF16_GRAD_ATOL,
+        )
+    LOGGER.info(
+        (
+            "CUTLASS fused backward 尾块：sizes=%s D=33 I=130 "
+            "grad_input_error=%.6f [PASS]"
+        ),
+        tail_sizes.tolist(),
+        max_error(tail_fused[1], tail_reference[1]),
+    )
+
+    cached_input = tail_input.detach().clone().requires_grad_(True)
+    cached_down = tail_down.detach().clone().requires_grad_(True)
+    cached_up = tail_up.detach().clone().requires_grad_(True)
+    cached_caller = CutlassLoraFusedDownUp(
+        cached_down,
+        cached_up,
+    )
+    cached_operation = cached_caller.grouped_operation
+    cached_output = cached_caller(
+        cached_input,
+        tail_sizes,
+    )
+    cached_output.backward(tail_grad_output)
+    cached_values = (
+        cached_output,
+        cached_input.grad,
+        cached_down.grad,
+        cached_up.grad,
+    )
+    for cached_value, fused_value in zip(
+        cached_values,
+        tail_fused,
+    ):
+        torch.testing.assert_close(
+            cached_value,
+            fused_value,
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    with torch.no_grad():
+        cached_up.add_(
+            torch.tensor(
+                0.01,
+                device=cached_up.device,
+                dtype=cached_up.dtype,
+            )
+        )
+    refreshed_output = cached_operation(tail_input, tail_sizes)[1]
+    fresh_output = CutlassLoraFusedDownUpGrouped(
+        cached_down,
+        cached_up,
+    )(tail_input, tail_sizes)[1]
+    torch.testing.assert_close(
+        refreshed_output,
+        fresh_output,
+        rtol=0.0,
+        atol=0.0,
+    )
+
+    routed_sizes = tail_sizes.clone()
+    cached_operation(tail_input, routed_sizes)
+    routed_sizes[1] += 1
+    routed_sizes[4] -= 1
+    routed_output = cached_operation(tail_input, routed_sizes)[1]
+    fresh_routed_output = CutlassLoraFusedDownUpGrouped(
+        cached_down,
+        cached_up,
+    )(tail_input, routed_sizes)[1]
+    torch.testing.assert_close(
+        routed_output,
+        fresh_routed_output,
+        rtol=0.0,
+        atol=0.0,
+    )
+    LOGGER.info(
+        "CUTLASS packed weight/metadata 缓存失效回归 [PASS]"
+    )
+
+
+def run_bgrad_accuracy() -> None:
+    sizes = torch.tensor([0, 67, 2, 0, 129])
+    tokens = int(sizes.sum())
+    experts = sizes.numel()
+    lhs = torch.randn(
+        tokens,
+        16,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.1
+    aligned_rhs = torch.randn(
+        tokens,
+        256,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.1
+    cutlass = CutlassLoraBgradGrouped(experts, 256)
+    triton = LoraBgradGrouped(experts, 256)
+    cutile = CuTileLoraBgradGrouped(experts, 256)
+    expected = reference_bgrad(lhs, aligned_rhs, sizes)
+    cutlass_output = cutlass(lhs, aligned_rhs, sizes)
+    triton_output = triton(lhs, aligned_rhs, sizes)
+    cutile_output = cutile(lhs, aligned_rhs, sizes)
+    for actual in (cutlass_output, triton_output, cutile_output):
+        torch.testing.assert_close(
+            actual.float(),
+            expected,
+            rtol=BF16_RTOL,
+            atol=BF16_GRAD_ATOL,
+        )
+
+    odd_rhs = aligned_rhs[:, :33].contiguous()
+    odd_expected = reference_bgrad(lhs, odd_rhs, sizes)
+    odd_cutlass = CutlassLoraBgradGrouped(experts, 33)(
+        lhs,
+        odd_rhs,
+        sizes,
+    )
+    torch.testing.assert_close(
+        odd_cutlass.float(),
+        odd_expected,
+        rtol=BF16_RTOL,
+        atol=BF16_GRAD_ATOL,
+    )
+    if torch.count_nonzero(cutlass_output[[0, 3]]).item() != 0:
+        raise AssertionError("空 expert 的 bgrad 必须为零")
+
+    empty_sizes = torch.tensor([0, 0, 0])
+    empty_output = CutlassLoraBgradGrouped(3, 33)(
+        torch.empty(
+            0,
+            16,
+            device="cuda",
+            dtype=torch.bfloat16,
+        ),
+        torch.empty(
+            0,
+            33,
+            device="cuda",
+            dtype=torch.bfloat16,
+        ),
+        empty_sizes,
+    )
+    if torch.count_nonzero(empty_output).item() != 0:
+        raise AssertionError("全空输入的 bgrad 必须为零")
+
+    routed_sizes = torch.tensor([64, 64])
+    routed_lhs = lhs[:128]
+    routed_rhs = aligned_rhs[:128]
+    cached = CutlassLoraBgradGrouped(2, 256)
+    cached(routed_lhs, routed_rhs, routed_sizes)
+    routed_sizes[0] += 1
+    routed_sizes[1] -= 1
+    routed_output = cached(routed_lhs, routed_rhs, routed_sizes)
+    routed_expected = reference_bgrad(
+        routed_lhs,
+        routed_rhs,
+        routed_sizes,
+    )
+    torch.testing.assert_close(
+        routed_output.float(),
+        routed_expected,
+        rtol=BF16_RTOL,
+        atol=BF16_GRAD_ATOL,
+    )
+
+    LOGGER.info(
+        "%-12s | %14s | %14s | %14s | %14s",
+        "path",
+        "shape",
+        "CUTLASS error",
+        "Triton error",
+        "cuTile error",
+    )
+    LOGGER.info("-" * 83)
+    LOGGER.info(
+        "%-12s | %14s | %14.6f | %14.6f | %14.6f",
+        "aligned",
+        str(tuple(cutlass_output.shape)),
+        max_error(cutlass_output, expected),
+        max_error(triton_output, expected),
+        max_error(cutile_output, expected),
+    )
+    LOGGER.info(
+        "%-12s | %14s | %14.6f | %14s | %14s",
+        "tail K=33",
+        str(tuple(odd_cutlass.shape)),
+        max_error(odd_cutlass, odd_expected),
+        "-",
+        "-",
+    )
+    LOGGER.info(
+        "空 expert、全空输入与 metadata 版本失效回归 [PASS]"
     )
 
 
@@ -519,6 +934,10 @@ def run_performance() -> None:
     cutile_down = CuTileLoraDownGrouped(down_weight)
     cutile_up = CuTileLoraUpGrouped(up_weight)
     cutile_fused = CuTileLoraFusedDownUpGrouped(
+        down_weight,
+        up_weight,
+    )
+    cutlass_fused = CutlassLoraFusedDownUpGrouped(
         down_weight,
         up_weight,
     )
@@ -576,6 +995,9 @@ def run_performance() -> None:
     timings["Torch total"] = benchmark(torch_down_up)
     timings["Triton total"] = benchmark(triton_down_up)
     timings["Triton fused"] = benchmark(lambda: fused(a, sizes))
+    timings["CUTLASS fused"] = benchmark(
+        lambda: cutlass_fused(a, sizes)
+    )
 
     def cutile_down_up() -> None:
         current = cutile_down(a, sizes)
@@ -668,6 +1090,11 @@ def run_performance() -> None:
         )
     )
     LOGGER.info(
+        "CUTLASS fused：%.3f us，separate/fused=%.3fx",
+        timings["CUTLASS fused"],
+        timings["CUTLASS total"] / timings["CUTLASS fused"],
+    )
+    LOGGER.info(
         (
             "Triton metadata rebuild(us)："
             "down=%.3f up=%.3f total=%.3f fused=%.3f"
@@ -678,7 +1105,50 @@ def run_performance() -> None:
         timings["Triton rebuild fused"],
     )
 
+    cutlass_bgrad = CutlassLoraBgradGrouped(
+        experts,
+        hidden_size,
+    )
+    triton_bgrad = LoraBgradGrouped(experts, hidden_size)
+    cutile_bgrad = CuTileLoraBgradGrouped(experts, hidden_size)
+    cutlass_bgrad_us = benchmark(
+        lambda: cutlass_bgrad(hidden, a, sizes)
+    )
+    triton_bgrad_us = benchmark(
+        lambda: triton_bgrad(hidden, a, sizes)
+    )
+    cutile_bgrad_us = benchmark(
+        lambda: cutile_bgrad(hidden, a, sizes)
+    )
+    LOGGER.info("")
+    LOGGER.info(
+        "%-18s | %16s | %12s | %10s",
+        "bgrad implementation",
+        "time",
+        "vs Triton",
+        "result",
+    )
+    LOGGER.info("-" * 65)
+    for name, elapsed in (
+        ("CUTLASS rank16", cutlass_bgrad_us),
+        ("Triton", triton_bgrad_us),
+        ("cuTile", cutile_bgrad_us),
+    ):
+        LOGGER.info(
+            "%-18s | %13.3f us | %11.3fx | %10s",
+            name,
+            elapsed,
+            triton_bgrad_us / elapsed,
+            "pass",
+        )
+
     grad_output = torch.randn_like(a)
+    cached_down_weight = down_weight.detach().requires_grad_(True)
+    cached_up_weight = up_weight.detach().requires_grad_(True)
+    cached_cutlass_fused = CutlassLoraFusedDownUp(
+        cached_down_weight,
+        cached_up_weight,
+    )
 
     def cutlass_forward_backward() -> None:
         input_value = a.detach().requires_grad_(True)
@@ -688,6 +1158,28 @@ def run_performance() -> None:
             input_value,
             down_value,
             up_value,
+            sizes,
+        )
+        output.backward(grad_output)
+
+    def cutlass_fused_forward_backward() -> None:
+        input_value = a.detach().requires_grad_(True)
+        down_value = down_weight.detach().requires_grad_(True)
+        up_value = up_weight.detach().requires_grad_(True)
+        output = cutlass_fused_lora(
+            input_value,
+            down_value,
+            up_value,
+            sizes,
+        )
+        output.backward(grad_output)
+
+    def cutlass_cached_forward_backward() -> None:
+        cached_down_weight.grad = None
+        cached_up_weight.grad = None
+        input_value = a.detach().requires_grad_(True)
+        output = cached_cutlass_fused(
+            input_value,
             sizes,
         )
         output.backward(grad_output)
@@ -729,6 +1221,12 @@ def run_performance() -> None:
         output.backward(grad_output)
 
     cutlass_backward_us = benchmark(cutlass_forward_backward)
+    cutlass_fused_backward_us = benchmark(
+        cutlass_fused_forward_backward
+    )
+    cutlass_cached_backward_us = benchmark(
+        cutlass_cached_forward_backward
+    )
     torch_backward_us = benchmark(torch_forward_backward)
     triton_backward_us = benchmark(triton_forward_backward)
     cutile_backward_us = benchmark(cutile_forward_backward)
@@ -751,6 +1249,22 @@ def run_performance() -> None:
         cutlass_backward_us,
         "-",
         "baseline",
+    )
+    LOGGER.info(
+        "%-18s | %16d | %15.3f us | %11.3fx | %10s",
+        "CUTLASS fused",
+        3,
+        cutlass_fused_backward_us,
+        cutlass_backward_us / cutlass_fused_backward_us,
+        "pass",
+    )
+    LOGGER.info(
+        "%-18s | %16d | %15.3f us | %11.3fx | %10s",
+        "CUTLASS cached",
+        3,
+        cutlass_cached_backward_us,
+        cutlass_backward_us / cutlass_cached_backward_us,
+        "pass",
     )
     LOGGER.info(
         "%-18s | %16d | %15.3f us | %11.3fx | %10s",
@@ -796,6 +1310,9 @@ def main() -> None:
     LOGGER.info("")
     LOGGER.info("阶段：LoRA fused backward 精度验证")
     run_backward_accuracy()
+    LOGGER.info("")
+    LOGGER.info("阶段：LoRA bgrad 精度与边界验证")
+    run_bgrad_accuracy()
     LOGGER.info("")
     LOGGER.info(
         (

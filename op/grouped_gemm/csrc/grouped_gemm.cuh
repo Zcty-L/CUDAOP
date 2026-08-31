@@ -59,6 +59,34 @@ template <bool TransposeA, bool TransposeB>
 using Operator = cutlass::gemm::device::GemmGrouped<
     Kernel<TransposeA, TransposeB>>;
 
+using LoraBgradThreadblockShape =
+    cutlass::gemm::GemmShape<16, 128, 64>;
+using LoraBgradWarpShape =
+    cutlass::gemm::GemmShape<16, 32, 64>;
+using LoraBgradKernel =
+    typename cutlass::gemm::kernel::DefaultGemmGrouped<
+        Element,
+        cutlass::layout::ColumnMajor,
+        cutlass::ComplexTransform::kNone,
+        8,
+        Element,
+        cutlass::layout::RowMajor,
+        cutlass::ComplexTransform::kNone,
+        8,
+        Element,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        LoraBgradThreadblockShape,
+        LoraBgradWarpShape,
+        InstructionShape,
+        Epilogue,
+        cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
+        5>::GemmKernel;
+using LoraBgradOperator =
+    cutlass::gemm::device::GemmGrouped<LoraBgradKernel>;
+
 inline void check_cuda(
     cudaError_t status,
     const char* operation)
@@ -93,7 +121,10 @@ torch::Tensor copy_metadata(
     return output;
 }
 
-template <bool TransposeA, bool TransposeB>
+template <
+    bool TransposeA,
+    bool TransposeB,
+    typename Gemm = Operator<TransposeA, TransposeB>>
 torch::Tensor run(
     torch::Tensor a,
     torch::Tensor b,
@@ -142,7 +173,6 @@ torch::Tensor run(
         total_rows == a.size(0),
         "batch_sizes 之和必须等于 a.size(0)");
 
-    using Gemm = Operator<TransposeA, TransposeB>;
     using LayoutA = typename Gemm::LayoutA;
     using LayoutB = typename Gemm::LayoutB;
     using LayoutC = typename Gemm::LayoutC;
@@ -346,6 +376,26 @@ inline torch::Tensor grouped_gemm(
         return run<false, true>(a, b, batch_sizes);
     }
     return run<false, false>(a, b, batch_sizes);
+}
+
+inline torch::Tensor lora_bgrad_grouped(
+    torch::Tensor lhs,
+    torch::Tensor rhs,
+    torch::Tensor batch_sizes)
+{
+    TORCH_CHECK(
+        lhs.dim() == 2 && lhs.size(1) == 16,
+        "lhs 形状必须是 [N, 16]");
+    TORCH_CHECK(
+        rhs.dim() == 2 && rhs.size(0) == lhs.size(0),
+        "rhs 形状必须是 [N, K]");
+    TORCH_CHECK(
+        rhs.size(1) % 8 == 0,
+        "CUTLASS LoRA bgrad 要求 K 是 8 的倍数");
+    return run<true, false, LoraBgradOperator>(
+        lhs,
+        rhs,
+        batch_sizes);
 }
 
 }  // namespace cudaop::grouped_gemm

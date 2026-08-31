@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parent
 CSRC = ROOT / "csrc"
 CUTLASS_INCLUDE = ROOT.parents[2] / "cutlass" / "include"
 
-for source in ("ops.cu", "grouped_gemm.cuh"):
+for source in ("ops.cu", "grouped_gemm.cuh", "fused_lora.cuh"):
     if not (CSRC / source).is_file():
         raise FileNotFoundError(f"缺少 CUDA 源文件：{CSRC / source}")
 if not CUTLASS_INCLUDE.is_dir():

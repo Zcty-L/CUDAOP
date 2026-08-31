@@ -3,6 +3,14 @@
 独立的 BF16 Grouped GEMM Python 包，包含：
 
 - `gmm`：支持自动求导的 CUTLASS Grouped GEMM。
+- `CutlassLoraFusedDownUpGrouped`：CUTLASS/CuTe LoRA down/up 融合前向，
+  同时保存供反向使用的 `[N, 16]` hidden。
+- `CutlassLoraFusedDownUp`：完整的状态化训练调用器，前向使用
+  1 个 fused kernel，反向使用 1 个 fused agrad 和 2 个 bgrad
+  kernel。
+- `CutlassLoraBgradGrouped`：固定 rank=16 的 CUTLASS LoRA 权重梯度
+  Grouped GEMM。
+- `cutlass_fused_lora`：支持 CUTLASS/CuTe 融合前向和三 kernel 反向。
 - `torch_gmm`：支持自动求导的 `torch.nn.functional.grouped_mm`。
 - `LoraDownGrouped`：Triton LoRA down 前向算子。
 - `LoraUpGrouped`：Triton LoRA up 前向算子。
@@ -54,6 +62,30 @@ cuTile 需要 CUDA Toolkit 13.1+、支持的 NVIDIA 驱动以及
 `cuda-tile` Python 包。当前测试环境为 `cuda-tile 1.4.0` 和
 SM120。
 
+CUTLASS fusion 只支持 BF16 和 rank=16。每个 CTA 负责一个 expert
+的 32 行 tile：第一个 GEMM 使用 Tensor Core 和 FP32 累加得到 hidden，
+将 BF16 hidden 写回一次供反向使用，并保留一份 SMEM 副本直接送入
+第二个 GEMM。因此第二个 GEMM 不会从 GMEM 回读 hidden。构造时会将
+`up_weight[E, 16, I]` 预打包为连续的 `[E, I, 16]`；前向支持独立的
+输入维度 `D`、输出维度 `I`、空 expert 以及 M/N/K 尾块。
+
+MMA operand 使用无 bank conflict 的 swizzled SMEM layout。down 主循环
+采用两级 `cp.async` 双缓冲，up 权重使用 16B `cp.async` 向量搬运。
+状态化对象会缓存 down/up packed weights 和路由元数据；权重或
+`batch_sizes` 的 Tensor 版本变化时自动刷新，也可以调用
+`clear_metadata_cache()` 主动清除路由缓存。
+
+CUTLASS 反向将输入梯度的两级 GEMM 同样融合在一个 kernel 中：先计算
+`grad_hidden = grad_output @ up_weight.T`，将 BF16 `grad_hidden` 写回
+一次供 down 权重梯度使用，同时从 SMEM 直接计算
+`grad_input = grad_hidden @ down_weight`。down/up 两个权重梯度各使用一个
+Grouped GEMM，因此完整反向共三个 kernel；同样支持 `D != I`。
+`CutlassLoraBgradGrouped` 与 Triton 同名类一样计算每个 expert 的
+`lhs_e.T @ rhs_e`。输出维度满足 8 元素对齐时使用针对
+`M=16` 的 CUTLASS `16x128x64` Grouped GEMM tile；非对齐尾块则
+分派到 rank=16 专用的 CuTe bgrad kernel。两条路径都支持空
+expert 和非整块 token 数。
+
 ## 构建与测试
 
 ```bash
@@ -97,12 +129,50 @@ from cudaop_grouped_gemm import LoraFusedDownUpGrouped
 fused = LoraFusedDownUpGrouped(down_weight, up_weight)
 saved_hidden, fused_output = fused(a, sizes)
 
+from cudaop_grouped_gemm import CutlassLoraFusedDownUpGrouped
+
+cutlass_fused = CutlassLoraFusedDownUpGrouped(
+    down_weight,
+    up_weight,
+)
+saved_hidden, fused_output = cutlass_fused(a, sizes)
+
+# 训练调用器只返回最终 output，反向自动使用 3 个 kernel。
+from cudaop_grouped_gemm import CutlassLoraFusedDownUp
+
+cutlass_train = CutlassLoraFusedDownUp(
+    down_weight,
+    up_weight,
+)
+train_output = cutlass_train(a, sizes)
+train_output.sum().backward()
+
+from cudaop_grouped_gemm import CutlassLoraBgradGrouped
+
+cutlass_bgrad = CutlassLoraBgradGrouped(
+    num_experts=2,
+    hidden_size=256,
+)
+grad_weight = cutlass_bgrad(saved_hidden, a, sizes)
+
+# 重复训练调用使用状态化入口，复用 packed weights 和路由元数据。
+a.requires_grad_(True)
+down_weight.requires_grad_(True)
+up_weight.requires_grad_(True)
+cached_output = cutlass_fused.forward_autograd(a, sizes)
+cached_output.sum().backward()
+
 from cudaop_grouped_gemm import triton_fused_lora
 
 a.requires_grad_(True)
 down_weight.requires_grad_(True)
 up_weight.requires_grad_(True)
 output = triton_fused_lora(a, down_weight, up_weight, sizes)
+output.sum().backward()
+
+from cudaop_grouped_gemm import cutlass_fused_lora
+
+output = cutlass_fused_lora(a, down_weight, up_weight, sizes)
 output.sum().backward()
 
 from cudaop_grouped_gemm import (
