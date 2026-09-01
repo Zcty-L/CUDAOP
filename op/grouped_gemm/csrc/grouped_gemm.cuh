@@ -75,6 +75,34 @@ template <typename ShapeConfig, bool TransposeA, bool TransposeB>
 using Operator = cutlass::gemm::device::GemmGrouped<
     Kernel<ShapeConfig, TransposeA, TransposeB>>;
 
+using LoraBgradThreadblockShape =
+    cutlass::gemm::GemmShape<16, 128, 64>;
+using LoraBgradWarpShape =
+    cutlass::gemm::GemmShape<16, 32, 64>;
+using LoraBgradKernel =
+    typename cutlass::gemm::kernel::DefaultGemmGrouped<
+        Element,
+        cutlass::layout::ColumnMajor,
+        cutlass::ComplexTransform::kNone,
+        8,
+        Element,
+        cutlass::layout::RowMajor,
+        cutlass::ComplexTransform::kNone,
+        8,
+        Element,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        LoraBgradThreadblockShape,
+        LoraBgradWarpShape,
+        K32ShapeConfig::InstructionShape,
+        Epilogue,
+        cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
+        5>::GemmKernel;
+using LoraBgradOperator =
+    cutlass::gemm::device::GemmGrouped<LoraBgradKernel>;
+
 inline void check_cuda(
     cudaError_t status,
     const char* operation)
@@ -109,7 +137,13 @@ torch::Tensor copy_metadata(
     return output;
 }
 
-template <typename ShapeConfig, bool TransposeA, bool TransposeB>
+template <
+    bool TransposeA,
+    bool TransposeB,
+    typename Gemm = Operator<
+        K32ShapeConfig,
+        TransposeA,
+        TransposeB>>
 torch::Tensor run(
     torch::Tensor a,
     torch::Tensor b,
@@ -158,7 +192,6 @@ torch::Tensor run(
         total_rows == a.size(0),
         "batch_sizes 之和必须等于 a.size(0)");
 
-    using Gemm = Operator<ShapeConfig, TransposeA, TransposeB>;
     using LayoutA = typename Gemm::LayoutA;
     using LayoutB = typename Gemm::LayoutB;
     using LayoutC = typename Gemm::LayoutC;
@@ -356,13 +389,31 @@ torch::Tensor grouped_gemm_with_config(
         "A 和 B 不能同时转置");
     if (transpose_a)
     {
-        return run<ShapeConfig, true, false>(a, b, batch_sizes);
+        return run<
+            true,
+            false,
+            Operator<ShapeConfig, true, false>>(
+                a,
+                b,
+                batch_sizes);
     }
     if (transpose_b)
     {
-        return run<ShapeConfig, false, true>(a, b, batch_sizes);
+        return run<
+            false,
+            true,
+            Operator<ShapeConfig, false, true>>(
+                a,
+                b,
+                batch_sizes);
     }
-    return run<ShapeConfig, false, false>(a, b, batch_sizes);
+    return run<
+        false,
+        false,
+        Operator<ShapeConfig, false, false>>(
+            a,
+            b,
+            batch_sizes);
 }
 
 inline torch::Tensor grouped_gemm(
@@ -393,6 +444,26 @@ inline torch::Tensor grouped_gemm_k16(
         batch_sizes,
         transpose_a,
         transpose_b);
+}
+
+inline torch::Tensor lora_bgrad_grouped(
+    torch::Tensor lhs,
+    torch::Tensor rhs,
+    torch::Tensor batch_sizes)
+{
+    TORCH_CHECK(
+        lhs.dim() == 2 && lhs.size(1) == 16,
+        "lhs 形状必须是 [N, 16]");
+    TORCH_CHECK(
+        rhs.dim() == 2 && rhs.size(0) == lhs.size(0),
+        "rhs 形状必须是 [N, K]");
+    TORCH_CHECK(
+        rhs.size(1) % 8 == 0,
+        "CUTLASS LoRA bgrad 要求 K 是 8 的倍数");
+    return run<true, false, LoraBgradOperator>(
+        lhs,
+        rhs,
+        batch_sizes);
 }
 
 }  // namespace cudaop::grouped_gemm
