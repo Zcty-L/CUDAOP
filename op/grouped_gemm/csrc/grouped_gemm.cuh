@@ -31,6 +31,7 @@ struct K32ShapeConfig
         cutlass::gemm::GemmShape<128, 128, 32>;
     using WarpShape = cutlass::gemm::GemmShape<64, 64, 32>;
     using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+    static constexpr int kStages = 4;
 };
 
 struct K16ShapeConfig
@@ -39,6 +40,7 @@ struct K16ShapeConfig
         cutlass::gemm::GemmShape<128, 128, 16>;
     using WarpShape = cutlass::gemm::GemmShape<64, 64, 16>;
     using InstructionShape = cutlass::gemm::GemmShape<16, 8, 8>;
+    static constexpr int kStages = 4;
 };
 
 using Epilogue = cutlass::epilogue::thread::LinearCombination<
@@ -67,7 +69,7 @@ using Kernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
     typename ShapeConfig::InstructionShape,
     Epilogue,
     cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
-    4>::GemmKernel;
+    ShapeConfig::kStages>::GemmKernel;
 
 template <typename ShapeConfig, bool TransposeA, bool TransposeB>
 using Operator = cutlass::gemm::device::GemmGrouped<

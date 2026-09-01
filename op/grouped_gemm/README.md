@@ -64,6 +64,7 @@ cmake -S . -B build
 cmake --build build --target cudaop_grouped_gemm
 cmake --build build --target cudaop_grouped_gemm_test
 cmake --build build --target cudaop_grouped_gemm_k_tile_test
+cmake --build build --target cudaop_grouped_gemm_config_test
 ```
 
 也可以在当前目录原地构建：
@@ -72,6 +73,113 @@ cmake --build build --target cudaop_grouped_gemm_k_tile_test
 python build.py
 python test_grouped_gemm.py
 ```
+
+## CUTLASS shape 配置调优
+
+配置调优使用独立扩展 `cudaop_grouped_gemm._tuning`，用于比较不同的
+`ThreadblockShape`、`WarpShape`、instruction K 和 `kStages`。它和生产
+扩展 `cudaop_grouped_gemm._C` 分开构建，因此 47 个实验模板实例不会
+增加生产扩展的体积或普通构建时间。
+
+当前扫描包含：
+
+- up：17 个实验配置，加原始 K32/K16 和统一 K16/K8，共 19 项。
+- down：15 个实验配置，加两个现有配置，共 17 项。
+- bgrad：15 个实验配置，加两个现有配置，共 17 项。
+- 总计 53 个可调用项，并对 rank=16/32 做正确性验证。
+
+### 使用当前 GPU 构建并测试
+
+从仓库根目录执行：
+
+```bash
+conda activate py311
+cmake -S . -B build
+CUDA_VISIBLE_DEVICES=0 \
+  cmake --build build --target cudaop_grouped_gemm_config_test
+```
+
+`cudaop_grouped_gemm_config_test` 会依次构建生产扩展、调优扩展，然后运行
+全部配置扫描和完整 LoRA forward/forward+backward 测试。构建脚本默认
+读取可见 GPU 的 compute capability，例如 RTX 4090 对应 `8.9`。
+
+只构建调优扩展、不运行性能测试：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+  cmake --build build --target cudaop_grouped_gemm_tuning
+```
+
+### 指定 CUDA 架构
+
+在目标 GPU 不可见或需要提前构建时，可以直接指定架构：
+
+```bash
+cd op/grouped_gemm
+python build_tuning.py --arch-list 8.9
+```
+
+也可以通过 `TORCH_CUDA_ARCH_LIST` 同时约束生产和调优扩展：
+
+```bash
+TORCH_CUDA_ARCH_LIST="8.9" CUDA_VISIBLE_DEVICES=0 \
+  cmake --build build --target cudaop_grouped_gemm_config_test
+```
+
+模板实例较多，默认最多使用 4 个编译任务；内存较小的机器可以进一步
+限制并发：
+
+```bash
+cd op/grouped_gemm
+MAX_JOBS=2 TORCH_CUDA_ARCH_LIST="8.9" \
+  python build_tuning.py
+```
+
+### 直接运行调优脚本
+
+也可以绕过 CMake，在算子目录内执行：
+
+```bash
+cd op/grouped_gemm
+python build.py
+python build_tuning.py
+CUDA_VISIBLE_DEVICES=0 python test_cutlass_configs.py
+```
+
+测试依次输出：
+
+1. GPU、compute capability、数据类型、group/token 数和配置数量。
+2. rank=16/32 的 down、up、bgrad FP32 参考误差。
+3. H=2048/rank=16、H=8192/rank=16/32 的全配置性能排名。
+4. 每条路径前三名复测和完整 LoRA 性能。
+5. 最终成功标记：
+
+```text
+[SUCCESS] CUTLASS Grouped GEMM 配置扫描通过
+```
+
+### 在不同 GPU 上对比
+
+不同 GPU 应分别在设备空闲时运行，并保存完整输出。示例：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+  cmake --build build --target cudaop_grouped_gemm_config_test \
+  2>&1 | tee build/grouped_gemm_config_gpu0.log
+
+CUDA_VISIBLE_DEVICES=1 \
+  cmake --build build --target cudaop_grouped_gemm_config_test \
+  2>&1 | tee build/grouped_gemm_config_gpu1.log
+```
+
+对比时应保持代码版本、输入规模、预热/计时次数和 GPU 工作状态一致。
+如果两张卡架构不同，应为每张卡设置对应的 `TORCH_CUDA_ARCH_LIST` 后
+重新构建。不要只比较单次最低耗时；测试脚本会打乱执行顺序并使用多个
+sample 的中位数。
+
+配置定义、CUTLASS 源码约束、寄存器/shared-memory 数据以及 RTX 4090
+结果见
+[`docs/grouped_gemm_shape_configuration_tuning.md`](../../docs/grouped_gemm_shape_configuration_tuning.md)。
 
 ## Python 调用
 

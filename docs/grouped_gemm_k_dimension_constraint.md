@@ -327,3 +327,7 @@ CUTLASS 已提供 BF16 `m16n8k8`，所以原实现中的两个 K=32 不是不可
 - 由于收益较小且不是所有阶段和 shape 都占优，`gmm` 继续使用 K32/K16
   基线；需要对比或明确选择候选时使用 `gmm_k16`。在改变默认值前应在
   目标 GPU 和真实 shape 上重新测量。
+
+K8 后续针对 ThreadblockShape、WarpShape 和 stage 的 47 组配置扫描、
+shared-memory 资源数据及 RTX 4090 完整 LoRA 结果见
+`docs/grouped_gemm_shape_configuration_tuning.md`。
