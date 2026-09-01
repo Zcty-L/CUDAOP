@@ -113,8 +113,8 @@ add_custom_target(lora_moe_standard_test
 add_custom_target(cudaop_grouped_gemm
     COMMAND
         ${CMAKE_COMMAND} -E env
-        TORCH_CUDA_ARCH_LIST=12.0
-        ${Python3_EXECUTABLE} setup.py build_ext --inplace
+        TORCH_CUDA_ARCH_LIST=12.0a
+        ${Python3_EXECUTABLE} setup.py build_ext --inplace --force
     WORKING_DIRECTORY
         "${PROJECT_SOURCE_DIR}/op/grouped_gemm"
     COMMENT

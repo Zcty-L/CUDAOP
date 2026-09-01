@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <type_traits>
 #include <vector>
 
 #include <cute/tensor.hpp>
@@ -26,8 +27,24 @@ constexpr int kBgradBlockM = 32;
 constexpr int kBgradBlockN = 128;
 constexpr int kBgradBlockK = 32;
 constexpr int kThreads = 128;
+constexpr int kDownSharedElements =
+    kDownPipelineStages *
+    (kBlockM * kDownBlockK + kDownBlockN * kDownBlockK);
+constexpr int kUpSharedElements =
+    kBlockM * kUpBlockN + kBlockM * kRank;
+constexpr int kSharedElements =
+    kDownSharedElements > kUpSharedElements
+    ? kDownSharedElements
+    : kUpSharedElements;
+constexpr int kTmaBarrierCount = kDownPipelineStages;
+constexpr int kTmaBarrierBytes =
+    kTmaBarrierCount * static_cast<int>(sizeof(uint64_t));
 
 using Element = cute::bfloat16_t;
+
+struct CpAsyncCopyArguments
+{
+};
 
 __device__ inline int find_expert(
     int tile_index,
@@ -51,6 +68,11 @@ __device__ inline int find_expert(
     return low;
 }
 
+template <
+    bool UseTma,
+    class InputTma,
+    class DownWeightTma,
+    class UpWeightTma>
 __global__ __launch_bounds__(kThreads) void fused_down_up_kernel(
     const Element* input,
     const Element* down_weight,
@@ -61,10 +83,21 @@ __global__ __launch_bounds__(kThreads) void fused_down_up_kernel(
     const int32_t* token_offsets,
     const int32_t* token_counts,
     int experts,
+    int input_rows,
     int input_size,
-    int output_size)
+    int output_size,
+    CUTE_GRID_CONSTANT InputTma const input_tma,
+    CUTE_GRID_CONSTANT DownWeightTma const down_weight_tma,
+    CUTE_GRID_CONSTANT UpWeightTma const up_weight_tma)
 {
     using namespace cute;
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && \
+    !defined(CUTE_ARCH_TMA_SM90_ENABLED)
+    static_assert(
+        !UseTma,
+        "TMA kernel requires an architecture-specific target such as sm_90a or sm_120a");
+#endif
 
     const int tile_index = static_cast<int>(blockIdx.x);
     const int expert = find_expert(
@@ -73,28 +106,38 @@ __global__ __launch_bounds__(kThreads) void fused_down_up_kernel(
         experts);
     const int previous_tiles =
         expert == 0 ? 0 : cumulative_tiles[expert - 1];
-    const int local_tile = tile_index - previous_tiles;
+    const int local_tile_index = tile_index - previous_tiles;
     const int token_offset = token_offsets[expert];
-    const int row_start = token_offset + local_tile * kBlockM;
+    const int row_start = token_offset + local_tile_index * kBlockM;
     const int valid_rows = min(
         kBlockM,
-        token_counts[expert] - local_tile * kBlockM);
+        token_counts[expert] - local_tile_index * kBlockM);
 
     const auto swizzle_64 = composition(
         Swizzle<3, 3, 3>{},
         cute::Layout<
             cute::Shape<_8, cute::Shape<_8, _8>>,
             cute::Stride<_8, cute::Stride<_1, _64>>>{});
-    const auto swizzle_32 = composition(
+    using CpAsyncDownLayout = decltype(composition(
         Swizzle<2, 3, 3>{},
         cute::Layout<
             cute::Shape<_8, _32>,
-            cute::Stride<_32, _1>>{});
-    const auto swizzle_16 = composition(
+            cute::Stride<_32, _1>>{}));
+    using CpAsyncUpLayout = decltype(composition(
         Swizzle<1, 3, 3>{},
         cute::Layout<
             cute::Shape<_8, _16>,
-            cute::Stride<_16, _1>>{});
+            cute::Stride<_16, _1>>{}));
+    using DownLayoutAtom = std::conditional_t<
+        UseTma,
+        GMMA::Layout_K_SW64_Atom<Element>,
+        CpAsyncDownLayout>;
+    using UpLayoutAtom = std::conditional_t<
+        UseTma,
+        GMMA::Layout_K_SW32_Atom<Element>,
+        CpAsyncUpLayout>;
+    const DownLayoutAtom swizzle_32{};
+    const UpLayoutAtom swizzle_16{};
     const auto down_a_layout = tile_to_shape(
         swizzle_32,
         make_shape(
@@ -133,6 +176,9 @@ __global__ __launch_bounds__(kThreads) void fused_down_up_kernel(
     extern __shared__ char shared_memory_bytes[];
     Element* shared_memory =
         reinterpret_cast<Element*>(shared_memory_bytes);
+    [[maybe_unused]] uint64_t* tma_barriers =
+        reinterpret_cast<uint64_t*>(
+            shared_memory + kSharedElements);
     Tensor shared_down_a = make_tensor(
         make_smem_ptr(shared_memory),
         down_a_layout);
@@ -178,93 +224,180 @@ __global__ __launch_bounds__(kThreads) void fused_down_up_kernel(
 
     auto load_down_tile = [&](int reduction_start, int stage)
     {
-        const int vector_index = static_cast<int>(threadIdx.x);
-        const int a_row = vector_index / (kDownBlockK / 8);
-        const int a_reduction = vector_index % (kDownBlockK / 8) * 8;
-        const int a_global_reduction = reduction_start + a_reduction;
-        if (a_row < valid_rows && input_size % 8 == 0 &&
-            a_global_reduction + 7 < input_size)
+        if constexpr (UseTma)
         {
-            Tensor global_vector = make_tensor(
-                make_gmem_ptr(
-                    input +
-                    (row_start + a_row) * input_size +
-                    a_global_reduction),
-                make_shape(Int<8>{}));
-            Tensor shared_vector = make_tensor(
-                make_smem_ptr(
-                    &shared_down_a(
-                        a_row,
-                        a_reduction,
-                        stage)),
-                make_shape(Int<8>{}));
-            copy(global_to_shared, global_vector, shared_vector);
-        }
-        else
-        {
-            CUTE_UNROLL
-            for (int offset = 0; offset < 8; ++offset)
+#if defined(CUTE_ARCH_TMA_SM90_ENABLED)
+            for (int index = static_cast<int>(threadIdx.x);
+                 index < (kDownBlockN - kRank) * kDownBlockK;
+                 index += kThreads)
             {
-                const int global_reduction =
-                    a_global_reduction + offset;
-                Element value = Element(0.0F);
-                if (a_row < valid_rows &&
-                    global_reduction < input_size)
-                {
-                    value = input[
-                        (row_start + a_row) * input_size +
-                        global_reduction];
-                }
-                shared_down_a(
-                    a_row,
-                    a_reduction + offset,
-                    stage) = value;
+                const int rank = kRank + index / kDownBlockK;
+                const int reduction = index % kDownBlockK;
+                shared_down_b(rank, reduction, stage) = Element(0.0F);
             }
-        }
+            if (threadIdx.x == 0)
+            {
+                constexpr int transaction_bytes =
+                    (kBlockM * kDownBlockK +
+                     kRank * kDownBlockK) *
+                    static_cast<int>(sizeof(Element));
+                tma_barriers[stage] = 0;
+                initialize_barrier(tma_barriers[stage], 1);
+                set_barrier_transaction_bytes(
+                    tma_barriers[stage],
+                    transaction_bytes);
 
-        const int b_rank = vector_index / (kDownBlockK / 8);
-        const int b_reduction = vector_index % (kDownBlockK / 8) * 8;
-        const int b_global_reduction = reduction_start + b_reduction;
-        if (b_rank < kRank && input_size % 8 == 0 &&
-            b_global_reduction + 7 < input_size)
-        {
-            Tensor global_vector = make_tensor(
-                make_gmem_ptr(
-                    down_weight +
-                    (expert * kRank + b_rank) * input_size +
-                    b_global_reduction),
-                make_shape(Int<8>{}));
-            Tensor shared_vector = make_tensor(
-                make_smem_ptr(
-                    &shared_down_b(
-                        b_rank,
-                        b_reduction,
-                        stage)),
-                make_shape(Int<8>{}));
-            copy(global_to_shared, global_vector, shared_vector);
+                Tensor input_tensor = input_tma.get_tma_tensor(
+                    make_shape(input_rows, input_size));
+                Tensor input_window = domain_offset(
+                    make_coord(row_start, reduction_start),
+                    input_tensor);
+                Tensor input_tile = local_tile(
+                    input_window,
+                    make_shape(
+                        Int<kBlockM>{},
+                        Int<kDownBlockK>{}),
+                    make_coord(Int<0>{}, Int<0>{}));
+                Tensor shared_input_tile = shared_down_a(_, _, stage);
+                auto input_copy = input_tma.get_slice(Int<0>{});
+                Tensor input_source =
+                    input_copy.partition_S(input_tile);
+                Tensor input_destination =
+                    input_copy.partition_D(shared_input_tile);
+                copy(
+                    input_tma.with(tma_barriers[stage]),
+                    input_source,
+                    input_destination);
+
+                Tensor weight_tensor = down_weight_tma.get_tma_tensor(
+                    make_shape(experts * kRank, input_size));
+                Tensor weight_window = domain_offset(
+                    make_coord(
+                        expert * kRank,
+                        reduction_start),
+                    weight_tensor);
+                Tensor weight_tile = local_tile(
+                    weight_window,
+                    make_shape(
+                        Int<kRank>{},
+                        Int<kDownBlockK>{}),
+                    make_coord(Int<0>{}, Int<0>{}));
+                const auto down_b_tma_layout = tile_to_shape(
+                    swizzle_32,
+                    make_shape(
+                        Int<kRank>{},
+                        Int<kDownBlockK>{}));
+                Tensor shared_weight_tile = make_tensor(
+                    make_smem_ptr(&shared_down_b(0, 0, stage)),
+                    down_b_tma_layout);
+                auto weight_copy =
+                    down_weight_tma.get_slice(Int<0>{});
+                Tensor weight_source =
+                    weight_copy.partition_S(weight_tile);
+                Tensor weight_destination =
+                    weight_copy.partition_D(shared_weight_tile);
+                copy(
+                    down_weight_tma.with(tma_barriers[stage]),
+                    weight_source,
+                    weight_destination);
+            }
+            __syncthreads();
+#endif
         }
         else
         {
-            CUTE_UNROLL
-            for (int offset = 0; offset < 8; ++offset)
+            const int vector_index = static_cast<int>(threadIdx.x);
+            const int a_row = vector_index / (kDownBlockK / 8);
+            const int a_reduction =
+                vector_index % (kDownBlockK / 8) * 8;
+            const int a_global_reduction =
+                reduction_start + a_reduction;
+            if (a_row < valid_rows && input_size % 8 == 0 &&
+                a_global_reduction + 7 < input_size)
             {
-                const int global_reduction =
-                    b_global_reduction + offset;
-                Element value = Element(0.0F);
-                if (b_rank < kRank &&
-                    global_reduction < input_size)
-                {
-                    value = down_weight[
-                        (expert * kRank + b_rank) * input_size +
-                        global_reduction];
-                }
-                shared_down_b(
-                    b_rank,
-                    b_reduction + offset,
-                    stage) = value;
+                Tensor global_vector = make_tensor(
+                    make_gmem_ptr(
+                        input +
+                        (row_start + a_row) * input_size +
+                        a_global_reduction),
+                    make_shape(Int<8>{}));
+                Tensor shared_vector = make_tensor(
+                    make_smem_ptr(
+                        &shared_down_a(
+                            a_row,
+                            a_reduction,
+                            stage)),
+                    make_shape(Int<8>{}));
+                copy(global_to_shared, global_vector, shared_vector);
             }
+            else
+            {
+                CUTE_UNROLL
+                for (int offset = 0; offset < 8; ++offset)
+                {
+                    const int global_reduction =
+                        a_global_reduction + offset;
+                    Element value = Element(0.0F);
+                    if (a_row < valid_rows &&
+                        global_reduction < input_size)
+                    {
+                        value = input[
+                            (row_start + a_row) * input_size +
+                            global_reduction];
+                    }
+                    shared_down_a(
+                        a_row,
+                        a_reduction + offset,
+                        stage) = value;
+                }
+            }
+
+            const int b_rank = vector_index / (kDownBlockK / 8);
+            const int b_reduction =
+                vector_index % (kDownBlockK / 8) * 8;
+            const int b_global_reduction =
+                reduction_start + b_reduction;
+            if (b_rank < kRank && input_size % 8 == 0 &&
+                b_global_reduction + 7 < input_size)
+            {
+                Tensor global_vector = make_tensor(
+                    make_gmem_ptr(
+                        down_weight +
+                        (expert * kRank + b_rank) * input_size +
+                        b_global_reduction),
+                    make_shape(Int<8>{}));
+                Tensor shared_vector = make_tensor(
+                    make_smem_ptr(
+                        &shared_down_b(
+                            b_rank,
+                            b_reduction,
+                            stage)),
+                    make_shape(Int<8>{}));
+                copy(global_to_shared, global_vector, shared_vector);
+            }
+            else
+            {
+                CUTE_UNROLL
+                for (int offset = 0; offset < 8; ++offset)
+                {
+                    const int global_reduction =
+                        b_global_reduction + offset;
+                    Element value = Element(0.0F);
+                    if (b_rank < kRank &&
+                        global_reduction < input_size)
+                    {
+                        value = down_weight[
+                            (expert * kRank + b_rank) * input_size +
+                            global_reduction];
+                    }
+                    shared_down_b(
+                        b_rank,
+                        b_reduction + offset,
+                        stage) = value;
+                }
+            }
+            cp_async_fence();
         }
-        cp_async_fence();
     };
 
     int read_stage = 0;
@@ -273,7 +406,16 @@ __global__ __launch_bounds__(kThreads) void fused_down_up_kernel(
          reduction_start < input_size;
          reduction_start += kDownBlockK)
     {
-        cp_async_wait<0>();
+        if constexpr (UseTma)
+        {
+#if defined(CUTE_ARCH_TMA_SM90_ENABLED)
+            wait_barrier(tma_barriers[read_stage], 0);
+#endif
+        }
+        else
+        {
+            cp_async_wait<0>();
+        }
         __syncthreads();
         const int write_stage = 1 - read_stage;
         if (reduction_start + kDownBlockK < input_size)
@@ -305,7 +447,10 @@ __global__ __launch_bounds__(kThreads) void fused_down_up_kernel(
         }
         read_stage = write_stage;
     }
-    cp_async_wait<0>();
+    if constexpr (!UseTma)
+    {
+        cp_async_wait<0>();
+    }
     __syncthreads();
 
     Tensor down_output_fragment =
@@ -371,43 +516,89 @@ __global__ __launch_bounds__(kThreads) void fused_down_up_kernel(
          column_start < output_size;
          column_start += kUpBlockN)
     {
-        for (int vector_index = static_cast<int>(threadIdx.x);
-             vector_index < kUpBlockN * kRank / 8;
-             vector_index += kThreads)
+        if constexpr (UseTma)
         {
-            const int column = vector_index / (kRank / 8);
-            const int rank = vector_index % (kRank / 8) * 8;
-            const int global_column = column_start + column;
-            if (global_column < output_size)
+#if defined(CUTE_ARCH_TMA_SM90_ENABLED)
+            if (threadIdx.x == 0)
             {
-                Tensor global_vector = make_tensor(
-                    make_gmem_ptr(
-                        up_weight_transposed +
-                        (expert * output_size + global_column) *
-                            kRank +
-                        rank),
-                    make_shape(Int<8>{}));
-                Tensor shared_vector = make_tensor(
-                    make_smem_ptr(
-                        &shared_up_b(column, rank)),
-                    make_shape(Int<8>{}));
+                constexpr int transaction_bytes =
+                    kUpBlockN * kRank *
+                    static_cast<int>(sizeof(Element));
+                tma_barriers[0] = 0;
+                initialize_barrier(tma_barriers[0], 1);
+                set_barrier_transaction_bytes(
+                    tma_barriers[0],
+                    transaction_bytes);
+
+                Tensor weight_tensor = up_weight_tma.get_tma_tensor(
+                    make_shape(
+                        experts * output_size,
+                        Int<kRank>{}));
+                Tensor weight_window = domain_offset(
+                    make_coord(
+                        expert * output_size + column_start,
+                        Int<0>{}),
+                    weight_tensor);
+                Tensor weight_tile = local_tile(
+                    weight_window,
+                    make_shape(
+                        Int<kUpBlockN>{},
+                        Int<kRank>{}),
+                    make_coord(Int<0>{}, Int<0>{}));
+                auto weight_copy = up_weight_tma.get_slice(Int<0>{});
+                Tensor weight_source =
+                    weight_copy.partition_S(weight_tile);
+                Tensor weight_destination =
+                    weight_copy.partition_D(shared_up_b);
                 copy(
-                    global_to_shared,
-                    global_vector,
-                    shared_vector);
+                    up_weight_tma.with(tma_barriers[0]),
+                    weight_source,
+                    weight_destination);
             }
-            else
+            __syncthreads();
+            wait_barrier(tma_barriers[0], 0);
+#endif
+        }
+        else
+        {
+            for (int vector_index = static_cast<int>(threadIdx.x);
+                 vector_index < kUpBlockN * kRank / 8;
+                 vector_index += kThreads)
             {
-                CUTE_UNROLL
-                for (int offset = 0; offset < 8; ++offset)
+                const int column = vector_index / (kRank / 8);
+                const int rank = vector_index % (kRank / 8) * 8;
+                const int global_column = column_start + column;
+                if (global_column < output_size)
                 {
-                    shared_up_b(column, rank + offset) =
-                        Element(0.0F);
+                    Tensor global_vector = make_tensor(
+                        make_gmem_ptr(
+                            up_weight_transposed +
+                            (expert * output_size + global_column) *
+                                kRank +
+                            rank),
+                        make_shape(Int<8>{}));
+                    Tensor shared_vector = make_tensor(
+                        make_smem_ptr(
+                            &shared_up_b(column, rank)),
+                        make_shape(Int<8>{}));
+                    copy(
+                        global_to_shared,
+                        global_vector,
+                        shared_vector);
+                }
+                else
+                {
+                    CUTE_UNROLL
+                    for (int offset = 0; offset < 8; ++offset)
+                    {
+                        shared_up_b(column, rank + offset) =
+                            Element(0.0F);
+                    }
                 }
             }
+            cp_async_fence();
+            cp_async_wait<0>();
         }
-        cp_async_fence();
-        cp_async_wait<0>();
         __syncthreads();
 
         ThrMMA up_thread_mma = tiled_mma.get_slice(threadIdx.x);
@@ -762,42 +953,143 @@ inline std::vector<torch::Tensor> fused_lora_forward(
     }
     TORCH_CHECK(total_tiles > 0, "非空输入的 total_tiles 必须大于零");
 
-    constexpr int down_shared_elements =
-        kDownPipelineStages *
-        (kBlockM * kDownBlockK +
-         kDownBlockN * kDownBlockK);
-    constexpr int up_shared_elements =
-        kBlockM * kUpBlockN + kBlockM * kRank;
-    constexpr int shared_elements =
-        down_shared_elements > up_shared_elements
-        ? down_shared_elements
-        : up_shared_elements;
-    constexpr int shared_bytes =
-        shared_elements * static_cast<int>(sizeof(Element));
-    const auto kernel = fused_down_up_kernel;
+    cudaDeviceProp device_properties{};
     check_cuda(
-        cudaFuncSetAttribute(
+        cudaGetDeviceProperties(
+            &device_properties,
+            input.get_device()),
+        "读取 fused LoRA 设备架构");
+    TORCH_CHECK(
+        device_properties.major >= 8,
+        "fused LoRA 至少需要 SM80");
+
+    // TMA 的非单位 GMEM stride 必须按 16B 对齐。满足该约束时，
+    // SM90 及后续架构使用 CuTe SM90_TMA_LOAD；其余情况保留原始
+    // SM80 cp.async kernel，尾块精度路径也因此不受影响。
+    const bool use_tma =
+        device_properties.major >= 9 &&
+        input.size(1) > 0 && input.size(1) % 8 == 0 &&
+        up_weight_transposed.size(1) > 0;
+    const int shared_bytes =
+        kSharedElements * static_cast<int>(sizeof(Element)) +
+        (use_tma ? kTmaBarrierBytes : 0);
+    const auto launch = [&, shared_bytes](
+        auto kernel,
+        const auto& input_copy,
+        const auto& down_weight_copy,
+        const auto& up_weight_copy)
+    {
+        check_cuda(
+            cudaFuncSetAttribute(
+                kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                shared_bytes),
+            "设置 fused LoRA 动态共享内存");
+        kernel<<<
+            static_cast<unsigned int>(total_tiles),
+            kThreads,
+            shared_bytes,
+            c10::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const Element*>(input.data_ptr()),
+            reinterpret_cast<const Element*>(down_weight.data_ptr()),
+            reinterpret_cast<const Element*>(
+                up_weight_transposed.data_ptr()),
+            reinterpret_cast<Element*>(hidden.data_ptr()),
+            reinterpret_cast<Element*>(output.data_ptr()),
+            cumulative_tiles.data_ptr<int32_t>(),
+            token_offsets.data_ptr<int32_t>(),
+            token_counts.data_ptr<int32_t>(),
+            static_cast<int>(experts),
+            static_cast<int>(input.size(0)),
+            static_cast<int>(input.size(1)),
+            static_cast<int>(up_weight_transposed.size(1)),
+            input_copy,
+            down_weight_copy,
+            up_weight_copy);
+    };
+
+    if (use_tma)
+    {
+        using namespace cute;
+
+        const GMMA::Layout_K_SW64_Atom<Element> swizzle_32{};
+        const GMMA::Layout_K_SW32_Atom<Element> swizzle_16{};
+        const auto input_smem_layout = tile_to_shape(
+            swizzle_32,
+            make_shape(Int<kBlockM>{}, Int<kDownBlockK>{}));
+        const auto down_weight_smem_layout = tile_to_shape(
+            swizzle_32,
+            make_shape(Int<kRank>{}, Int<kDownBlockK>{}));
+        const auto up_weight_smem_layout = tile_to_shape(
+            swizzle_16,
+            make_shape(Int<kUpBlockN>{}, Int<kRank>{}));
+
+        Tensor input_tensor = make_tensor(
+            make_gmem_ptr(
+                reinterpret_cast<const Element*>(input.data_ptr())),
+            make_shape(
+                static_cast<int>(input.size(0)),
+                static_cast<int>(input.size(1))),
+            make_stride(
+                static_cast<int>(input.size(1)),
+                Int<1>{}));
+        Tensor down_weight_tensor = make_tensor(
+            make_gmem_ptr(
+                reinterpret_cast<const Element*>(
+                    down_weight.data_ptr())),
+            make_shape(
+                static_cast<int>(experts * kRank),
+                static_cast<int>(input.size(1))),
+            make_stride(
+                static_cast<int>(input.size(1)),
+                Int<1>{}));
+        Tensor up_weight_tensor = make_tensor(
+            make_gmem_ptr(
+                reinterpret_cast<const Element*>(
+                    up_weight_transposed.data_ptr())),
+            make_shape(
+                static_cast<int>(
+                    experts * up_weight_transposed.size(1)),
+                kRank),
+            make_stride(kRank, Int<1>{}));
+
+        auto input_tma = make_tma_copy(
+            SM90_TMA_LOAD{},
+            input_tensor,
+            input_smem_layout);
+        auto down_weight_tma = make_tma_copy(
+            SM90_TMA_LOAD{},
+            down_weight_tensor,
+            down_weight_smem_layout);
+        auto up_weight_tma = make_tma_copy(
+            SM90_TMA_LOAD{},
+            up_weight_tensor,
+            up_weight_smem_layout);
+        const auto kernel = fused_down_up_kernel<
+            true,
+            decltype(input_tma),
+            decltype(down_weight_tma),
+            decltype(up_weight_tma)>;
+        launch(
             kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            shared_bytes),
-        "设置 fused LoRA 动态共享内存");
-    kernel<<<
-        static_cast<unsigned int>(total_tiles),
-        kThreads,
-        shared_bytes,
-        c10::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const Element*>(input.data_ptr()),
-        reinterpret_cast<const Element*>(down_weight.data_ptr()),
-        reinterpret_cast<const Element*>(
-            up_weight_transposed.data_ptr()),
-        reinterpret_cast<Element*>(hidden.data_ptr()),
-        reinterpret_cast<Element*>(output.data_ptr()),
-        cumulative_tiles.data_ptr<int32_t>(),
-        token_offsets.data_ptr<int32_t>(),
-        token_counts.data_ptr<int32_t>(),
-        static_cast<int>(experts),
-        static_cast<int>(input.size(1)),
-        static_cast<int>(up_weight_transposed.size(1)));
+            input_tma,
+            down_weight_tma,
+            up_weight_tma);
+    }
+    else
+    {
+        const CpAsyncCopyArguments copy_arguments{};
+        const auto kernel = fused_down_up_kernel<
+            false,
+            CpAsyncCopyArguments,
+            CpAsyncCopyArguments,
+            CpAsyncCopyArguments>;
+        launch(
+            kernel,
+            copy_arguments,
+            copy_arguments,
+            copy_arguments);
+    }
     check_cuda(cudaGetLastError(), "启动 fused LoRA kernel");
     return {hidden, output};
 }

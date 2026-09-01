@@ -1,5 +1,6 @@
 """构建 cudaop_grouped_gemm CUDA 扩展。"""
 
+import os
 from pathlib import Path
 
 from setuptools import find_packages, setup
@@ -9,6 +10,10 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 ROOT = Path(__file__).resolve().parent
 CSRC = ROOT / "csrc"
 CUTLASS_INCLUDE = ROOT.parents[2] / "cutlass" / "include"
+
+# SM120 的 TMA 需要 architecture-specific feature target。调用方仍可通过
+# TORCH_CUDA_ARCH_LIST 显式覆盖为 8.0 等目标，此时 kernel 会走 cp.async。
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0a")
 
 for source in ("ops.cu", "grouped_gemm.cuh", "fused_lora.cuh"):
     if not (CSRC / source).is_file():
