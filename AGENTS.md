@@ -18,12 +18,11 @@
 
 ## 配置文件
 - 一些参数配置，结构体定义需要在 `./op/config.h`
-- PTX 指令**读取**和**添加**统一在 `./op/ptx_utils.cuh`
-- `./op/cuda_utils.cuh` **已弃用，不再使用**，新代码禁止引用
 - `cmake` 配置：`./CMakeLists.txt`
 
 ### PTX 指令规范
-- 所有 PTX 指令统一在 `./op/ptx_utils.cuh` 中管理
+- PTX 指令**读取**和**添加**统一在 `./op/ptx_utils.cuh`
+- `./op/cuda_utils.cuh` **已弃用，不再使用**，新代码禁止引用
 - 添加 PTX 指令时需在注释中注明：指令名称、来源（文档链接或参考项目）、用途
 
 
@@ -35,8 +34,8 @@
 
 
 ## 编译代码规则
-- 代码的编译统一在 `CMakeLists`，只有在临时测试的时候才允许使用 `nvcc`，产生的临时可执行文件的输出目录为 `./build`
-- 最终一定需要放到 `CMakeLists` 进行测试验证
+- C++ 代码的编译统一在 `CMakeLists`，只有在临时测试的时候才允许使用 `nvcc`，产生的临时可执行文件的输出目录为 `./build`，最终一定需要放到 `CMakeLists` 进行测试验证
+- Python 代码可以直接执行，不必放到 `CMakeLists`
 
 
 ## 测试 Debug 输出规范
