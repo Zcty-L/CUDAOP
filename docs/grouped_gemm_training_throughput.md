@@ -239,3 +239,87 @@ cmake --build build --target cudaop_grouped_gemm_test -j
 ```text
 [SUCCESS] cudaop_grouped_gemm 对比测试通过
 ```
+
+## CUTLASS kernel fusion 专项复测（RTX 4090）
+
+### 测试目的与口径
+
+2026-09-08 在 RTX 4090（SM89）上对 `fused_lora.cuh` 进行专项复测，
+只比较 CUTLASS 默认非融合路径与 CUTLASS/CuTe 融合路径：
+
+| 阶段 | 非融合计算 kernel | 融合计算 kernel |
+|---|---:|---:|
+| 前向 | down、up，共 2 个 | fused down/up，共 1 个 |
+| 纯反向 | grad hidden/input 和两个 bgrad，共 4 个 | fused agrad 和两个 bgrad，共 3 个 |
+| 前向+反向 | 6 个 | 4 个 |
+
+测试参数为 BF16、8 experts、rank 16、hidden size 2048，expert token 数为
+`[2560, 3140, 1940, 2000, 2220, 2580, 2760, 2020]`，总 token 数
+为 19220。每个采样预热 100 次、计时 1000 次，融合与非融合交替执行，
+共取 10 个采样的中位数。
+
+纯反向在计时前构建好 Autograd graph，并通过 `retain_graph=True` 重复执行，
+因此不包含前向。端到端测试每轮重新执行前向和反向。融合权重预打包和首次
+metadata 构建均在计时外；CUDA Event 结果仍包含每个入口自身的 metadata、
+Autograd 和 kernel launch 开销。
+
+### 正确性
+
+目标性能规模上的融合/非融合最大绝对差如下，全部通过
+`rtol=2e-2`、前向 `atol=2e-2`、反向 `atol=5e-1` 检查：
+
+| Tensor | 最大绝对差 |
+|---|---:|
+| saved hidden | 0.000000 |
+| output | 0.000000 |
+| grad input | 0.000000 |
+| grad down weight | 0.000000 |
+| grad up weight | 0.007812 |
+
+空 expert、非整块 M/N/K 尾块和 bgrad K=256/33 回归也全部通过。
+
+### CUDA Event 稳态入口耗时
+
+最终 CMake 测试结果如下：
+
+| 阶段 | 非融合（us） | 融合（us） | 加速比 | 延迟下降 |
+|---|---:|---:|---:|---:|
+| 前向 | 236.310 | 190.334 | 1.242x | 19.5% |
+| 纯反向 | 456.619 | 347.252 | 1.315x | 24.0% |
+| 前向+反向 | 1737.381 | 844.424 | 2.057x | 51.4% |
+
+### Nsight Systems 纯计算 kernel 时间
+
+使用 Nsight Systems 2025.5.2 采集 100 次调用，并按 NVTX 时间范围直接从
+`CUPTI_ACTIVITY_KIND_KERNEL` 汇总。下表排除 metadata memcpy、Python、
+Autograd 和 launch 间隙，也排除两条反向路径都存在的约 2.5 us
+elementwise fill kernel：
+
+| 阶段 | 非融合计算 kernel（us） | 融合计算 kernel（us） | 加速比 | 延迟下降 |
+|---|---:|---:|---:|---:|
+| 前向 | 229.382 | 191.906 | 1.195x | 16.3% |
+| 纯反向 | 440.305 | 336.124 | 1.310x | 23.7% |
+| 前向+反向 | 604.149 | 558.670 | 1.081x | 7.5% |
+
+因此可以确认：kernel fusion 本身在该负载上使前向计算 kernel 加速约
+1.195x、纯反向计算 kernel 加速约 1.310x。CUDA Event 端到端的约 2x
+训练加速不能全部归因于 fusion；较大部分来自融合状态化入口复用 packed
+weight/metadata，而通用非融合 CUTLASS 路径每轮仍需准备 Grouped GEMM
+metadata 和 Autograd 调用。
+
+### 复现方式
+
+```bash
+conda activate py311
+cmake -S . -B build \
+  -DPython3_EXECUTABLE=/home/lsbing/.conda/envs/py311/bin/python
+CUDA_VISIBLE_DEVICES=1 \
+  cmake --build build --target cudaop_grouped_gemm_test -j 4
+```
+
+最终目标输出：
+
+```text
+[SUCCESS] cudaop_grouped_gemm 对比测试通过
+[100%] Built target cudaop_grouped_gemm_test
+```

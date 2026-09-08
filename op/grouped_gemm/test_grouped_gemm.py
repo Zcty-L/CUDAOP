@@ -36,6 +36,9 @@ BF16_GRAD_ATOL = 5e-1
 TORCH_WEIGHT_GRAD_ATOL = 8.0
 WARMUP_ITERATIONS = 20
 BENCHMARK_ITERATIONS = 100
+BENCHMARK_SAMPLES = 10
+FUSION_WARMUP_ITERATIONS = 100
+FUSION_BENCHMARK_ITERATIONS = 1000
 SIZES = [128, 157, 97, 100, 111, 129, 138, 101]
 SIZES = [i * 20 for i in SIZES]
 
@@ -1079,23 +1082,351 @@ def run_bgrad_accuracy() -> None:
     )
 
 
-def benchmark_once(operation: Callable[[], None]) -> float:
-    for _ in range(WARMUP_ITERATIONS):
+def benchmark_once(
+    operation: Callable[[], None],
+    warmup_iterations: int = WARMUP_ITERATIONS,
+    benchmark_iterations: int = BENCHMARK_ITERATIONS,
+) -> float:
+    for _ in range(warmup_iterations):
         operation()
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
-    for _ in range(BENCHMARK_ITERATIONS):
+    for _ in range(benchmark_iterations):
         operation()
     end.record()
     end.synchronize()
-    return start.elapsed_time(end) * 1000.0 / BENCHMARK_ITERATIONS
+    return start.elapsed_time(end) * 1000.0 / benchmark_iterations
 
 
 def benchmark(operation: Callable[[], None]) -> float:
     samples = [benchmark_once(operation) for _ in range(5)]
     return statistics.median(samples)
+
+
+def benchmark_pair(
+    separate: Callable[[], None],
+    fused: Callable[[], None],
+) -> tuple[list[float], list[float]]:
+    """交替测量两个实现，降低温度和频率漂移带来的顺序偏差。"""
+    samples = {"separate": [], "fused": []}
+    operations = {"separate": separate, "fused": fused}
+    for sample_index in range(BENCHMARK_SAMPLES):
+        order = (
+            ("separate", "fused")
+            if sample_index % 2 == 0
+            else ("fused", "separate")
+        )
+        for name in order:
+            samples[name].append(
+                benchmark_once(
+                    operations[name],
+                    FUSION_WARMUP_ITERATIONS,
+                    FUSION_BENCHMARK_ITERATIONS,
+                )
+            )
+    return samples["separate"], samples["fused"]
+
+
+def benchmark_summary(
+    samples: list[float],
+) -> tuple[float, float, float, float]:
+    median = statistics.median(samples)
+    mean = statistics.mean(samples)
+    coefficient_of_variation = (
+        statistics.pstdev(samples) / mean * 100.0
+    )
+    return (
+        median,
+        min(samples),
+        max(samples),
+        coefficient_of_variation,
+    )
+
+
+def run_cutlass_fusion_performance() -> None:
+    """分别对比 CUTLASS fusion 的前向、反向及训练总耗时。"""
+    sizes = torch.tensor(SIZES)
+    tokens = int(sizes.sum())
+    experts = sizes.numel()
+    hidden_size = 2048
+    a = torch.randn(
+        tokens,
+        hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    down_weight = torch.randn(
+        experts,
+        16,
+        hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    up_weight = torch.randn_like(down_weight)
+    cutlass_fused = CutlassLoraFusedDownUpGrouped(
+        down_weight,
+        up_weight,
+    )
+
+    # 前向精度：两次通用 CUTLASS Grouped GEMM 对比一个融合 kernel。
+    separate_hidden = gmm(a, down_weight, sizes, True)
+    separate_output = gmm(
+        separate_hidden,
+        up_weight,
+        sizes,
+        False,
+    )
+    fused_hidden, fused_output = cutlass_fused(a, sizes)
+    torch.testing.assert_close(
+        fused_hidden,
+        separate_hidden,
+        rtol=BF16_RTOL,
+        atol=BF16_ATOL,
+    )
+    torch.testing.assert_close(
+        fused_output,
+        separate_output,
+        rtol=BF16_RTOL,
+        atol=BF16_ATOL,
+    )
+
+    # 反向精度：分别验证输入、down 权重和 up 权重梯度。
+    grad_output = torch.randn_like(a)
+    accuracy_separate_a = a.detach().requires_grad_(True)
+    accuracy_separate_down = down_weight.detach().requires_grad_(True)
+    accuracy_separate_up = up_weight.detach().requires_grad_(True)
+    accuracy_fused_a = a.detach().requires_grad_(True)
+    accuracy_fused_down = down_weight.detach().requires_grad_(True)
+    accuracy_fused_up = up_weight.detach().requires_grad_(True)
+    accuracy_fused_operation = CutlassLoraFusedDownUp(
+        accuracy_fused_down,
+        accuracy_fused_up,
+    )
+    accuracy_separate_output = lora_gmm(
+        accuracy_separate_a,
+        accuracy_separate_down,
+        accuracy_separate_up,
+        sizes,
+    )
+    accuracy_fused_output = accuracy_fused_operation(
+        accuracy_fused_a,
+        sizes,
+    )
+    accuracy_separate_gradients = torch.autograd.grad(
+        accuracy_separate_output,
+        (
+            accuracy_separate_a,
+            accuracy_separate_down,
+            accuracy_separate_up,
+        ),
+        grad_output,
+    )
+    accuracy_fused_gradients = torch.autograd.grad(
+        accuracy_fused_output,
+        (
+            accuracy_fused_a,
+            accuracy_fused_down,
+            accuracy_fused_up,
+        ),
+        grad_output,
+    )
+    for fused_gradient, separate_gradient in zip(
+        accuracy_fused_gradients,
+        accuracy_separate_gradients,
+    ):
+        torch.testing.assert_close(
+            fused_gradient,
+            separate_gradient,
+            rtol=BF16_RTOL,
+            atol=BF16_GRAD_ATOL,
+        )
+    LOGGER.info(
+        (
+            "正确性：tokens=%d experts=%d hidden=%d rank=16 "
+            "hidden_diff=%.6f output_diff=%.6f [PASS]"
+        ),
+        tokens,
+        experts,
+        hidden_size,
+        max_error(fused_hidden, separate_hidden),
+        max_error(fused_output, separate_output),
+    )
+    LOGGER.info(
+        (
+            "反向正确性：grad_input_diff=%.6f "
+            "grad_down_diff=%.6f grad_up_diff=%.6f [PASS]"
+        ),
+        *(
+            max_error(fused_gradient, separate_gradient)
+            for fused_gradient, separate_gradient in zip(
+                accuracy_fused_gradients,
+                accuracy_separate_gradients,
+            )
+        ),
+    )
+
+    def cutlass_separate_forward() -> None:
+        hidden = gmm(a, down_weight, sizes, True)
+        gmm(hidden, up_weight, sizes, False)
+
+    def cutlass_fused_forward() -> None:
+        cutlass_fused(a, sizes)
+
+    forward_samples = benchmark_pair(
+        cutlass_separate_forward,
+        cutlass_fused_forward,
+    )
+
+    # 纯反向计时复用已构建的 autograd graph，不包含两条路径的前向。
+    backward_separate_a = a.detach().requires_grad_(True)
+    backward_separate_down = down_weight.detach().requires_grad_(True)
+    backward_separate_up = up_weight.detach().requires_grad_(True)
+    backward_fused_a = a.detach().requires_grad_(True)
+    backward_fused_down = down_weight.detach().requires_grad_(True)
+    backward_fused_up = up_weight.detach().requires_grad_(True)
+    backward_fused_operation = CutlassLoraFusedDownUp(
+        backward_fused_down,
+        backward_fused_up,
+    )
+    backward_separate_output = lora_gmm(
+        backward_separate_a,
+        backward_separate_down,
+        backward_separate_up,
+        sizes,
+    )
+    backward_fused_output = backward_fused_operation(
+        backward_fused_a,
+        sizes,
+    )
+
+    def cutlass_separate_backward() -> None:
+        torch.autograd.grad(
+            backward_separate_output,
+            (
+                backward_separate_a,
+                backward_separate_down,
+                backward_separate_up,
+            ),
+            grad_output,
+            retain_graph=True,
+        )
+
+    def cutlass_fused_backward() -> None:
+        torch.autograd.grad(
+            backward_fused_output,
+            (
+                backward_fused_a,
+                backward_fused_down,
+                backward_fused_up,
+            ),
+            grad_output,
+            retain_graph=True,
+        )
+
+    backward_samples = benchmark_pair(
+        cutlass_separate_backward,
+        cutlass_fused_backward,
+    )
+
+    # 训练总耗时包含一次前向、一次反向，不包含权重预打包。
+    total_separate_a = a.detach().requires_grad_(True)
+    total_separate_down = down_weight.detach().requires_grad_(True)
+    total_separate_up = up_weight.detach().requires_grad_(True)
+    total_fused_a = a.detach().requires_grad_(True)
+    total_fused_down = down_weight.detach().requires_grad_(True)
+    total_fused_up = up_weight.detach().requires_grad_(True)
+    total_fused_operation = CutlassLoraFusedDownUp(
+        total_fused_down,
+        total_fused_up,
+    )
+
+    def cutlass_separate_total() -> None:
+        output = lora_gmm(
+            total_separate_a,
+            total_separate_down,
+            total_separate_up,
+            sizes,
+        )
+        torch.autograd.grad(
+            output,
+            (
+                total_separate_a,
+                total_separate_down,
+                total_separate_up,
+            ),
+            grad_output,
+        )
+
+    def cutlass_fused_total() -> None:
+        output = total_fused_operation(total_fused_a, sizes)
+        torch.autograd.grad(
+            output,
+            (total_fused_a, total_fused_down, total_fused_up),
+            grad_output,
+        )
+
+    total_samples = benchmark_pair(
+        cutlass_separate_total,
+        cutlass_fused_total,
+    )
+
+    stages = (
+        ("forward", 2, 1, *forward_samples),
+        ("backward", 4, 3, *backward_samples),
+        ("forward+backward", 6, 4, *total_samples),
+    )
+    LOGGER.info("")
+    LOGGER.info(
+        (
+            "%-18s | %-10s | %7s | %12s | "
+            "%23s | %8s | %10s"
+        ),
+        "stage",
+        "CUTLASS",
+        "kernels",
+        "median(us)",
+        "sample min-max(us)",
+        "CV",
+        "speedup",
+    )
+    LOGGER.info("-" * 108)
+    for (
+        stage,
+        separate_kernels,
+        fused_kernels,
+        separate_stage_samples,
+        fused_stage_samples,
+    ) in stages:
+        separate_summary = benchmark_summary(separate_stage_samples)
+        fused_summary = benchmark_summary(fused_stage_samples)
+        speedup = separate_summary[0] / fused_summary[0]
+        for name, kernels, summary in (
+            ("separate", separate_kernels, separate_summary),
+            ("fused", fused_kernels, fused_summary),
+        ):
+            median_us, minimum_us, maximum_us, variation = summary
+            LOGGER.info(
+                (
+                    "%-18s | %-10s | %7d | %12.3f | "
+                    "%10.3f-%10.3f | %7.3f%% | %9s"
+                ),
+                stage,
+                name,
+                kernels,
+                median_us,
+                minimum_us,
+                maximum_us,
+                variation,
+                "-" if name == "separate" else f"{speedup:.3f}x",
+            )
+    LOGGER.info(
+        (
+            "说明：kernels 仅统计 GEMM/fusion 计算 kernel；"
+            "计时不包含 fused 权重预打包，包含各入口自身的元数据处理。"
+        )
+    )
 
 
 def run_performance() -> None:
@@ -1500,7 +1831,20 @@ def main() -> None:
                 "执行 Torch/CUTLASS/Triton 可移植回归"
             )
         )
+        LOGGER.info("")
+        LOGGER.info("阶段：LoRA fusion 可移植精度验证")
         run_portable_accuracy()
+        LOGGER.info("")
+        LOGGER.info(
+            (
+                "阶段：CUTLASS fusion/非 fusion 性能对比，"
+                "hidden_size=2048 warmup=%d iterations=%d samples=%d"
+            ),
+            FUSION_WARMUP_ITERATIONS,
+            FUSION_BENCHMARK_ITERATIONS,
+            BENCHMARK_SAMPLES,
+        )
+        run_cutlass_fusion_performance()
         LOGGER.info("")
         LOGGER.info("[SUCCESS] cudaop_grouped_gemm 对比测试通过")
         return
