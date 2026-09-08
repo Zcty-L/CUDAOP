@@ -1,6 +1,7 @@
-"""原地构建扩展，并验证 Python 包可导入。"""
+"""构建并验证 CUTLASS Grouped GEMM 配置扫描扩展。"""
 
 import argparse
+import importlib
 import os
 import subprocess
 import sys
@@ -41,12 +42,17 @@ def main() -> None:
     env = os.environ.copy()
     env["TORCH_CUDA_ARCH_LIST"] = resolve_arch_list(args.arch_list)
     env.setdefault("MAX_JOBS", "4")
+    tuning_build_root = ROOT / "build" / "tuning"
     subprocess.run(
         [
             sys.executable,
-            "setup.py",
+            "setup_tuning.py",
             "build_ext",
             "--inplace",
+            "--build-temp",
+            str(tuning_build_root / "temp"),
+            "--build-lib",
+            str(tuning_build_root / "lib"),
         ],
         cwd=ROOT,
         env=env,
@@ -54,14 +60,15 @@ def main() -> None:
     )
 
     sys.path.insert(0, str(ROOT))
-    import cudaop_grouped_gemm
-
-    for operation_name in ("gmm", "gmm_k16"):
-        operation = getattr(cudaop_grouped_gemm, operation_name, None)
-        if not callable(operation):
-            raise RuntimeError(
-                f"cudaop_grouped_gemm.{operation_name} 不可调用"
-            )
+    tuning = importlib.import_module("cudaop_grouped_gemm._tuning")
+    required = (
+        "up_tb128x128x16_w64x64x16_i8_s2",
+        "down_tb128x32x16_w64x32x16_i8_s4",
+        "bgrad_tb32x128x16_w32x64x16_i8_s4",
+    )
+    for operation_name in required:
+        if not callable(getattr(tuning, operation_name, None)):
+            raise RuntimeError(f"配置扫描接口不可调用：{operation_name}")
 
 
 if __name__ == "__main__":

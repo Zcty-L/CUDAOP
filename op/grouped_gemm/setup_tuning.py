@@ -1,36 +1,36 @@
-"""构建 cudaop_grouped_gemm CUDA 扩展。"""
+"""构建 CUTLASS Grouped GEMM 配置扫描扩展。"""
 
-import os
 from pathlib import Path
 
-from setuptools import find_packages, setup
+from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 
 ROOT = Path(__file__).resolve().parent
 CSRC = ROOT / "csrc"
 CUTLASS_INCLUDE = ROOT.parents[2] / "cutlass" / "include"
+SOURCES = (
+    "tuning_ops.cpp",
+    "tuning_up.cu",
+    "tuning_down.cu",
+    "tuning_bgrad.cu",
+)
 
-# SM120 的 TMA 需要 architecture-specific feature target。调用方仍可通过
-# TORCH_CUDA_ARCH_LIST 显式覆盖为 8.0 等目标，此时 kernel 会走 cp.async。
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0a")
-
-for source in ("ops.cu", "grouped_gemm.cuh", "fused_lora.cuh"):
+for source in SOURCES:
     if not (CSRC / source).is_file():
-        raise FileNotFoundError(f"缺少 CUDA 源文件：{CSRC / source}")
+        raise FileNotFoundError(f"缺少配置扫描源文件：{CSRC / source}")
 if not CUTLASS_INCLUDE.is_dir():
     raise FileNotFoundError(f"缺少 CUTLASS 头文件目录：{CUTLASS_INCLUDE}")
 
 
 setup(
-    name="cudaop_grouped_gemm",
+    name="cudaop_grouped_gemm_tuning",
     version="0.1.0",
-    description="CUDAOP CUTLASS grouped GEMM",
-    packages=find_packages(),
+    description="CUDAOP CUTLASS grouped GEMM configuration tuning",
     ext_modules=[
         CUDAExtension(
-            name="cudaop_grouped_gemm._C",
-            sources=[str(CSRC / "ops.cu")],
+            name="cudaop_grouped_gemm._tuning",
+            sources=[str(CSRC / source) for source in SOURCES],
             include_dirs=[
                 str(CSRC),
                 str(CUTLASS_INCLUDE),
@@ -40,6 +40,7 @@ setup(
                 "nvcc": [
                     "-O3",
                     "--use_fast_math",
+                    "-lineinfo",
                     "-std=c++17",
                 ],
             },
