@@ -1,13 +1,29 @@
 # CUDAOP
 
-CUDAOP 是一个面向 CUDA 算子实现、性能分析与优化的实验项目。仓库包含独立的CUDA/C++ benchmark、与 cuDNN 等实现的性能对比，以及部分可由 PyTorch 调用的扩展算子。
+CUDAOP 是一个面向 CUDA 算子实现、性能分析与优化的实验项目。仓库包含独立的 CUDA/C++ benchmark、与 cuDNN 等实现的性能对比，以及部分可由 PyTorch 调用的扩展算子。
 
 ## 算子
 
-- 卷积：Conv2D、Depthwise Conv2D 与融合算子
-- 线性代数：Linear、Grouped GEMM、LoRA MoE、MMA/WGMMA
-- 神经元：LIF 等脉冲神经网络算子
-- 其他：Resize、逐元素乘法、QK Attention 与异步拷贝实验
+- 卷积
+  - [Conv2D](op/conv)：FP32/FP16 卷积、脉冲卷积以及 Conv2D + LIF 融合实现
+  - [Depthwise Conv2D](op/dwconv)：FP32/FP16、脉冲神经网络与分组卷积优化实现
+- 线性代数与 MoE
+  - [Linear](op/linear)：全精度与脉冲神经网络线性层
+  - [Grouped GEMM](op/grouped_gemm)：CUTLASS、Triton 和 cuTile 实现，包含 LoRA 前向与反向路径
+  - [LoRA MoE](op/lora_moe)：路由辅助算子以及标准、非标准 LoRA-MoE 实现
+- 注意力与生成
+  - [Flash Attention](op/flashattn)：Flash Nano CUDA 实现以及 MHA、GQA、MQA、MLA、Linear Attention 的 PyTorch 参考实现
+  - [QK Attention](op/qk_attn)：面向脉冲数据的 QK Attention 实现
+  - [Decoder Sampling](op/decoder_sampling)：支持 temperature、top-k、top-p、min-p 和历史惩罚的单步 token 采样
+- 神经元
+  - [IF、LIF 与 PLIF](op/neuron)：PyTorch C++/CUDA 扩展和 CuPy 实现，支持 FP32/FP16 前向与反向
+- 通用算子
+  - [Softmax](op/softmax)：FP32 与 INT8 路径
+  - [Top-K](op/topk)：CUDA 实现及 CPU 参考实现
+  - [Resize](op/resize)：UINT8 图像缩放
+  - [逐元素乘法](op/mul)：UINT8 逐元素乘法
+
+底层原语与系统实验包括 [MMA](op/mma)、[WGMMA](op/wgmma)、[异步拷贝](op/cp_async)、[NCCL 多卡 MLP](op/nccl)，以及 [`op/test/`](op/test) 中的 GPU 存储层次和 CUDA 架构原语验证。
 
 核心实现位于 [`op/`](op)，优化记录与项目文档位于 [`docs/`](docs)。
 

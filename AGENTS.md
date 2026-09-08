@@ -18,12 +18,11 @@
 
 ## 配置文件
 - 一些参数配置，结构体定义需要在 `./op/config.h`
-- PTX 指令**读取**和**添加**统一在 `./op/ptx_utils.cuh`
-- `./op/cuda_utils.cuh` **已弃用，不再使用**，新代码禁止引用
 - `cmake` 配置：`./CMakeLists.txt`
 
 ### PTX 指令规范
-- 所有 PTX 指令统一在 `./op/ptx_utils.cuh` 中管理
+- PTX 指令**读取**和**添加**统一在 `./op/ptx_utils.cuh`
+- `./op/cuda_utils.cuh` **已弃用，不再使用**，新代码禁止引用
 - 添加 PTX 指令时需在注释中注明：指令名称、来源（文档链接或参考项目）、用途
 
 
@@ -35,8 +34,8 @@
 
 
 ## 编译代码规则
-- 代码的编译统一在 `CMakeLists`，只有在临时测试的时候才允许使用 `nvcc`，产生的临时可执行文件的输出目录为 `./build`
-- 最终一定需要放到 `CMakeLists` 进行测试验证
+- C++ 代码的编译统一在 `CMakeLists`，只有在临时测试的时候才允许使用 `nvcc`，产生的临时可执行文件的输出目录为 `./build`，最终一定需要放到 `CMakeLists` 进行测试验证
+- Python 代码可以直接执行，不必放到 `CMakeLists`
 
 
 ## 测试 Debug 输出规范
@@ -56,7 +55,7 @@
 ## Git 规范
 - 修改代码前必须执行 `git status --short --branch` 检查当前分支
 - 涉及 `./op/{op_name}/` 的任务，包括对应的实现、测试、`CMakeLists.txt` 和文档修改，工作分支应为 `feature/{op_name}`, 发现不对应需要切换或新建，禁止把其他功能分支的提交一并带入目标分支
-- 禁止在 `main` 分支修改；如果当前分支是 `main`，应先切换或创建正确分支; 仅当任务只修改 `AGENTS.md` 时，允许修改
+- 禁止在 `main` 分支修改；如果当前分支是 `main`，应先切换或创建正确分支; 仅当任务只修改 `AGENTS.md` 和 `README.md` 时，允许修改
 - Commit 前缀: `feat:`, `fix:`, `perf:`, `refactor:`, `docs:`, `chore:`
 - 分支命名: `feature/{op_name}`
 
