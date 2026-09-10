@@ -240,72 +240,71 @@ cmake --build build --target cudaop_grouped_gemm_test -j
 [SUCCESS] cudaop_grouped_gemm 对比测试通过
 ```
 
-## CUTLASS kernel fusion 专项复测（RTX 4090）
-
-### 测试目的与口径
+## Kernel fusion 专项复测（RTX 4090）
 
 2026-09-08 在 RTX 4090（SM89）上对 `fused_lora.cuh` 进行专项复测，
 只比较 CUTLASS 默认非融合路径与 CUTLASS/CuTe 融合路径：
 
-| 阶段 | 非融合计算 kernel | 融合计算 kernel |
-|---|---:|---:|
-| 前向 | down、up，共 2 个 | fused down/up，共 1 个 |
-| 纯反向 | grad hidden/input 和两个 bgrad，共 4 个 | fused agrad 和两个 bgrad，共 3 个 |
-| 前向+反向 | 6 个 | 4 个 |
+测试参数为 BF16、8 experts、rank 16、hidden size 2048/8192，expert token 数为 `[2560, 3140, 1940, 2000, 2220, 2580, 2760, 2020]`，
+总 token 数为 19220。每个采样预热 100 次、计时 1000 次，融合与非融合交替执行，共取 10 个采样的中位数。
 
-测试参数为 BF16、8 experts、rank 16、hidden size 2048，expert token 数为
-`[2560, 3140, 1940, 2000, 2220, 2580, 2760, 2020]`，总 token 数
-为 19220。每个采样预热 100 次、计时 1000 次，融合与非融合交替执行，
-共取 10 个采样的中位数。
+纯反向在计时前构建好 Autograd graph，并通过 `retain_graph=True` 重复执行，因此不包含前向。端到端测试每轮重新执行前向和反向。
+融合权重预打包和首次 metadata 构建均在计时外；CUDA Event 结果仍包含每个入口自身的 metadata、Autograd 和 kernel launch 开销。
+融合/非融合精度、空 expert、非整块 M/N/K 尾块和 bgrad K=256/33 回归全部通过。
 
-纯反向在计时前构建好 Autograd graph，并通过 `retain_graph=True` 重复执行，
-因此不包含前向。端到端测试每轮重新执行前向和反向。融合权重预打包和首次
-metadata 构建均在计时外；CUDA Event 结果仍包含每个入口自身的 metadata、
-Autograd 和 kernel launch 开销。
+### CUTLASS 非融合 vs fusion
 
-### 正确性
+| 计时口径 | hidden | 阶段 | 非融合（us） | 融合（us） | 加速比 |
+|---|---:|---|---:|---:|---:|
+| CUDA Event | 2048 | 前向 | 236.310 | 190.334 | 1.242x |
+| CUDA Event | 2048 | 纯反向 | 456.619 | 347.252 | 1.315x |
+| CUDA Event | 2048 | 前向+反向 | 1737.381 | 844.424 | 2.057x |
+| CUDA Event | 8192 | 前向 | 907.509 | 764.643 | 1.187x |
+| CUDA Event | 8192 | 纯反向 | 1647.916 | 1461.882 | 1.127x |
+| CUDA Event | 8192 | 前向+反向 | 2554.622 | 2242.184 | 1.139x |
+| Nsight 纯计算 | 2048 | 前向 | 229.382 | 191.906 | 1.195x |
+| Nsight 纯计算 | 2048 | 纯反向 | 440.305 | 336.124 | 1.310x |
+| Nsight 纯计算 | 2048 | 前向+反向 | 604.149 | 558.670 | 1.081x |
+| Nsight 纯计算 | 8192 | 前向 | 896.246 | 765.123 | 1.171x |
+| Nsight 纯计算 | 8192 | 纯反向 | 1608.875 | 1437.234 | 1.119x |
+| Nsight 纯计算 | 8192 | 前向+反向 | 2505.444 | 2223.066 | 1.127x |
 
-目标性能规模上的融合/非融合最大绝对差如下，全部通过
-`rtol=2e-2`、前向 `atol=2e-2`、反向 `atol=5e-1` 检查：
+### CUTLASS 非融合 vs Triton fusion
 
-| Tensor | 最大绝对差 |
-|---|---:|
-| saved hidden | 0.000000 |
-| output | 0.000000 |
-| grad input | 0.000000 |
-| grad down weight | 0.000000 |
-| grad up weight | 0.007812 |
+`重建` 表示每次调用执行 `clear_metadata_cache()`；`复用` 表示输入信息不变，首次 metadata 构建已在 warmup 完成。
 
-空 expert、非整块 M/N/K 尾块和 bgrad K=256/33 回归也全部通过。
+| 计时口径 | metadata | hidden | 阶段 | CUTLASS 非融合（us） | Triton fusion（us） | 加速比 |
+|---|---|---:|---|---:|---:|---:|
+| CUDA Event | 重建 | 2048 | 前向 | 235.869 | 261.829 | 0.901x |
+| CUDA Event | 重建 | 2048 | 纯反向 | 457.636 | 325.740 | 1.405x |
+| CUDA Event | 重建 | 2048 | 前向+反向 | 1666.220 | 1536.047 | 1.085x |
+| CUDA Event | 重建 | 8192 | 前向 | 909.293 | 803.863 | 1.131x |
+| CUDA Event | 重建 | 8192 | 纯反向 | 1643.180 | 1494.391 | 1.100x |
+| CUDA Event | 重建 | 8192 | 前向+反向 | 2548.558 | 2319.074 | 1.099x |
+| CUDA Event | 复用 | 2048 | 前向 | 237.824 | 182.376 | 1.304x |
+| CUDA Event | 复用 | 2048 | 纯反向 | 456.912 | 321.967 | 1.419x |
+| CUDA Event | 复用 | 2048 | 前向+反向 | 1732.645 | 1129.045 | 1.535x |
+| CUDA Event | 复用 | 8192 | 前向 | 909.863 | 726.543 | 1.252x |
+| CUDA Event | 复用 | 8192 | 纯反向 | 1647.500 | 1492.660 | 1.104x |
+| CUDA Event | 复用 | 8192 | 前向+反向 | 2557.574 | 2218.912 | 1.153x |
+| Nsight 纯计算 | 重建 | 2048 | 前向 | 228.689 | 178.981 | 1.278x |
+| Nsight 纯计算 | 重建 | 2048 | 纯反向 | 440.415 | 319.490 | 1.379x |
+| Nsight 纯计算 | 重建 | 2048 | 前向+反向 | 604.594 | 561.706 | 1.076x |
+| Nsight 纯计算 | 重建 | 8192 | 前向 | 895.111 | 722.408 | 1.239x |
+| Nsight 纯计算 | 重建 | 8192 | 纯反向 | 1607.582 | 1490.073 | 1.079x |
+| Nsight 纯计算 | 重建 | 8192 | 前向+反向 | 2503.795 | 2219.389 | 1.128x |
+| Nsight 纯计算 | 复用 | 2048 | 前向 | 228.986 | 183.094 | 1.251x |
+| Nsight 纯计算 | 复用 | 2048 | 纯反向 | 439.378 | 323.177 | 1.360x |
+| Nsight 纯计算 | 复用 | 2048 | 前向+反向 | 614.696 | 563.515 | 1.091x |
+| Nsight 纯计算 | 复用 | 8192 | 前向 | 906.738 | 729.592 | 1.243x |
+| Nsight 纯计算 | 复用 | 8192 | 纯反向 | 1605.521 | 1494.133 | 1.075x |
+| Nsight 纯计算 | 复用 | 8192 | 前向+反向 | 2509.204 | 2222.077 | 1.129x |
 
-### CUDA Event 稳态入口耗时
-
-最终 CMake 测试结果如下：
-
-| 阶段 | 非融合（us） | 融合（us） | 加速比 | 延迟下降 |
-|---|---:|---:|---:|---:|
-| 前向 | 236.310 | 190.334 | 1.242x | 19.5% |
-| 纯反向 | 456.619 | 347.252 | 1.315x | 24.0% |
-| 前向+反向 | 1737.381 | 844.424 | 2.057x | 51.4% |
-
-### Nsight Systems 纯计算 kernel 时间
-
-使用 Nsight Systems 2025.5.2 采集 100 次调用，并按 NVTX 时间范围直接从
-`CUPTI_ACTIVITY_KIND_KERNEL` 汇总。下表排除 metadata memcpy、Python、
-Autograd 和 launch 间隙，也排除两条反向路径都存在的约 2.5 us
-elementwise fill kernel：
-
-| 阶段 | 非融合计算 kernel（us） | 融合计算 kernel（us） | 加速比 | 延迟下降 |
-|---|---:|---:|---:|---:|
-| 前向 | 229.382 | 191.906 | 1.195x | 16.3% |
-| 纯反向 | 440.305 | 336.124 | 1.310x | 23.7% |
-| 前向+反向 | 604.149 | 558.670 | 1.081x | 7.5% |
-
-因此可以确认：kernel fusion 本身在该负载上使前向计算 kernel 加速约
-1.195x、纯反向计算 kernel 加速约 1.310x。CUDA Event 端到端的约 2x
-训练加速不能全部归因于 fusion；较大部分来自融合状态化入口复用 packed
-weight/metadata，而通用非融合 CUTLASS 路径每轮仍需准备 Grouped GEMM
-metadata 和 Autograd 调用。
+- “前向”使用的 Tensor 没有开启梯度，不构建完整 Autograd graph，见 op/grouped_gemm/test_grouped_gemm.py:1666。
+- “纯反向”的前向和计算图在计时前已经创建；计时期间反复对同一个 graph 执行 retain_graph=True，见 op/grouped_gemm/test_grouped_gemm.py:1682。
+- “前向+反向”每轮都会重新构建 Autograd graph、保存中间 Tensor、执行反向并销毁 graph，见 op/grouped_gemm/test_grouped_gemm.py:1743。
+- hidden=2048 时 kernel 较短，Python/Autograd 调度和 kernel launch 间隙会造成 GPU 等待。CUDA Event 的起止区间会包含这些 GPU 空闲间隙，因此差异特别明显。
+- hidden=8192 时 GPU 计算时间占主导，CPU 调度开销大部分被计算覆盖，所以完整路径基本接近两者之和。
 
 ### 复现方式
 
@@ -314,6 +313,30 @@ conda activate py311
 cmake -S . -B build \
   -DPython3_EXECUTABLE=/home/lsbing/.conda/envs/py311/bin/python
 CUDA_VISIBLE_DEVICES=1 \
+  cmake --build build --target cudaop_grouped_gemm_test -j 4
+```
+
+复测 hidden size 8192 时使用：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 CUDAOP_GROUPED_GEMM_HIDDEN_SIZE=8192 \
+  cmake --build build --target cudaop_grouped_gemm_test -j 4
+```
+
+动态 metadata 对比时使用（默认 `clear=1`）：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 CUDAOP_GROUPED_GEMM_HIDDEN_SIZE=8192 \
+  CUDAOP_GROUPED_GEMM_FUSION_COMPARISON=triton \
+  cmake --build build --target cudaop_grouped_gemm_test -j 4
+```
+
+固定复用 metadata 时增加 `clear=0`：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 CUDAOP_GROUPED_GEMM_HIDDEN_SIZE=8192 \
+  CUDAOP_GROUPED_GEMM_FUSION_COMPARISON=triton \
+  CUDAOP_GROUPED_GEMM_CLEAR_METADATA_CACHE=0 \
   cmake --build build --target cudaop_grouped_gemm_test -j 4
 ```
 
