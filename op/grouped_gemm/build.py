@@ -40,6 +40,7 @@ def main() -> None:
 
     env = os.environ.copy()
     env["TORCH_CUDA_ARCH_LIST"] = resolve_arch_list(args.arch_list)
+    env.setdefault("MAX_JOBS", "4")
     subprocess.run(
         [
             sys.executable,
@@ -55,8 +56,12 @@ def main() -> None:
     sys.path.insert(0, str(ROOT))
     import cudaop_grouped_gemm
 
-    if not callable(cudaop_grouped_gemm.gmm):
-        raise RuntimeError("cudaop_grouped_gemm.gmm 不可调用")
+    for operation_name in ("gmm", "gmm_k16"):
+        operation = getattr(cudaop_grouped_gemm, operation_name, None)
+        if not callable(operation):
+            raise RuntimeError(
+                f"cudaop_grouped_gemm.{operation_name} 不可调用"
+            )
 
 
 if __name__ == "__main__":
