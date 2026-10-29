@@ -1,3 +1,10 @@
+
+> **项目已弃用**  
+> 本项目已停止维护，请前往新项目：[cuda-systems-lab](https://github.com/Zcty-L/cuda-systems-lab)。
+>
+> **This project is deprecated.**  
+> This project is no longer maintained. Please visit the new project: [cuda-systems-lab](https://github.com/Zcty-L/cuda-systems-lab).
+
 # CUDAOP
 
 CUDAOP 是一个面向 CUDA 算子实现、性能分析与优化的实验项目。仓库包含独立的 CUDA/C++ benchmark、与 cuDNN 等实现的性能对比，以及部分可由 PyTorch 调用的扩展算子。
